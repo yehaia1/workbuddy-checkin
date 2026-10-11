@@ -39,6 +39,14 @@
 - README 全面重写，新增目录、特性表、免责声明、项目结构。
 - 新增 `CHANGELOG.md`、`docs/architecture.md`、`docs/troubleshooting.md`。
 - 新增 `config.example.json` 配置样例。
+- **面向使用者的文档改为只描述界面操作**：README 与 troubleshooting 中原有的命令行用法
+  （`--selftest` / `--sched-status` / `--run`、以及查任务状态的命令）全部替换为
+  「打开程序 → 点某个按钮」的界面步骤，`selftest.json` 相关内容一并移除。
+- **移除 bat 方案相关的遗留说明**：README 里的 `setup_task.bat` / `run_checkin.bat`
+  FAQ 条目、`docs/architecture.md` 的「为什么移除了 bat 方案」整章、
+  troubleshooting 里的残留任务一行。
+- 面向维护者的内容保持不变：从源码运行、从源码构建 / 打包、项目结构、
+  `tools/no_popup_check.py` 回归检查。
 
 ### 安全
 

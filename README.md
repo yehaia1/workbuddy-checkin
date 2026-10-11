@@ -36,7 +36,7 @@
 | **后台静默运行** | 自动拉起客户端后立刻隐藏窗口，不抢焦点、不打断你手头的活 |
 | **定时签到** | 界面里设置时间 + 随机抖动，写进 Windows 计划任务；程序本身不用常驻（占用 0 MB） |
 | **消息推送** | 企业微信机器人 / 钉钉机器人，**只填 key**，地址程序自动拼 |
-| **全程零弹窗** | 连底层的 PowerShell / tasklist 调用都不弹黑框（见 [常见问题](#常见问题)） |
+| **全程零弹窗** | 连底层的子进程调用都不弹黑框（见 [常见问题](#常见问题)） |
 | **高 DPI 适配** | 250% 缩放下字不会变小（[原理](docs/architecture.md#高-dpi为什么字会变小)） |
 
 ---
@@ -155,8 +155,8 @@ python checkin_gui.py
 如果把 exe 挪到了别的目录，任务里记录的路径会失效。程序启动时能检测出来，
 在「定时签到」里提示「任务指向的程序不是当前这个」，点一次「应用到系统」即可修复。
 
-> 实现细节（为什么不用 `schtasks.exe`、怎么传中文路径）见
-> [docs/architecture.md](docs/architecture.md#计划任务为什么不用-schtasksexe)。
+> 实现细节（任务怎么注册进去、中文路径怎么处理）见
+> [docs/architecture.md](docs/architecture.md)。
 
 ---
 
@@ -232,7 +232,7 @@ python build_exe.py
    **不报任何错**，只是悄悄少收集 `_tkinter.pyd` 和 tcl/tk 运行时，打出来的 exe
    一启动就崩。唯一线索是体积小掉约 3 MB（正常约 11 MB，损坏版约 8 MB）。
    脚本会自动挑一个带 tkinter 的解释器（也可 `--python <路径>` 指定），
-   并在打包后跑一次 `--selftest` 校验，不通过就直接报错、不放行。
+   并在打包后自动跑一次自检校验，不通过就直接报错、不放行。
 
 ---
 
@@ -265,27 +265,14 @@ Windows 会给它**新建一个控制台窗口**。修法是所有子进程调�
 `creationflags=CREATE_NO_WINDOW`。详见 [docs/troubleshooting.md](docs/troubleshooting.md#点按钮闪出黑框)。
 
 **Q：定时到点了但没签到？**
-先跑 `WorkBuddyCheckin.exe --sched-status` 看一眼任务状态（不开界面、不弹窗），
-再按 [docs/troubleshooting.md](docs/troubleshooting.md#定时不生效) 逐步排查。
+打开程序，点「**定时签到**」，对话框上方的「系统状态」那行会直接显示任务是否已注册、
+下次运行时间、上次运行结果。再按
+[docs/troubleshooting.md](docs/troubleshooting.md#定时不生效) 逐步排查。
 
 **Q：提示"未检测到 WorkBuddy 客户端"，但明明装了？**
 自检分了「装没装」和「在不在跑」两层判断。没在跑会被明确提示为
 「已安装，但当前没有运行」，并在设置里给出检测到的路径。
 如果路径没找到，可以在「设置 → WorkBuddy 客户端」手动指定，或用「自动检测」。
-
-**Q：以前的 `setup_task.bat` / `run_checkin.bat` 还能用吗？**
-**已经移除**（v1.5 起）。定时签到只剩**界面一种入口**：主界面点「定时签到」→
-「应用到系统」。旧方案靠本机 Python 运行，且固定整点触发、没有抖动，
-与"目标机器免 Python"的设计目标冲突，所以整体删掉了。
-
-如果你在旧版里跑过 `setup_task.bat`，机器上可能还残留
-`WorkBuddyCheckin_0900` / `_2100` 两个任务；它们指向的 bat 已经不在了，留着只会每天失败一次。
-点一次「**应用到系统**」会自动清掉，也可以手动删：
-
-```powershell
-Unregister-ScheduledTask -TaskName WorkBuddyCheckin_0900 -Confirm:$false
-Unregister-ScheduledTask -TaskName WorkBuddyCheckin_2100 -Confirm:$false
-```
 
 更多问题见 [docs/troubleshooting.md](docs/troubleshooting.md)。
 

@@ -189,7 +189,6 @@ python checkin_gui.py
 | `dingtalk_key` | `""` | 钉钉机器人 access_token（只填 token）。留空则不推送该渠道 |
 | `wecom_webhook` / `dingtalk_webhook` | `""` | 兼容旧配置：可直接填完整地址，优先于上面的 key |
 | `workbuddy_exe` | `""` | 客户端路径。**留空 = 自动探测**（推荐） |
-| `ipc_dir` | `""` | 内置模块所在目录。**留空 = 自动探测**（推荐）；仅当提示「缺少内置模块」时手工指定 |
 | `launch_workbuddy` | `true` | 宿主未运行时自动拉起客户端 |
 | `launch_timeout` | `120` | 拉起后等待 IPC 就绪的最长秒数 |
 | `hide_window` | `true` | 拉起后隐藏客户端主窗口（后台运行） |
@@ -270,10 +269,9 @@ v1.5 已修复。原因是窗口程序自身没有控制台，去调用系统命
 旧版只认几条固定路径，对不上就整体失效（哪怕客户端装好也登录了）。
 现在会自动递归去找，绝大多数情况不用管。
 
-万一还是提示，就到「**设置 → 内置模块目录**」手动指一下：选
-`workbuddy_ipc` 所在的**父目录**（该目录下应该有个 `workbuddy_ipc` 文件夹，
-里面是 `__init__.py`）。详见
-[docs/troubleshooting.md](docs/troubleshooting.md#提示缺少内置模块)。
+万一还是提示，基本可以判定是**客户端本身不完整或版本过旧**——那个模块是客户端
+自带的，程序已经翻遍了常见位置。重装（或升级）客户端后点一次「环境自检」即可。
+详见 [docs/troubleshooting.md](docs/troubleshooting.md#提示缺少内置模块)。
 
 **Q：定时到点了但没签到？**
 打开程序，点「**定时签到**」，对话框上方的「系统状态」那行会直接显示任务是否已注册、

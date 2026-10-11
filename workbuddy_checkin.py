@@ -269,9 +269,27 @@ def _install_dir_guesses() -> List[str]:
     return out
 
 
-def module_roots(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
+# module_roots 的进程级缓存：同一次运行里目录不会变，没必要反复扫盘
+# （安装目录 + 插件缓存的有界递归约 160ms，一启动就被 load_ipc 和
+#  detect_env 各要一次）。key 用配置里的 ipc_dir，它是唯一能改变候选集合
+# 的配置项；排查用的 probe_module_roots 会强制实扫，不吃缓存。
+_MODULE_ROOTS_CACHE: Dict[str, List[str]] = {}
+
+
+def module_roots(cfg: Optional[Dict[str, Any]] = None,
+                 refresh: bool = False) -> List[str]:
     """workbuddy_ipc 可能的所在目录（按可信度排序）。"""
     cfg = load_config() if cfg is None else cfg
+    key = str((cfg or {}).get("ipc_dir") or "")
+    if not refresh and key in _MODULE_ROOTS_CACHE:
+        return list(_MODULE_ROOTS_CACHE[key])
+    roots = _compute_module_roots(cfg)
+    _MODULE_ROOTS_CACHE[key] = list(roots)
+    return roots
+
+
+def _compute_module_roots(cfg: Optional[Dict[str, Any]]) -> List[str]:
+    """实际执行的探测（不要在热路径上直接调它，走 module_roots 吃缓存）。"""
     roots: List[str] = []
     seen = set()
 
@@ -336,9 +354,12 @@ def module_roots(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
 
 
 def probe_module_roots(cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """候选目录逐条体检（自检/排查用）。"""
+    """候选目录逐条体检（自检/排查用）。
+
+    强制重新扫描（refresh=True）：排查时若吃了缓存，现场刚改的东西看不到。
+    """
     out = []
-    for r in module_roots(cfg):
+    for r in module_roots(cfg, refresh=True):
         out.append({
             "path": r,
             "exists": os.path.isdir(r),
@@ -372,14 +393,15 @@ def load_ipc(cfg: Optional[Dict[str, Any]] = None) -> Tuple[Any, str]:
     IPC_SEARCH_TRACE.append("候选目录 {} 个".format(len(roots)))
     IPC_SEARCH_TRACE.append("客户端安装目录 {}".format(
         install or "未检测到"))
-    detail = list(IPC_SEARCH_TRACE)
+    # 发现过程的细节只写进日志 / selftest.json：界面上摆一句"候选目录 11 个"
+    # 对使用者没有任何意义，反而把真正的建议挤掉了。
+    _log_event("内置模块未找到：{}".format("；".join(IPC_SEARCH_TRACE)))
     if IPC_IMPORT_ERRORS:
-        detail.insert(0, "找到目录但导入失败：{}".format(
+        _log_event("内置模块导入失败：{}".format(
             " | ".join(IPC_IMPORT_ERRORS[:3])))
     raise CheckinError(
         "IPC_MODULE_NOT_FOUND",
-        "未找到 workbuddy_ipc 模块，请确认已安装 WorkBuddy 桌面端。"
-        "（{}）".format("；".join(detail)),
+        "未找到内置模块 workbuddy_ipc。",
         2,
     )
 

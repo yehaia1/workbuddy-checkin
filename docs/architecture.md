@@ -256,12 +256,36 @@ A/B 实测结果：
 
 ---
 
-## 旧式定时任务（`setup_task.bat`）
+## 为什么移除了 bat 方案
 
-这是 v1.0 的遗留方式：注册 `WorkBuddyCheckin_0900` / `WorkBuddyCheckin_2100`
-两个任务，走 `run_checkin.bat` → 命令行版。
+v1.0 的定时是靠两个批处理实现的：
 
-它的缺点是**依赖本机 Python 路径**，换台没装 Python 的机器就废了。
-现在推荐用界面里的「定时签到」。
+| 文件 | 作用 |
+|---|---|
+| `run_checkin.bat` | 先探测本机 Python（`WORKBUDDY_PY` → `py -3` → `PATH` → 常见安装目录），再调 `workbuddy_checkin.py` |
+| `setup_task.bat` | 用 `schtasks` 注册 `WorkBuddyCheckin_0900` / `WorkBuddyCheckin_2100` 两个任务 |
 
-> 两者**不要同时开**，会重复触发。界面里点「应用到系统」时会自动清理这两个旧任务。
+它有两个硬伤：
+
+1. **依赖本机 Python**。换一台没装 Python 或没装 tkinter 的机器，任务到点必然失败 ——
+   而"目标机器不用装 Python"恰恰是做界面的初衷。
+2. **容易配成两套定时**。界面里再设一次就会冒出两套任务重复触发；
+   而且旧任务是整点硬触发，**没有抖动**，所有机器会在同一秒扎堆。
+
+所以 v1.5 把两个脚本整体删掉，**定时签到只剩界面一种入口**。
+
+### 遗留任务的清理
+
+装过旧版的机器上，这两个任务可能还留在任务库里，而它们指向的 bat 已经不存在，
+留着只会每天失败一次。处理方式：
+
+- 界面里点一次「**应用到系统**」—— 会顺带调用 `wb_task.cleanup_legacy()` 注销它们
+- 或者手动：
+
+  ```powershell
+  Unregister-ScheduledTask -TaskName WorkBuddyCheckin_0900 -Confirm:$false
+  Unregister-ScheduledTask -TaskName WorkBuddyCheckin_2100 -Confirm:$false
+  ```
+
+> `wb_task.LEGACY_TASKS` 与 `cleanup_legacy()` 之所以保留，就是为了这个迁移场景 ——
+> 它是**兜底清理**，不是另一种实现方式，也不会创建任何任务。

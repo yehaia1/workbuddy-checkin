@@ -247,8 +247,6 @@ workbuddy-checkin/
 ├── win_quiet.py              # 让子进程不弹控制台窗口
 ├── build_exe.py              # 一键打包（含解释器校验）
 ├── probe_hidden_launch.py    # 后台拉起探针（只读，用于验证隐藏窗口可行性）
-├── run_checkin.bat           # 命令行入口（无界面）
-├── setup_task.bat            # 旧式计划任务注册（见 docs/architecture.md）
 ├── config.example.json       # 配置样例
 ├── tools/
 │   └── no_popup_check.py     # 回归检查：运行程序时是否弹出控制台黑框
@@ -275,9 +273,19 @@ Windows 会给它**新建一个控制台窗口**。修法是所有子进程调�
 「已安装，但当前没有运行」，并在设置里给出检测到的路径。
 如果路径没找到，可以在「设置 → WorkBuddy 客户端」手动指定，或用「自动检测」。
 
-**Q：能同时用界面里的定时和 `setup_task.bat` 吗？**
-**不建议**，会重复触发。界面里点「应用到系统」时会自动清理旧的
-`_0900` / `_2100` 任务。旧方式现在只留给"不想用界面"的机器。
+**Q：以前的 `setup_task.bat` / `run_checkin.bat` 还能用吗？**
+**已经移除**（v1.5 起）。定时签到只剩**界面一种入口**：主界面点「定时签到」→
+「应用到系统」。旧方案靠本机 Python 运行，且固定整点触发、没有抖动，
+与"目标机器免 Python"的设计目标冲突，所以整体删掉了。
+
+如果你在旧版里跑过 `setup_task.bat`，机器上可能还残留
+`WorkBuddyCheckin_0900` / `_2100` 两个任务；它们指向的 bat 已经不在了，留着只会每天失败一次。
+点一次「**应用到系统**」会自动清掉，也可以手动删：
+
+```powershell
+Unregister-ScheduledTask -TaskName WorkBuddyCheckin_0900 -Confirm:$false
+Unregister-ScheduledTask -TaskName WorkBuddyCheckin_2100 -Confirm:$false
+```
 
 更多问题见 [docs/troubleshooting.md](docs/troubleshooting.md)。
 

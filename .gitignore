@@ -10,6 +10,7 @@ config.json
 checkin.log
 selftest.json
 no_popup_check.json
+module_discovery_check.json
 *.log
 
 # ---------------- Python ----------------

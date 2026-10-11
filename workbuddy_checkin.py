@@ -65,8 +65,9 @@ CLAIM_PATH = "/v2/billing/meter/daily-checkin"
 IPC_CLIENT_ID = "buddy-checkin"
 IPC_TIMEOUT_S = 30.0
 
-# workbuddy_ipc 各候选路径的导入失败原因（排查用，成功时为空）
+# workbuddy_ipc 各候选路径的导入失败原因 / 发现过程（排查用，成功时为空）
 IPC_IMPORT_ERRORS: list = []
+IPC_SEARCH_TRACE: list = []
 
 # 推送渠道的 URL 前缀：用户只需在配置里填 key，程序自己拼完整地址
 WECOM_API_PREFIX = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send"
@@ -87,6 +88,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "dingtalk_webhook": "",         # 兼容：可直接填完整钉钉地址（优先于 dingtalk_key）
     "launch_workbuddy": True,       # 宿主未运行时自动拉起客户端
     "workbuddy_exe": "",            # 留空 = 自动探测安装路径
+    "ipc_dir": "",                  # 留空 = 自动探测；填 workbuddy_ipc 的父目录（特殊安装方式兜底）
     "launch_timeout": 120,          # 拉起后等待 IPC 就绪的最长秒数
     "hide_window": True,            # 拉起后把客户端主窗口隐藏（后台运行，不打断别的活）
     "hide_window_timeout": 25,      # 等待主窗口出现并隐藏的最长秒数
@@ -161,65 +163,196 @@ def workbuddy_installed(cfg: Optional[Dict[str, Any]] = None) -> bool:
 
 
 # ---------------- workbuddy_ipc 模块发现 ----------------
-# 注意：计划任务/开机自启环境没有 CODEBUDDY_BUILTIN_SKILLS_DIR，
-# 必须多来源发现 + 约定路径探测（参考社区踩坑经验）。
+# 注意：计划任务/开机自启环境没有 CODEBUDDY_BUILTIN_SKILLS_DIR。
+#
+# 这里必须「约定路径 + 有界递归兜底」两条腿走路：模块的父目录布局在不同
+# 安装方式/版本下并不一致（安装目录里是 .../workbuddy-builtin/skills/library，
+# 用户插件缓存里是 <厂商>/<插件>/<版本>/…），只写死几条相对路径的话，
+# 换一台机器就会出现"明明装了客户端却找不到模块"（IPC_MODULE_NOT_FOUND）。
 
-def module_roots():
-    """workbuddy_ipc 可能的所在目录（按可信度排序）。
+IPC_PKG = "workbuddy_ipc"
 
-    实测安装目录里的真实位置是
-    <install>/resources/app.asar.unpacked/resources/plugins/workbuddy-builtin/
-        skills/library/workbuddy_ipc
-    所以必须把 skills/library 也纳入，不能只探 skills 本身；否则一旦用户
-    缓存目录被清理，就会出现"明明装了客户端却找不到模块"。
+# 递归扫描时跳过的目录名（纯缓存/版本库，里面不可能有模块）。
+# 用显式黑名单而不是「跳过所有点号目录」——.workbuddy 本身就是关键位置。
+_SKIP_DIRS = frozenset((
+    "node_modules", "__pycache__", "Cache", "GPUCache", "Code Cache",
+    "CachedData", "logs", "temp", "tmp",
+    ".git", ".svn", ".hg", ".venv", "venv",
+))
+
+
+def is_ipc_parent(path: Any) -> bool:
+    """path 是否是 workbuddy_ipc 包的父目录。"""
+    if not path:
+        return False
+    return os.path.isfile(os.path.join(str(path), IPC_PKG, "__init__.py"))
+
+
+def _scan_ipc_parents(base: Any, max_depth: int = 9,
+                      max_entries: int = 200000) -> List[str]:
+    """在 base 下有界广度优先搜索，返回所有 workbuddy_ipc 包的父目录。
+
+    实测代价：<安装目录> 约 20ms、插件缓存约 30ms，可以忽略。
+
+    命中后**继续下探**：同一个 base 下可能并存多种布局
+    （例如 plugins/workbuddy-builtin/skills 与其 skills/library 都放了包），
+    提前收工会把后者漏掉——这是踩过的坑。
     """
-    roots = []
-    env = os.environ.get("CODEBUDDY_BUILTIN_SKILLS_DIR", "").strip()
-    if env:
-        roots.append(env)
-
-    tail = "resources/app.asar.unpacked/resources/plugins/workbuddy-builtin"
-    install = install_root()
-    if install:
-        base = os.path.join(install, tail).replace("\\", "/")
-        roots.append(base + "/skills/library")
-        roots.append(base + "/skills")
-        # 插件式布局（如 builtin-plugins/<plugin>/skills/<skill>/）
-        for pat in ("skills/*", "*/skills/*", "*"):
-            for hit in glob.glob(base + "/" + pat):
-                if os.path.isdir(os.path.join(hit, "workbuddy_ipc")):
-                    roots.append(hit)
-                    continue
-                for sub in glob.glob(hit + "/*"):
-                    if os.path.isdir(os.path.join(sub, "workbuddy_ipc")):
-                        roots.append(sub)
-
-    pats = ["/Applications/WorkBuddy.app/Contents/" + tail + "/skills/library"]
-    for drv in ("C:", "D:", "E:", "F:", "G:"):
-        for pf in ("Program Files", "Program Files (x86)"):
-            pats.append(drv + "/" + pf + "/*/WorkBuddy/" + tail + "/skills/library")
-            pats.append(drv + "/" + pf + "/WorkBuddy/" + tail + "/skills/library")
-            pats.append(drv + "/" + pf + "/*/WorkBuddy/" + tail)
-            pats.append(drv + "/" + pf + "/WorkBuddy/" + tail)
-    for p in pats:
-        roots.extend(sorted(glob.glob(p)))
-    # 插件缓存兜底（用户目录）
-    roots.extend(sorted(glob.glob(os.path.join(
-        os.path.expanduser("~"), ".workbuddy", "plugins", "cache",
-        "workbuddy-builtin", "skill-library", "*", ""))))
-
-    seen = set()
-    out = []
-    for r in roots:
-        if r and r not in seen:
-            seen.add(r)
-            out.append(r)
+    out: List[str] = []
+    if not base or not os.path.isdir(base):
+        return out
+    seen = 0
+    frontier = [(os.path.abspath(str(base)), 0)]
+    while frontier and seen < max_entries:
+        nxt = []
+        for cur, depth in frontier:
+            if is_ipc_parent(cur):
+                out.append(cur)
+            if depth >= max_depth:
+                continue
+            try:
+                entries = os.scandir(cur)
+            except OSError:
+                continue
+            with entries:
+                for ent in entries:
+                    seen += 1
+                    if seen >= max_entries:
+                        break
+                    try:
+                        if not ent.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+                    if ent.name in _SKIP_DIRS:
+                        continue
+                    nxt.append((ent.path, depth + 1))
+        frontier = nxt
     return out
 
 
-def load_ipc() -> Tuple[Any, str]:
-    for root in module_roots():
-        if not os.path.isdir(os.path.join(root, "workbuddy_ipc")):
+def _install_dir_guesses() -> List[str]:
+    """可能装 WorkBuddy 的目录（只保留真实存在的）。
+
+    与 find_workbuddy_exe 的区别：这里不要求一定能找到 WorkBuddy.exe，
+    目的是即使 exe 探测失败，也能靠目录约定把模块找回来。
+    """
+    cands: List[str] = []
+    bases = [
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    ]
+    local = os.environ.get("LOCALAPPDATA", "")
+    appdata = os.environ.get("APPDATA", "")
+    if local:
+        bases += [os.path.join(local, "Programs"), local]
+    if appdata:
+        bases.append(appdata)
+    for base in bases:
+        if not base:
+            continue
+        cands.append(os.path.join(base, "WorkBuddy"))
+        cands.extend(sorted(glob.glob(os.path.join(base, "*", "WorkBuddy"))))
+    for drv in ("C:", "D:", "E:", "F:", "G:"):
+        for pf in ("Program Files", "Program Files (x86)"):
+            cands.append(drv + "\\" + pf + "\\WorkBuddy")
+        cands.append(drv + "\\WorkBuddy")
+
+    out: List[str] = []
+    seen = set()
+    for c in cands:
+        key = os.path.normcase(c)
+        if key in seen or not os.path.isdir(c):
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+
+def module_roots(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
+    """workbuddy_ipc 可能的所在目录（按可信度排序）。"""
+    cfg = load_config() if cfg is None else cfg
+    roots: List[str] = []
+    seen = set()
+
+    def add(path: Any) -> None:
+        if not path:
+            return
+        try:
+            p = os.path.abspath(
+                os.path.expandvars(str(path).strip().strip('"')))
+        except Exception:
+            return
+        key = os.path.normcase(p)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(p)
+
+    # 1) 配置里手工指定的（最高优先级，用来兜住探测不到的安装方式）
+    add((cfg or {}).get("ipc_dir"))
+
+    # 2) 环境变量
+    for var in ("CODEBUDDY_BUILTIN_SKILLS_DIR", "WORKBUDDY_SKILLS_DIR"):
+        add((os.environ.get(var) or "").strip())
+
+    install = install_root(cfg)
+    tail = ("resources", "app.asar.unpacked", "resources", "plugins",
+            "workbuddy-builtin")
+
+    # 3) 安装目录内的约定路径（命中最快，放前面）
+    for base in ([install] if install else []) + _install_dir_guesses():
+        builtin = os.path.join(base, *tail)
+        for sub in ("skills/library", "skills", "resources/skills"):
+            add(os.path.join(builtin, *sub.split("/")))
+        add(builtin)
+
+    # 4) 用户级插件缓存：实测存在多种布局，逐个 glob
+    cache = os.path.join(os.path.expanduser("~"), ".workbuddy",
+                         "plugins", "cache")
+    for pat in ("workbuddy-builtin/skill-library/*",
+                "workbuddy-builtin/skill-library/*/skills/library",
+                "workbuddy-builtin/*/skill-library/*",
+                "workbuddy-builtin/*/*/skills/library",
+                "*/*/skills/library",
+                "*/*/*/skills/library"):
+        for hit in glob.glob(os.path.join(cache, *pat.split("/"))):
+            add(hit)
+
+    # 5) 有界递归兜底：上面所有约定路径都落空时，靠它把模块捞回来。
+    #    放在最后，是为了让可信度高的约定路径排在前面。
+    scan_bases: List[str] = []
+    if install:
+        scan_bases.append(install)
+    scan_bases.extend(_install_dir_guesses())
+    scan_bases.append(cache)
+    scan_bases.append(os.path.join(os.path.expanduser("~"), ".workbuddy",
+                                   "skills"))
+    for base in scan_bases:
+        for hit in _scan_ipc_parents(base):
+            add(hit)
+
+    return roots
+
+
+def probe_module_roots(cfg: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    """候选目录逐条体检（自检/排查用）。"""
+    out = []
+    for r in module_roots(cfg):
+        out.append({
+            "path": r,
+            "exists": os.path.isdir(r),
+            "has_package": is_ipc_parent(r),
+        })
+    return out
+
+
+def load_ipc(cfg: Optional[Dict[str, Any]] = None) -> Tuple[Any, str]:
+    del IPC_IMPORT_ERRORS[:]
+    del IPC_SEARCH_TRACE[:]
+    roots = module_roots(cfg)
+    for root in roots:
+        if not os.path.isdir(os.path.join(root, IPC_PKG)):
             continue
         if root not in sys.path:
             sys.path.insert(0, root)
@@ -234,11 +367,19 @@ def load_ipc() -> Tuple[Any, str]:
             except ValueError:
                 pass
             sys.modules.pop("workbuddy_ipc", None)
+
+    install = install_root(cfg)
+    IPC_SEARCH_TRACE.append("候选目录 {} 个".format(len(roots)))
+    IPC_SEARCH_TRACE.append("客户端安装目录 {}".format(
+        install or "未检测到"))
+    detail = list(IPC_SEARCH_TRACE)
+    if IPC_IMPORT_ERRORS:
+        detail.insert(0, "找到目录但导入失败：{}".format(
+            " | ".join(IPC_IMPORT_ERRORS[:3])))
     raise CheckinError(
         "IPC_MODULE_NOT_FOUND",
-        "未找到 workbuddy_ipc 模块；请确认已安装 WorkBuddy 桌面端。" +
-        ("（{}）".format(" | ".join(IPC_IMPORT_ERRORS[:3]))
-         if IPC_IMPORT_ERRORS else ""),
+        "未找到 workbuddy_ipc 模块，请确认已安装 WorkBuddy 桌面端。"
+        "（{}）".format("；".join(detail)),
         2,
     )
 
@@ -248,8 +389,8 @@ def load_ipc() -> Tuple[Any, str]:
 class Session:
     """单连接内完成多次调用（一次握手，多次 invoke）。"""
 
-    def __init__(self):
-        self.ipc, self.module_path = load_ipc()
+    def __init__(self, cfg: Optional[Dict[str, Any]] = None):
+        self.ipc, self.module_path = load_ipc(cfg)
         try:
             self.client = self.ipc.connect(
                 client_id=IPC_CLIENT_ID, client_kind="skill")
@@ -448,7 +589,7 @@ def connect_with_autolaunch(cfg: Dict[str, Any],
     """
     emit = progress or _progress
     try:
-        return Session(), False
+        return Session(cfg), False
     except CheckinError as e:
         if not cfg.get("launch_workbuddy", True):
             raise
@@ -460,7 +601,7 @@ def connect_with_autolaunch(cfg: Dict[str, Any],
     # 残留进程恢复：有 WorkBuddy 进程却没有 IPC 通道 = 后台残留
     # （单实例锁会让新拉起的实例立即退出，导致永远等不到就绪）。
     # 先清理残留，再走正常拉起。
-    ipc, _ = load_ipc()
+    ipc, _ = load_ipc(cfg)
     if workbuddy_process_running() and not _endpoint_ready(ipc):
         emit("检测到 WorkBuddy 后台残留进程（无宿主通道），"
              "先结束残留进程再重新拉起...")
@@ -513,7 +654,7 @@ def connect_with_autolaunch(cfg: Dict[str, Any],
                 err.launched = False
                 raise err
         try:
-            sess = Session()
+            sess = Session(cfg)
         except CheckinError as e:
             last_err = e
             if time.time() >= next_hint:
@@ -741,24 +882,29 @@ def build_message(result: Dict[str, Any]) -> str:
 # ---------------- 诊断 ----------------
 
 def diagnose() -> Dict[str, Any]:
+    cfg = load_config()
     out: Dict[str, Any] = {}
+    out["client_exe"] = find_workbuddy_exe(cfg) or None
+    out["install_root"] = install_root(cfg) or None
+    out["module_roots"] = probe_module_roots(cfg)
     try:
-        ipc, path = load_ipc()
+        ipc, path = load_ipc(cfg)
         out["ipc_module"] = path
     except CheckinError as e:
         out["ipc_module"] = None
         out["error"] = str(e)
+        out["ipc_import_errors"] = list(IPC_IMPORT_ERRORS)
         return out
     endpoint = getattr(ipc, "discovery_path", lambda: None)()
     out["endpoint_file"] = endpoint
     out["endpoint_exists"] = bool(endpoint and os.path.exists(endpoint))
     out["workbuddy_running"] = workbuddy_process_running()
-    out["notify_channels"] = configured_channels(load_config())
+    out["notify_channels"] = configured_channels(cfg)
     if not out["endpoint_exists"]:
         out["error"] = "wbipc endpoint.json 不存在（WorkBuddy 未运行？）"
         return out
     try:
-        with Session() as sess:
+        with Session(cfg) as sess:
             pipe = sess.client.get_pipe("wb.request")
             out["connected"] = True
             out["methods"] = list(getattr(pipe, "methods", None) or [])
@@ -904,12 +1050,15 @@ def detect_env(deep: bool = True,
         return out
 
     try:
-        with Session() as sess:
+        with Session(cfg) as sess:
             status, body = sess.fetch("POST", STATUS_PATH)
     except CheckinError as e:
         out["ipc_connected"] = False
-        if e.result in ("NOT_IN_WORKBUDDY", "CONSENT_REQUIRED", "NO_MODULE",
-                        "IPC_MODULE_NOT_FOUND"):
+        if e.result == "IPC_MODULE_NOT_FOUND":
+            # 与"未登录"分开报：这是环境/安装问题，说成未登录会误导排查方向
+            out["module_roots"] = probe_module_roots(cfg)
+            out.update(code="NO_MODULE", message=str(e))
+        elif e.result in ("NOT_IN_WORKBUDDY", "CONSENT_REQUIRED", "NO_MODULE"):
             out.update(code="NOT_LOGGED_IN",
                        message="宿主通道未就绪：{}".format(e))
         else:

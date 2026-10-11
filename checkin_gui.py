@@ -35,7 +35,7 @@ import workbuddy_checkin as core
 import wb_task
 
 APP_TITLE = "WorkBuddy 每日签到"
-VERSION = "1.5"
+VERSION = "1.6"
 
 # 界面缩放系数：物理像素 = 逻辑像素 × PX。由 apply_tk_scaling() 按 DPI 设置。
 # tkinter 的 padding/width 等参数都是物理像素，不跟着 tk scaling 走，
@@ -302,6 +302,19 @@ class SettingsDialog:
         self.lbl_exe_state.pack(fill="x", padx=P(18), pady=(P(4), 0))
         self._refresh_exe_state()
 
+        # 内置模块目录：只在自动探测失败时才需要填（特殊安装方式兜底）
+        mrow = tk.Frame(body, bg=C_BG)
+        mrow.pack(fill="x", padx=P(18), pady=(P(8), 0))
+        tk.Label(mrow, text="内置模块目录", font=UI_FONT_SM, bg=C_BG,
+                 fg=C_MUTED).pack(side="left", padx=(0, P(8)))
+        self.var_ipc = tk.StringVar(value=str(self.cfg.get("ipc_dir") or ""))
+        ttk.Entry(mrow, textvariable=self.var_ipc, style="Wb.TEntry",
+                  width=30).pack(side="left", ipady=P(3))
+        self._btn(mrow, "浏览…", self._browse_ipc)
+        self._hint(body, "一般留空即可（自动探测）。只有当界面提示「缺少内置模块」"
+                         "时才需要手动指定——选 workbuddy_ipc 所在的父目录，"
+                         "该目录下应有 workbuddy_ipc\\__init__.py。")
+
         # --- 行为 ---
         self._section(body, "运行行为")
         self.var_auto_env = tk.BooleanVar(
@@ -443,6 +456,15 @@ class SettingsDialog:
             self.var_exe.set(os.path.normpath(path))
             self._refresh_exe_state()
 
+    def _browse_ipc(self):
+        init = (self.var_ipc.get().strip()
+                or core.install_root() or "C:/")
+        path = filedialog.askdirectory(
+            parent=self.top, title="选择 workbuddy_ipc 所在的父目录",
+            initialdir=init if os.path.isdir(init) else "C:/")
+        if path:
+            self.var_ipc.set(os.path.normpath(path))
+
     def _refresh_exe_state(self):
         raw = self.var_exe.get().strip()
         if raw and os.path.isfile(raw):
@@ -464,6 +486,7 @@ class SettingsDialog:
         self.var_wecom.set(d.get("wecom_key", ""))
         self.var_dingtalk.set(d.get("dingtalk_key", ""))
         self.var_exe.set(d.get("workbuddy_exe", ""))
+        self.var_ipc.set(d.get("ipc_dir", ""))
         self.var_auto_env.set(bool(d.get("auto_env_check", True)))
         self.var_launch.set(bool(d.get("launch_workbuddy", True)))
         self.var_hide.set(bool(d.get("hide_window", True)))
@@ -488,6 +511,12 @@ class SettingsDialog:
         exe = self.var_exe.get().strip()
         if exe and not os.path.isfile(exe):
             raise ValueError("客户端路径不存在：{}".format(exe))
+        ipc_dir = self.var_ipc.get().strip()
+        if ipc_dir and not core.is_ipc_parent(ipc_dir):
+            raise ValueError(
+                "「内置模块目录」下没有找到 workbuddy_ipc 模块：{}\n"
+                "请选择包含 workbuddy_ipc\\__init__.py 的父目录，"
+                "或留空交给程序自动探测。".format(ipc_dir))
         scale = next((v for t, v in SCALE_CHOICES
                       if t == self.var_scale.get()), 0)
         return {
@@ -497,6 +526,7 @@ class SettingsDialog:
             "wecom_webhook": "",
             "dingtalk_webhook": "",
             "workbuddy_exe": exe,
+            "ipc_dir": ipc_dir,
             "auto_env_check": bool(self.var_auto_env.get()),
             "launch_workbuddy": bool(self.var_launch.get()),
             "hide_window": bool(self.var_hide.get()),
@@ -1224,6 +1254,13 @@ class App:
                 "若长时间不动，可用「打开客户端」重新唤起。",
                 action="  重新自检  ",
                 action_cmd=lambda: self.start_task(self.task_env_check))
+        elif code == "NO_MODULE":
+            self.set_banner(
+                "error", "缺少内置模块，无法连接客户端",
+                "{}\n这通常不是没装客户端，而是模块不在预期路径上。"
+                "可在「设置 → 内置模块目录」里手动指定它所在的父目录。".format(
+                    env.get("message", "")),
+                action="  打开设置  ", action_cmd=self.open_settings)
         elif code == "NOT_LOGGED_IN":
             self.set_banner(
                 "error", "客户端未登录",
@@ -1424,14 +1461,18 @@ def selftest() -> int:
     except Exception:
         out["host_error"] = traceback.format_exc()
     out["frozen"] = bool(getattr(sys, "frozen", False))
-    out["module_roots"] = core.module_roots()
-    out["ipc_import_errors"] = list(core.IPC_IMPORT_ERRORS)
+    cfg = core.load_config()
+    out["install_root"] = core.install_root(cfg) or None
+    # 候选目录逐条体检：哪条存在、哪条真的含 workbuddy_ipc 包，
+    # 是"找不到模块"这类问题唯一能一眼看明白的证据。
+    out["module_roots"] = core.probe_module_roots(cfg)
     try:
-        ipc, root = core.load_ipc()
+        ipc, root = core.load_ipc(cfg)
         out["ipc_module_ok"] = root
     except Exception as e:
         out["ipc_module_error"] = "{}: {}".format(type(e).__name__, e)
-        out["ipc_import_errors"] = list(core.IPC_IMPORT_ERRORS)
+    out["ipc_import_errors"] = list(core.IPC_IMPORT_ERRORS)
+    out["ipc_search_trace"] = list(core.IPC_SEARCH_TRACE)
     try:
         (core.SCRIPT_DIR / "selftest.json").write_text(
             json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")

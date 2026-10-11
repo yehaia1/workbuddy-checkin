@@ -302,18 +302,9 @@ class SettingsDialog:
         self.lbl_exe_state.pack(fill="x", padx=P(18), pady=(P(4), 0))
         self._refresh_exe_state()
 
-        # 内置模块目录：只在自动探测失败时才需要填（特殊安装方式兜底）
-        mrow = tk.Frame(body, bg=C_BG)
-        mrow.pack(fill="x", padx=P(18), pady=(P(8), 0))
-        tk.Label(mrow, text="内置模块目录", font=UI_FONT_SM, bg=C_BG,
-                 fg=C_MUTED).pack(side="left", padx=(0, P(8)))
-        self.var_ipc = tk.StringVar(value=str(self.cfg.get("ipc_dir") or ""))
-        ttk.Entry(mrow, textvariable=self.var_ipc, style="Wb.TEntry",
-                  width=30).pack(side="left", ipady=P(3))
-        self._btn(mrow, "浏览…", self._browse_ipc)
-        self._hint(body, "一般留空即可（自动探测）。只有当界面提示「缺少内置模块」"
-                         "时才需要手动指定——选 workbuddy_ipc 所在的父目录，"
-                         "该目录下应有 workbuddy_ipc\\__init__.py。")
+        # 内置模块目录不出现在界面上：它是"自动探测失败时的最后一根救命
+        # 稻草"，正常安装根本用不到，摆出来只会让使用者以为必须填。
+        # 配置项 ipc_dir 仍然有效（手工改 config.json 可用），这里只做保留。
 
         # --- 行为 ---
         self._section(body, "运行行为")
@@ -456,15 +447,6 @@ class SettingsDialog:
             self.var_exe.set(os.path.normpath(path))
             self._refresh_exe_state()
 
-    def _browse_ipc(self):
-        init = (self.var_ipc.get().strip()
-                or core.install_root() or "C:/")
-        path = filedialog.askdirectory(
-            parent=self.top, title="选择 workbuddy_ipc 所在的父目录",
-            initialdir=init if os.path.isdir(init) else "C:/")
-        if path:
-            self.var_ipc.set(os.path.normpath(path))
-
     def _refresh_exe_state(self):
         raw = self.var_exe.get().strip()
         if raw and os.path.isfile(raw):
@@ -486,7 +468,6 @@ class SettingsDialog:
         self.var_wecom.set(d.get("wecom_key", ""))
         self.var_dingtalk.set(d.get("dingtalk_key", ""))
         self.var_exe.set(d.get("workbuddy_exe", ""))
-        self.var_ipc.set(d.get("ipc_dir", ""))
         self.var_auto_env.set(bool(d.get("auto_env_check", True)))
         self.var_launch.set(bool(d.get("launch_workbuddy", True)))
         self.var_hide.set(bool(d.get("hide_window", True)))
@@ -511,12 +492,6 @@ class SettingsDialog:
         exe = self.var_exe.get().strip()
         if exe and not os.path.isfile(exe):
             raise ValueError("客户端路径不存在：{}".format(exe))
-        ipc_dir = self.var_ipc.get().strip()
-        if ipc_dir and not core.is_ipc_parent(ipc_dir):
-            raise ValueError(
-                "「内置模块目录」下没有找到 workbuddy_ipc 模块：{}\n"
-                "请选择包含 workbuddy_ipc\\__init__.py 的父目录，"
-                "或留空交给程序自动探测。".format(ipc_dir))
         scale = next((v for t, v in SCALE_CHOICES
                       if t == self.var_scale.get()), 0)
         return {
@@ -526,7 +501,9 @@ class SettingsDialog:
             "wecom_webhook": "",
             "dingtalk_webhook": "",
             "workbuddy_exe": exe,
-            "ipc_dir": ipc_dir,
+            # 界面上已不再暴露该入口（用户不关心）；这里原样保留手工改过的值，
+            # 避免"打开设置再保存"就把兜底路径清空
+            "ipc_dir": str(self.cfg.get("ipc_dir") or ""),
             "auto_env_check": bool(self.var_auto_env.get()),
             "launch_workbuddy": bool(self.var_launch.get()),
             "hide_window": bool(self.var_hide.get()),
@@ -706,14 +683,29 @@ class ScheduleDialog:
     # ----- 后台动作 -----
 
     def _probe(self):
-        """读系统任务状态（跑在后台线程）。"""
-        info = wb_task.query()
-        prog, _args = wb_task.launcher()
-        info["stale"] = bool(
-            info.get("exists")
-            and os.path.normcase(str(info.get("command") or ""))
-            != os.path.normcase(prog))
+        """读系统任务状态（跑在后台线程）。
+
+        两段式：先用 query_fast 把"在不在、几点跑、指向的程序对不对"
+        秒显出来（读 XML，约 0.5 毫秒），再用 query() 补上运行记录。
+        窗口一打开就有内容，不必干等 PowerShell 冷启动的 5 秒。
+        """
+        fast = wb_task.query_fast()
+        fast["stale"] = self._is_stale(fast)
+        self.app.post("call", lambda: self._show(fast))
+
+        info = wb_task.query()                    # 完整版：含运行记录
+        if info.get("partial") or (info.get("error") and fast.get("exists")):
+            return        # 拿不到更全的信息，保留已经显示出来的那份
+        info["stale"] = self._is_stale(info)
         self.app.post("call", lambda: self._show(info))
+
+    @staticmethod
+    def _is_stale(info: dict) -> bool:
+        """系统任务指向的程序，是不是当前这个程序。"""
+        prog, _args = wb_task.launcher()
+        return bool(info.get("exists")
+                    and os.path.normcase(str(info.get("command") or ""))
+                    != os.path.normcase(prog))
 
     def _show(self, info):
         if info.get("error"):
@@ -730,8 +722,12 @@ class ScheduleDialog:
             bits.append("每天 {}".format("、".join(times)))
         if info.get("next_run"):
             bits.append("下次 {}".format(short_time(str(info["next_run"]))))
-        res_txt, ok = wb_task.describe_last_result(info.get("last_result"))
-        bits.append("上次 {}".format(res_txt))
+        ok = True
+        if info.get("partial"):
+            bits.append("正在读取运行记录…")
+        else:
+            res_txt, ok = wb_task.describe_last_result(info.get("last_result"))
+            bits.append("上次 {}".format(res_txt))
         if info.get("stale"):
             bits.append("⚠ 任务指向的程序不是当前这个，请重新「应用到系统」")
         self.lbl_state.configure(
@@ -875,6 +871,7 @@ class App:
         self.last_env: dict = {}
         self.cfg = core.load_config()
         self._fit_pending = False
+        self._fit_size = None
 
         root.title(APP_TITLE)
         root.configure(bg=C_BG)
@@ -930,6 +927,11 @@ class App:
             if self.root.winfo_width() > 1:      # 已显示：只放大，避免抖动
                 w = max(w, self.root.winfo_width())
                 h = max(h, self.root.winfo_height())
+            if self._fit_size == (w, h):
+                # 算出来跟当前一样就别再设一次 geometry：每次设置都会触发
+                # 一次重绘，启动时环境自检会连着刷好几轮内容，白白闪几下。
+                return
+            self._fit_size = (w, h)
             x = self.root.winfo_x()
             y = self.root.winfo_y()
             if x < 1:
@@ -1098,6 +1100,10 @@ class App:
                 txt += " · 任务路径已失效"
             elif st.get("next_run"):
                 txt += " · 下次 " + short_time(str(st["next_run"]))
+            else:
+                # 快速查询读不到运行记录（下次运行时间在 XML 里没有），
+                # 能确认的只有"系统里确实注册着"
+                txt += " · 已注册"
         return txt
 
     def apply_config(self, cfg: dict) -> None:
@@ -1257,10 +1263,11 @@ class App:
         elif code == "NO_MODULE":
             self.set_banner(
                 "error", "缺少内置模块，无法连接客户端",
-                "{}\n这通常不是没装客户端，而是模块不在预期路径上。"
-                "可在「设置 → 内置模块目录」里手动指定它所在的父目录。".format(
+                "{}这通常不是没装客户端，而是客户端文件不完整或版本过旧。"
+                "重装或升级客户端后，点下面按钮重新自检即可。".format(
                     env.get("message", "")),
-                action="  打开设置  ", action_cmd=self.open_settings)
+                action="  重新自检  ",
+                action_cmd=lambda: self.start_task(self.task_env_check))
         elif code == "NOT_LOGGED_IN":
             self.set_banner(
                 "error", "客户端未登录",
@@ -1290,12 +1297,19 @@ class App:
         self.refresh_schedule_state(log_it=True)
 
     def refresh_schedule_state(self, log_it: bool = False) -> None:
-        """读一次系统计划任务状态（本方法可能跑在后台线程里）。"""
+        """读一次系统计划任务状态（本方法可能跑在后台线程里）。
+
+        用 query_fast（直读任务定义 XML，约 0.5 毫秒）而不是 query()：
+        后者每次都要拉起 PowerShell 并重新加载 ScheduledTasks 模块，
+        本机实测单次 5 秒——挂在启动自检上，就是"开程序后横幅转半天、
+        按钮一直灰着"的元凶。这里只需要 exists / command，XML 里都有。
+        下次运行时间、上次结果这类运行记录只在「定时签到」对话框里按需查。
+        """
         if not self.cfg.get("schedule_enabled"):
             self.sched_state = None
             self.post("call", self.report_config)
             return
-        info = wb_task.query()
+        info = wb_task.query_fast()
         prog, _args = wb_task.launcher()
         info["stale"] = bool(
             info.get("exists")
@@ -1309,8 +1323,10 @@ class App:
             elif info["stale"]:
                 self.log("定时任务：系统任务的程序路径与当前不一致，需重新应用")
             else:
-                self.log("定时任务：已注册，下次执行 {}".format(
-                    info.get("next_run") or "?"))
+                times = "、".join(info.get("times") or []) or "?"
+                jit = int(info.get("jitter_minutes") or 0)
+                self.log("定时任务：已注册，每天 {}{}".format(
+                    times, "（±{} 分）".format(jit) if jit else ""))
         self.post("call", self.report_config)
 
     def task_status(self) -> None:

@@ -21,8 +21,10 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from xml.etree import ElementTree
 
 from win_quiet import quiet_kwargs
 
@@ -172,6 +174,120 @@ def exists(task_name: str = TASK_NAME) -> bool:
     return bool(query(task_name).get("exists"))
 
 
+# ---------------- 任务查询（快速路径） ----------------
+
+# 系统把每个计划任务落成一份 XML 定义文件，人人可读。直接读它只要约
+# 0.1 毫秒，而走 PowerShell 要重新加载 ScheduledTasks 模块——本机实测
+# 单次查询 5.0 秒。启动自检、应用定时前的遗留清理都只需要"任务在不在、
+# 指向哪个程序、几点跑"，用这份文件完全够，于是把它们全部切到快速路径。
+TASK_NS = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
+
+
+def task_xml_path(task_name: str = TASK_NAME) -> Path:
+    """计划任务定义文件的路径。"""
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    return Path(root) / "System32" / "Tasks" / task_name
+
+
+def _iso_to_local_hm(raw: Any) -> str:
+    """'2026-10-11T01:00:00Z' → 本地 '09:00'（UTC 标记会被换算）。
+
+    任务 XML 里的 StartBoundary 一律是 UTC；不带 Z 的按本地时间处理，
+    解析不了返回空串，由调用方忽略该触发器。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if "." in text:                      # 容错：个别系统会带小数秒
+        text = text.split(".", 1)[0] + text[text.find("Z"):]
+    try:
+        if text.endswith("Z"):
+            dt = datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc).astimezone()
+        else:
+            dt = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return ""
+    return dt.strftime("%H:%M")
+
+
+def _iso_duration_minutes(raw: Any) -> int:
+    """'PT15M' → 15；'PT1H30M' → 90。解析不了返回 0。"""
+    text = str(raw or "").strip().upper()
+    if not text.startswith("PT"):
+        return 0
+    total = 0
+    num = ""
+    for ch in text[2:]:
+        if ch.isdigit() or ch == ".":
+            num += ch
+        elif ch in ("H", "M", "S"):
+            try:
+                val = float(num or 0)
+            except ValueError:
+                val = 0.0
+            if ch == "H":
+                total += int(val * 60)
+            elif ch == "M":
+                total += int(val)
+            num = ""
+    return total
+
+
+def query_fast(task_name: str = TASK_NAME) -> Dict[str, Any]:
+    """极速查询：直读任务定义 XML，实测约 0.1 毫秒。
+
+    代价是**拿不到运行记录**：下次运行时间 / 上次运行时间 / 上次返回码
+    都不在 XML 里，统一给 None，并以 ``partial=True`` 标记。展示方据此
+    跳过这些字段，避免出现"上次 未知"这种误导。
+    需要完整信息（例如排查"定时不生效"）时再调 query()。
+    """
+    miss: Dict[str, Any] = {"exists": False, "task": task_name, "partial": True}
+    try:
+        text = task_xml_path(task_name).read_text(encoding="utf-16",
+                                                  errors="replace")
+    except (OSError, ValueError):
+        return miss
+    try:
+        root = ElementTree.fromstring(text)
+    except ElementTree.ParseError:
+        return miss
+
+    cmd = args = ""
+    act = root.find(TASK_NS + "Actions/" + TASK_NS + "Exec")
+    if act is not None:
+        cmd = (act.findtext(TASK_NS + "Command") or "").strip()
+        args = (act.findtext(TASK_NS + "Arguments") or "").strip()
+
+    times: List[str] = []
+    jitter = 0
+    for tr in root.findall(TASK_NS + "Triggers/" + TASK_NS + "CalendarTrigger"):
+        hm = _iso_to_local_hm(tr.findtext(TASK_NS + "StartBoundary") or "")
+        if hm and hm not in times:
+            times.append(hm)
+        jitter = max(jitter, _iso_duration_minutes(
+            tr.findtext(TASK_NS + "RandomDelay") or ""))
+
+    enabled = (root.findtext(TASK_NS + "Settings/" + TASK_NS + "Enabled")
+               or "true").strip().lower() != "false"
+
+    return {
+        "exists": True,
+        "task": task_name,
+        "state": "Ready" if enabled else "Disabled",
+        "enabled": enabled,
+        "times": sorted(times),
+        "jitter_minutes": jitter,
+        "command": cmd,
+        "arguments": args,
+        "next_run": None,
+        "last_run": None,
+        "last_result": None,
+        "partial": True,
+        "source": "xml",
+    }
+
+
 # ---------------- 注册 / 更新 ----------------
 
 _APPLY_TEMPLATE = """
@@ -282,14 +398,18 @@ def cleanup_legacy() -> List[str]:
     注意：任务本来就不存在时**不计入**返回值。旧实现是先 remove 再判断，
     而 remove 是幂等的（不存在也返回成功），于是界面每次应用定时都会
     误报一句「已清理旧的计划任务：_0900、_2100」，其实什么都没清。
+
+    存在性判断走 query_fast（读 XML）：遗留任务在绝大多数机器上根本不存在，
+    用 query() 会白等两次 PowerShell 启动（本机实测各 5 秒），「应用定时」
+    因此要卡 10 秒以上。
     """
     gone: List[str] = []
     for name in LEGACY_TASKS:
         try:
-            if not query(name).get("exists"):
+            if not query_fast(name).get("exists"):
                 continue        # 本来就没有，别去动它，也别在界面上瞎报
             ok, _msg = remove(name)
-            if ok and not query(name).get("exists"):
+            if ok and not query_fast(name).get("exists"):
                 gone.append(name)
         except Exception:
             pass

@@ -1,0 +1,38 @@
+# ---------------- 构建产物 ----------------
+.build/
+dist/
+build/
+*.spec
+
+# ---------------- 运行时产物（含密钥，绝对不要提交）----------------
+# config.json 里可能存有企业微信 / 钉钉的真实 key，
+# 需要配置样例请参考 config.example.json
+config.json
+checkin.log
+selftest.json
+no_popup_check.json
+*.log
+
+# ---------------- Python ----------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ---------------- 编辑器 / 系统 ----------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+desktop.ini
+
+# ---------------- 本地工具状态 ----------------
+# 内含本机路径、进程号、账号 uid 等个人环境信息，不适合公开
+.workbuddy/

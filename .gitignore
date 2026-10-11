@@ -5,8 +5,7 @@ build/
 *.spec
 
 # ---------------- 运行时产物（含密钥，绝对不要提交）----------------
-# config.json 里可能存有企业微信 / 钉钉的真实 key，
-# 需要配置样例请参考 config.example.json
+# config.json 里存有企业微信 / 钉钉的真实 key，必须挡在版本库外
 config.json
 checkin.log
 selftest.json

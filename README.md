@@ -180,8 +180,8 @@ python checkin_gui.py
 
 ## 配置项
 
-配置文件是 exe 旁边的 `config.json`（首次运行自动生成）。样例见
-[`config.example.json`](config.example.json)。
+配置文件是 exe 旁边的 `config.json`（首次运行自动生成）。下表就是它的全部内容，
+**通常不需要手改** —— 界面上都能改。
 
 | 键 | 默认 | 含义 |
 |---|---|---|
@@ -247,7 +247,6 @@ workbuddy-checkin/
 ├── win_quiet.py              # 让子进程不弹控制台窗口
 ├── build_exe.py              # 一键打包（含解释器校验）
 ├── probe_hidden_launch.py    # 后台拉起探针（只读，用于验证隐藏窗口可行性）
-├── config.example.json       # 配置样例
 ├── tools/
 │   └── no_popup_check.py     # 回归检查：运行程序时是否弹出控制台黑框
 └── docs/

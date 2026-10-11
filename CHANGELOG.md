@@ -38,7 +38,8 @@
 
 - README 全面重写，新增目录、特性表、免责声明、项目结构。
 - 新增 `CHANGELOG.md`、`docs/architecture.md`、`docs/troubleshooting.md`。
-- 新增 `config.example.json` 配置样例。
+- 不再提供 `config.example.json` 配置样例：全部配置项已在 README 的「配置项」
+  表格里列全，单独维护一份样例反而容易与代码脱节。
 - **面向使用者的文档改为只描述界面操作**：README 与 troubleshooting 中原有的命令行用法
   （`--selftest` / `--sched-status` / `--run`、以及查任务状态的命令）全部替换为
   「打开程序 → 点某个按钮」的界面步骤，`selftest.json` 相关内容一并移除。

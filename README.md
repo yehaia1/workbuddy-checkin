@@ -189,6 +189,7 @@ python checkin_gui.py
 | `dingtalk_key` | `""` | 钉钉机器人 access_token（只填 token）。留空则不推送该渠道 |
 | `wecom_webhook` / `dingtalk_webhook` | `""` | 兼容旧配置：可直接填完整地址，优先于上面的 key |
 | `workbuddy_exe` | `""` | 客户端路径。**留空 = 自动探测**（推荐） |
+| `ipc_dir` | `""` | 内置模块所在目录。**留空 = 自动探测**（推荐）；仅当提示「缺少内置模块」时手工指定 |
 | `launch_workbuddy` | `true` | 宿主未运行时自动拉起客户端 |
 | `launch_timeout` | `120` | 拉起后等待 IPC 就绪的最长秒数 |
 | `hide_window` | `true` | 拉起后隐藏客户端主窗口（后台运行） |
@@ -248,7 +249,8 @@ workbuddy-checkin/
 ├── build_exe.py              # 一键打包（含解释器校验）
 ├── probe_hidden_launch.py    # 后台拉起探针（只读，用于验证隐藏窗口可行性）
 ├── tools/
-│   └── no_popup_check.py     # 回归检查：运行程序时是否弹出控制台黑框
+│   ├── no_popup_check.py           # 回归检查：运行程序时是否弹出控制台黑框
+│   └── module_discovery_check.py   # 回归检查：非标准安装布局能否找到内置模块
 └── docs/
     ├── architecture.md       # 架构与实现细节
     └── troubleshooting.md    # 排查手册
@@ -258,10 +260,20 @@ workbuddy-checkin/
 
 ## 常见问题
 
-**Q：点「定时签到」时冒出一个 PowerShell 窗口？**
-v1.5 已修复。原因是窗口程序自身没有控制台，拉起 `powershell.exe` 这类控制台程序时
-Windows 会给它**新建一个控制台窗口**。修法是所有子进程调用统一加
-`creationflags=CREATE_NO_WINDOW`。详见 [docs/troubleshooting.md](docs/troubleshooting.md#点按钮闪出黑框)。
+**Q：点「定时签到」时冒出一个黑色的命令窗口？**
+v1.5 已修复。原因是窗口程序自身没有控制台，去调用系统命令时 Windows
+会**给它新建一个控制台窗口**。现在所有系统调用都在隐藏窗口的方式下进行。
+详见 [docs/troubleshooting.md](docs/troubleshooting.md#点按钮闪出黑框)。
+
+**Q：在我这台电脑好好的，拷到另一台电脑就提示「缺少内置模块」？**
+这是 v1.6 修掉的问题。客户端自带的内置模块在不同安装方式下**位置不一样**，
+旧版只认几条固定路径，对不上就整体失效（哪怕客户端装好也登录了）。
+现在会自动递归去找，绝大多数情况不用管。
+
+万一还是提示，就到「**设置 → 内置模块目录**」手动指一下：选
+`workbuddy_ipc` 所在的**父目录**（该目录下应该有个 `workbuddy_ipc` 文件夹，
+里面是 `__init__.py`）。详见
+[docs/troubleshooting.md](docs/troubleshooting.md#提示缺少内置模块)。
 
 **Q：定时到点了但没签到？**
 打开程序，点「**定时签到**」，对话框上方的「系统状态」那行会直接显示任务是否已注册、

@@ -65,6 +65,53 @@
 
 ---
 
+## 内置模块发现：为什么不能写死路径
+
+`workbuddy_ipc` 是客户端**自带**的模块（不是 pip 装的），运行时靠往 `sys.path`
+插一个目录再 `import`。麻烦在于：**它的父目录在不同安装方式/版本下并不统一**。
+实测同一台机器上就同时存在三种布局：
+
+```
+<安装目录>/resources/app.asar.unpacked/resources/plugins/
+    workbuddy-builtin/skills/library/                          ← 主路径
+    workbuddy-builtin/builtin-plugins/<插件>/skills/<技能>/     ← 插件式布局
+<用户目录>/.workbuddy/plugins/cache/<厂商>/<插件>/<版本>/…/     ← 插件缓存
+```
+
+早期版本只探测前两类中的固定几条，一旦对不上就整体报
+`IPC_MODULE_NOT_FOUND` —— 表现为"明明装了客户端也登录了，却说找不到模块"。
+本机跑得好好的、换台机器就坏，根源就在这里。
+
+### v1.6 的做法：约定路径 + 有界递归兜底
+
+`module_roots()` 按可信度依次产出候选目录：
+
+1. 配置里手工指定的 `ipc_dir`（最后一根救命稻草）
+2. 环境变量（存在时）
+3. 安装目录内的约定路径（命中即用，最快）
+4. 用户插件缓存的多种 glob 布局
+5. **有界递归扫描**：在安装目录 / 插件缓存 / `~/.workbuddy` 下逐层找
+   `workbuddy_ipc` 的父目录（深度 ≤ 9，条目数封顶，跳过纯缓存目录）
+
+实测代价：安装目录约 20 ms、插件缓存约 30 ms，整体 `module_roots()` 约 0.15 s，
+相对一次签到（2 秒级）可以忽略。
+
+### 两个踩过的坑
+
+- **命中后不能提前收工**。同一个 base 下可能并存多种布局
+  （`skills/workbuddy_ipc` 与 `skills/library/workbuddy_ipc` 同时存在），
+  找到第一个就 `continue` 会把后者漏掉。
+- **不能"跳过所有点号目录"**。`~/.workbuddy` 本身就是最关键的位置；
+  必须用显式黑名单（`.git` / `.venv` / `node_modules` …）而不是前缀判断。
+
+### 报错要能远程定位
+
+失败时把 `候选目录 N 个；客户端安装目录 X` 拼进报错信息。这条信息决定了
+远程排查是"再猜一轮"还是"一眼看出是哪个环节断了"。自检还会输出每条候选目录的
+`exists` / `has_package`，见 `tools/module_discovery_check.py`。
+
+---
+
 ## 后台运行：怎么做到不跳窗打断你
 
 ### 先试官方参数：没有

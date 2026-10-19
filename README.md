@@ -151,6 +151,10 @@ python workbuddy_checkin.py --diagnose       # 看当前令牌状态（不显示
 > ② 调用身份是 CLI 而不是桌面端，服务端看到的风控特征不同。
 > 如果你的机器常年开着客户端，**没有理由选直连**。
 
+| 直连模式主界面 | 设置里的登录方式 |
+|---|---|
+| ![直连主界面](dist/ui_oauth_main.png) | ![登录方式](dist/ui_oauth_settings.png) |
+
 ---
 
 ## 定时签到（每天自动跑）

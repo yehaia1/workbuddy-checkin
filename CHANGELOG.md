@@ -3,6 +3,53 @@
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)，
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2.1] - 2026-10-19
+
+**目录与入口重组：逻辑源码、构建脚本、本地运行、独立运行四件事彻底分开。**
+
+### 变更（不兼容的路径调整）
+
+- **目录分层**
+  - `src/`：全部业务逻辑（GUI、签到、授权、推送、计划任务、服务端脚本）
+  - `build/`：全部构建代码（`build_exe.py` + `entry.py`）
+  - `tools/`：回归检查，不参与发布
+  - 仓库根目录只留 `run.py` 与文档
+- **两个运行入口**
+  - `run.py`：本地源码运行，唯一入口。负责挂 `src/` 到 `sys.path`，
+    并在缺 tkinter 时给出明确提示
+  - `build/entry.py`：独立运行入口，只给 PyInstaller 用。冻结态不再做
+    路径引导，避免把 `_MEIPASS` 里的包结构搞乱
+- **数据目录按运行方式分流**
+  - 本地运行：仓库根目录
+  - 独立运行：exe 所在目录
+  - 两套 `config.json` / `checkin.log` / `auth_oauth.json` 互不影响
+  - 界面日志区新增一行「运行方式」，排查时先确认在看哪一套
+- 版本号 2.0 → 2.1。
+
+### 构建
+
+- `build/build_exe.py` 显式传 `--paths src`，入口改为 `build/entry.py`
+- 打包加 `--clean`，避免上一次的中间产物导致 `PermissionError`
+- 自检不再只看 `selftest.json` 是否存在，还要求 `frozen == true`；
+  顺带打印授权状态与推送渠道
+- 打包成功后自动复制出 `dist/WorkBuddy签到.exe`，不再手工改名
+- `.gitignore` 不再忽略 `build/`（它是打包脚本目录）；中间产物仍在 `.build/`
+
+### 文档
+
+- README 按新结构重写，开头先讲清「本地运行 vs 独立运行」
+- `docs/` 重组为四份：`usage.md`（使用）、`build.md`（构建）、
+  `architecture.md`（架构取舍）、`troubleshooting.md`（排障）
+- 删除过期的界面缩放、客户端通道、旧路径说明；命令行示例统一改为
+  `python run.py …` / `WorkBuddy签到.exe …`
+- 排障手册新增「先分清两套数据目录」与「本地/独立任务互相覆盖」两节
+
+### 回归
+
+- `tools/oauth_mode_check.py`：41 项全部通过（路径改为 `src/`）
+- `dist/WorkBuddy签到.exe --selftest`：`frozen=true`、`app_dir=dist`
+- `--sched-status` 无控制台弹窗
+
 ## [2.0] - 2026-10-19
 
 **不兼容的大改版：只保留「账号直连」一条通道，其它全部删掉。**

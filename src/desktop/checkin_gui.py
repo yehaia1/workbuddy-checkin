@@ -243,14 +243,15 @@ def center_over(parent: tk.Misc, top: tk.Toplevel, frac: int = 3) -> None:
 # ---------------- 授权窗口 ----------------
 
 class AuthDialog:
-    """账号授权：只做本机浏览器授权。
+    """账号授权：在本机发起，链接可以直接拿到手机上完成。
 
-    为什么单独一个窗口：浏览器那头登录完，用户需要看到"到底成没成"，
-    否则只能靠再点一次签到去试，失败了也说不清是授权没完成还是别的问题。
+    设备授权的链接**不绑定发起设备**：本机点「立即授权」拿到链接，复制到手机
+    打开并登录，本机这边用同一个 `state` 轮询，手机点完确认后几秒内自动
+    拿到令牌并落盘，手机上不需要任何回传操作。
 
-    **远程授权（把链接推到手机）不在这里**：那是服务端流程的一部分，
-    由 wb_server.py 自己完成（见 docs/server.md）。
-    本地版只保留这一个入口，界面和心智负担都最简单。
+    所以默认不在本机弹浏览器（`open_browser=False`）——多数人的 WorkBuddy
+    账号就在手机上，拿链接过去比在电脑上再登录一次更顺。「在本机打开」
+    仍然留着，给习惯在电脑上操作的人。
 
     线程模型：网络轮询在后台线程，结果通过队列回主线程刷控件。
     """
@@ -277,11 +278,14 @@ class AuthDialog:
         body = tk.Frame(top, bg=C_BG)
         body.pack(fill="both", expand=True, padx=P(20), pady=(P(16), 0))
 
-        tk.Label(body, text="在本机浏览器完成登录", font=UI_FONT_BOLD, bg=C_BG,
+        tk.Label(body, text="用手机完成授权", font=UI_FONT_BOLD, bg=C_BG,
                  fg=C_TEXT, anchor="w").pack(fill="x")
-        self.lbl_desc = tk.Label(body, text="正在申请授权链接…", font=UI_FONT_SM,
-                                 bg=C_BG, fg=C_MUTED, anchor="w",
-                                 justify="left", wraplength=P(480))
+        self.lbl_desc = tk.Label(
+            body,
+            text=("复制链接发到手机打开，登录并确认授权。手机点完，"
+                  "本窗口会自动拿到令牌，电脑上不用再操作。"),
+            font=UI_FONT_SM, bg=C_BG, fg=C_MUTED, anchor="w",
+            justify="left", wraplength=P(420))
         self.lbl_desc.pack(fill="x", pady=(P(6), P(10)))
 
         self.var_url = tk.StringVar(value="")
@@ -290,23 +294,37 @@ class AuthDialog:
 
         row = tk.Frame(body, bg=C_BG)
         row.pack(fill="x", pady=(P(10), 0))
-        self.btn_copy = flat_button(row, "复制链接", self._copy)
+        self.btn_copy = flat_button(row, "复制链接", self._copy, primary=True)
         self.btn_copy.pack(side="left", padx=(0, P(8)))
-        self.btn_open = flat_button(row, "打开浏览器", self._open)
+        self.btn_open = flat_button(row, "在本机打开", self._open)
         self.btn_open.pack(side="left", padx=(0, P(8)))
         self.btn_close = flat_button(row, "取消", self._cancel)
         self.btn_close.pack(side="left")
 
-        self.lbl_status = tk.Label(body, text="等待授权…", font=UI_FONT_SM,
+        self.lbl_status = tk.Label(body, text="正在申请授权链接…", font=UI_FONT_SM,
                                    bg=C_BG, fg=C_WARN, anchor="w",
-                                   justify="left", wraplength=P(480))
+                                   justify="left", wraplength=P(420))
         self.lbl_status.pack(fill="x", pady=(P(12), P(16)))
+
+        # 换行宽度跟着控件实际宽度走：P(420) 在高 DPI 下可能比可用宽度还宽，
+        # 那样中文会被窗口边缘直接裁掉（不是换行）。
+        for _lbl in (self.lbl_desc, self.lbl_status):
+            _lbl.bind("<Configure>", self._fit_wrap)
 
         center_over(app.root, top)
         top.grab_set()
 
         threading.Thread(target=self._work, daemon=True).start()
         top.after(200, self._drain)
+
+    @staticmethod
+    def _fit_wrap(event) -> None:
+        w = max(P(120), int(event.width) - P(2))
+        try:
+            if int(event.widget.cget("wraplength")) != w:
+                event.widget.configure(wraplength=w)
+        except Exception:
+            pass
 
     def _status(self, text, level="info"):
         color = {"ok": C_OK, "bad": C_BAD, "warn": C_WARN}.get(level, C_MUTED)
@@ -321,7 +339,8 @@ class AuthDialog:
                 progress=lambda m: self.q.put(("msg", m)),
                 timeout=self.timeout,
                 on_url=lambda u: self.q.put(("url", u)),
-                should_stop=lambda: self.stop)
+                should_stop=lambda: self.stop,
+                open_browser=False)     # 默认不弹本机浏览器，链接拿去手机用
             if rec.get("result") == "AUTHORIZED":
                 self.q.put(("done", rec))
             else:
@@ -336,9 +355,6 @@ class AuthDialog:
                 if kind == "url":
                     self.url = str(payload)
                     self.var_url.set(self.url)
-                    self.lbl_desc.configure(
-                        text=("浏览器已打开授权页；若没反应，点「打开浏览器」"
-                              "或复制下方链接手动访问。"))
                 elif kind == "msg":
                     self._status(str(payload), "info")
                 elif kind == "done":
@@ -352,7 +368,7 @@ class AuthDialog:
         if not self.done:
             elapsed = int(time.time() - self.started)
             if self.url:
-                self._status("等待完成授权… 已等 {} 秒（最多 {} 秒）".format(
+                self._status("等待手机完成授权… 已等 {} 秒（最多 {} 秒）".format(
                     elapsed, self.timeout), "warn")
             self.top.after(300, self._drain)
 
@@ -1064,7 +1080,7 @@ class App:
 
         if not info.get("present"):
             self.sec_auth.set("● 未授权",
-                              "还没有登录过。点「立即授权」完成一次浏览器登录，"
+                              "还没有登录过。点「立即授权」拿到链接，用手机完成授权；"
                               "授权前其它操作都不可用。", C_BAD)
         elif info.get("error"):
             self.sec_auth.set("● 令牌异常",
@@ -1308,7 +1324,7 @@ class App:
                         if days is not None else ""))
         elif code == "OAUTH_NOT_AUTHORIZED":
             self.set_banner(
-                "error", "尚未授权　先完成一次浏览器登录，授权前其它操作都不可用。",
+                "error", "尚未授权　先点「立即授权」用手机完成授权，授权前其它操作都不可用。",
                 "  立即授权  ", self.open_auth)
         elif code in ("OAUTH_SESSION_DEAD", "OAUTH_TOKEN_BAD"):
             self.set_banner(

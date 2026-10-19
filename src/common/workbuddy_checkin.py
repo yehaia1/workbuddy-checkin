@@ -15,18 +15,19 @@
 
 用法
 ----
-本地运行统一走仓库根目录的 `run.py`（打包后的 exe 参数完全一致）：
+源码运行（打好的 exe 参数完全一致）：
 
-    python run.py                          # 图形界面
-    python run.py --run                    # 无界面执行一次（计划任务用）
-    python run.py --check-only
-    python run.py --auth                   # 本机浏览器授权（界面唯一入口）
-    python run.py --test-notify
-    python run.py --diagnose
-    python run.py --version
+    python src/desktop/checkin_gui.py      # 图形界面
+    python src/common/workbuddy_checkin.py --run        # 无界面执行一次（计划任务用）
+    python src/common/workbuddy_checkin.py --check-only
+    python src/common/workbuddy_checkin.py --auth       # 发起授权（打印链接）
+    python src/common/workbuddy_checkin.py --auth --no-browser   # 只打印链接，不弹浏览器
+    python src/common/workbuddy_checkin.py --test-notify
+    python src/common/workbuddy_checkin.py --diagnose
+    python src/common/workbuddy_checkin.py --version
   以上均可加 --json 输出单行 JSON
 
-服务端（定时脚本）不是这套参数，见 src/wb_server.py。
+服务端（定时脚本）不是这套参数，见 src/server/wb_server.py。
 """
 from __future__ import annotations
 
@@ -313,12 +314,16 @@ def login_oauth(cfg: Optional[Dict[str, Any]] = None,
                 progress: Optional[Any] = None,
                 timeout: Optional[int] = None,
                 on_url: Optional[Callable[[str], None]] = None,
-                should_stop: Optional[Callable[[], bool]] = None
+                should_stop: Optional[Callable[[], bool]] = None,
+                open_browser: bool = True
                 ) -> Dict[str, Any]:
-    """走一遍设备授权，把令牌落到本机（本机浏览器，界面唯一入口）。
+    """走一遍设备授权，把令牌落到本机。
 
-    远程授权（把链接推到手机）不在这里：那属于服务端流程，
-    由 wb_server.py 自己完成，见 docs/server.md。
+    链接给谁打开都行：本机浏览器、手机、另一台电脑。令牌始终由**发起方自己**
+    用 `state` 轮询回来（见 wb_oauth.poll_token），不需要对方回传。
+
+    open_browser=False 时不在本机弹浏览器，只把链接交给 on_url / 日志，
+    适合"复制到手机授权"（界面默认）或无图形环境（`--auth --no-browser`）。
 
     on_url(url)   拿到链接的瞬间回调（界面靠它立刻把链接显示出来）
     should_stop() 返回 True 时中断等待（用户点了取消）
@@ -329,7 +334,7 @@ def login_oauth(cfg: Optional[Dict[str, Any]] = None,
     timeout = int(timeout or cfg.get("oauth_auth_timeout", 300) or 300)
 
     try:
-        rec = wb_oauth.login(path, emit=emit, open_browser=True,
+        rec = wb_oauth.login(path, emit=emit, open_browser=bool(open_browser),
                              timeout=timeout, on_url=on_url,
                              should_stop=should_stop)
     except wb_oauth.OAuthError as e:
@@ -356,12 +361,12 @@ def login_oauth(cfg: Optional[Dict[str, Any]] = None,
 
 def import_token(code_or_file: str,
                  cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """导入服务端授权拿到的令牌（导入码或令牌文件路径）。"""
+    """导入一份已有令牌（导入码或令牌文件路径）。"""
     cfg = cfg or load_config()
     raw = str(code_or_file or "").strip()
     if os.path.isfile(raw):
-        # 也接受一个令牌文件（服务端 --save-token 导出的那份，或别的机器
-        # 拷过来的 auth_oauth.json）。文件里是 JSON，导入码是 base64，两者都要认。
+        # 也接受一个令牌文件（比如另一台机器拷过来的 auth_oauth.json）。
+        # 文件里是 JSON，导入码是 base64，两者都要认。
         try:
             with open(raw, "r", encoding="utf-8") as fh:
                 text = fh.read()
@@ -549,7 +554,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--test-notify", action="store_true",
                         help="发送测试消息到已选推送渠道")
     parser.add_argument("--auth", action="store_true",
-                        help="本机浏览器授权（界面唯一入口）")
+                        help="发起设备授权：打印授权链接并等待完成")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="配合 --auth：不自动打开本机浏览器，只打印链接")
     parser.add_argument("--import-token", metavar="CODE_OR_FILE",
                         help="导入授权结果（导入码或令牌文件），令牌迁移/救急用")
     parser.add_argument("--version", action="store_true", help="显示版本后退出")
@@ -597,7 +604,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     if args.auth:
-        result = login_oauth(cfg, progress=_progress)
+        result = login_oauth(cfg, progress=_progress,
+                             open_browser=not args.no_browser)
         render(result, args.json)
         return int(result.get("exit_code", 0))
 

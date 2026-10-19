@@ -243,7 +243,7 @@ def load(path: str) -> Dict[str, Any]:
     if not os.path.isfile(path):
         raise OAuthError(
             "OAUTH_NOT_LOGGED_IN",
-            "尚未完成账号授权。请点「立即授权」完成一次浏览器登录。", 2)
+            "尚未完成账号授权。请点「立即授权」完成一次授权。", 2)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -355,7 +355,7 @@ def poll_token(state: str, timeout: int = 900, interval: int = POLL_INTERVAL,
                on_tick: Optional[Callable[[int, int], None]] = None,
                should_stop: Optional[Callable[[], bool]] = None
                ) -> Dict[str, Any]:
-    """等用户在浏览器里完成登录，拿到授权响应。
+    """等用户在任意设备上完成登录，拿到授权响应。
 
     on_tick(elapsed, remain) 用于界面刷进度；should_stop() 返回 True 时中断。
     返回原始授权响应体，调用方再用 build_record() 转成落盘格式。
@@ -383,7 +383,7 @@ def poll_token(state: str, timeout: int = 900, interval: int = POLL_INTERVAL,
             on_tick(int(time.time() - started), int(deadline - time.time()))
         time.sleep(max(1, int(interval)))
     raise OAuthError("OAUTH_TIMEOUT",
-                     "授权超时：{} 秒内未完成浏览器登录。".format(int(timeout)), 2)
+                     "授权超时：{} 秒内未完成授权。".format(int(timeout)), 2)
 
 
 def _open_browser(url: str) -> bool:
@@ -410,9 +410,13 @@ def login(path: str, emit: Optional[Callable[[str], None]] = None,
     url = info["auth_url"]
     if on_url and url:
         on_url(url)
-    say("请在浏览器完成登录：{}".format(url))
+    # 链接可以给任何设备打开：手机扫码授权后，**发起方自己**靠 state 轮询取令牌，
+    # 不需要手机回传任何东西。所以 open_browser=False 只影响"是否在本机弹浏览器"。
     if open_browser and url:
+        say("请在浏览器完成登录：{}".format(url))
         say("已尝试自动打开浏览器" if _open_browser(url) else "自动打开失败，请手动复制链接")
+    else:
+        say("请在手机或任意设备打开授权链接：{}".format(url))
     payload = poll_token(info["state"], timeout=timeout,
                          on_tick=on_tick, should_stop=should_stop)
     record = build_record(payload)

@@ -26,14 +26,14 @@ Windows 那台机器可能没人守着（或者干脆没有浏览器）。与其
 三种用法
 --------
 1) 默认：生成链接 → 推送 → 等待扫码 → 打印导入码（人工粘到 Windows 端）
-       python wb_auth_server.py
+       python src/wb_auth_server.py
 
 2) 自动：授权后开一个一次性领取端口，Windows 端自己来取，全程无人工
-       python wb_auth_server.py --handoff --port 8787
+       python src/wb_auth_server.py --handoff --port 8787
      Windows 端执行脚本打印出来的那条命令即可。
 
 3) 只转发：把一条已有链接推到渠道（本机生成的链接也能借服务器发出去）
-       python wb_auth_server.py --push-only --url https://copilot.tencent.com/login?...
+       python src/wb_auth_server.py --push-only --url https://copilot.tencent.com/login?...
 
 零依赖，Python 3.7+，Linux / Windows 都能跑。
 """
@@ -245,7 +245,7 @@ def do_auth(cfg: dict, channels: list, timeout: int,
         say("在 Windows 端执行（exe 或源码任选其一）：")
         say('  WorkBuddy签到.exe --pull-token "http://{}:{}/token" "{}"'
             .format(local_ip(), h.port, h.secret))
-        say('  python workbuddy_checkin.py --pull-token '
+        say('  python run.py --pull-token '
             '"http://{}:{}/token" "{}"'.format(local_ip(), h.port, h.secret))
         got = h.serve(handoff_timeout)
         if not got:
@@ -277,7 +277,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="服务端发起 WorkBuddy 账号授权，把链接推到手机并在本地等待结果")
     ap.add_argument("--config", default="",
-                    help="配置文件路径（默认与本脚本同目录的 config.json）")
+                    help="配置文件路径（默认仓库根目录的 config.json）")
     ap.add_argument("--channel", choices=["wecom", "dingtalk"], default="",
                     help="强制只用某个推送渠道（默认按配置里的 push_channels）")
     ap.add_argument("--timeout", type=int, default=600,

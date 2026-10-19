@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 APP_TITLE = "WorkBuddy 签到"
-VERSION = "2.0"
+VERSION = "2.1"
 
 TOKEN_FILE_NAME = "auth_oauth.json"
 
@@ -25,15 +25,26 @@ TOKEN_FILE_NAME = "auth_oauth.json"
 PUSH_CHANNEL_LABELS = {"wecom": "企业微信", "dingtalk": "钉钉"}
 
 
-def app_dir() -> Path:
-    """程序所在目录。
+SRC_DIR = Path(__file__).resolve().parent
 
-    打包成单文件 exe 后 __file__ 指向 PyInstaller 的临时解包目录，
-    配置和日志写进去会在进程退出时一起消失，所以冻结态必须用 exe 目录。
+
+def run_mode() -> str:
+    """"frozen" = 独立运行（exe），"source" = 本地源码运行。"""
+    return "frozen" if getattr(sys, "frozen", False) else "source"
+
+
+def app_dir() -> Path:
+    """数据目录（配置、日志、令牌都放这里）。
+
+    * 独立运行：`__file__` 在 PyInstaller 的临时解包目录里，写进去会随进程
+      退出一起消失，所以必须用 exe 所在目录。
+    * 本地源码运行：`src/` 的上级目录，也就是仓库根目录 —— 不能把运行时
+      文件写进源码树里，否则配置、日志和 .py 混在一起，也很难区分
+      哪份配置属于哪次运行。
     """
-    if getattr(sys, "frozen", False):
+    if run_mode() == "frozen":
         return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    return SRC_DIR.parent
 
 
 SCRIPT_DIR = app_dir()

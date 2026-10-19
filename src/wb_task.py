@@ -392,8 +392,10 @@ def remove(task_name: str = TASK_NAME) -> Tuple[bool, str]:
 def launcher() -> Tuple[str, str]:
     """返回计划任务应当执行的 (程序, 参数)。
 
-    冻结态：exe 自己，加 --run（无界面签到入口）
-    源码态：优先 pythonw（无控制台，不闪黑框），退回当前解释器
+    冻结态（独立运行）：exe 自己，加 --run
+    源码态（本地运行）：pythonw + 仓库根目录的 run.py，同样加 --run
+
+    两种情况都用无控制台的解释器 / 窗口程序，避免每次触发闪一下黑框。
     """
     if getattr(sys, "frozen", False):
         return str(Path(sys.executable).resolve()), RUN_ARG
@@ -402,8 +404,9 @@ def launcher() -> Tuple[str, str]:
     if not pyw.is_file():
         alt = exe.with_name(exe.name.replace("python", "pythonw"))
         pyw = alt if alt.is_file() else exe
-    script = str(Path(__file__).resolve().parent / "checkin_gui.py")
-    return str(pyw), '"{}" {}'.format(script, RUN_ARG)
+    # wb_task.py 在 src/ 下，仓库根目录是它上一级
+    entry = Path(__file__).resolve().parent.parent / "run.py"
+    return str(pyw), '"{}" {}'.format(entry, RUN_ARG)
 
 
 # 任务计划自身的状态码（SCHED_S_*），它们**不是**失败，别误报成异常

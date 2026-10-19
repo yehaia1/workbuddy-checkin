@@ -969,6 +969,9 @@ class App:
         self.root.after(120, self._drain)
         cfg_path = wb_config.ensure_file()
         self.log("{} v{} 已启动".format(APP_TITLE, VERSION))
+        self.log("运行方式：{}".format(
+            "独立运行（exe）" if wb_config.run_mode() == "frozen"
+            else "本地源码运行"))
         self.log("程序目录：{}".format(wb_config.SCRIPT_DIR))
         self.log("配置文件：{}".format(cfg_path))
         self.log("系统 DPI {}（缩放 {:.0f}%）".format(

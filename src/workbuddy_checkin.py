@@ -15,15 +15,17 @@
 
 用法
 ----
-    python checkin_gui.py                  # 图形界面
-    python workbuddy_checkin.py --run       # 无界面执行一次（计划任务用）
-    python workbuddy_checkin.py --check-only
-    python workbuddy_checkin.py --auth          # 本机浏览器授权
-    python workbuddy_checkin.py --auth-push     # 授权链接推到手机，本机等待
-    python workbuddy_checkin.py --import-token <导入码|文件>
-    python workbuddy_checkin.py --pull-token <url> <secret>
-    python workbuddy_checkin.py --test-notify
-    python workbuddy_checkin.py --diagnose
+本地运行统一走仓库根目录的 `run.py`（打包后的 exe 参数完全一致）：
+
+    python run.py                          # 图形界面
+    python run.py --run                    # 无界面执行一次（计划任务用）
+    python run.py --check-only
+    python run.py --auth                   # 本机浏览器授权
+    python run.py --auth-push              # 授权链接推到手机，本机等待
+    python run.py --import-token <导入码|文件>
+    python run.py --pull-token <url> <secret>
+    python run.py --test-notify
+    python run.py --diagnose
   以上均可加 --json 输出单行 JSON
 """
 from __future__ import annotations

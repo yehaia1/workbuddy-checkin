@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""一键把 checkin_gui.py 打包成单文件 exe（开发/发布用）。
+"""把「独立运行」版本打包成单文件 exe（发布用，与逻辑源码分开）。
+
+本脚本只负责构建，不掺业务逻辑：
+    ROOT/src/          逻辑源码（GUI、签到、授权、推送、计划任务）
+    ROOT/build/entry.py 冻结态入口（PyInstaller 从这里进）
+    ROOT/dist/          产物
 
 为什么要包一层脚本：**打包用的解释器必须带 tkinter**。
 用不带 tkinter 的解释器打包，PyInstaller 不报任何错，只是悄悄少收集
@@ -9,25 +14,31 @@
 极易被忽略。所以这里先挑一个能 `import tkinter` 的解释器，打完再自检。
 
 用法：
-    python build_exe.py                   # 产出 dist/WorkBuddyCheckin.exe
-    python build_exe.py --python <解释器>  # 指定解释器
+    python build/build_exe.py                    # 产出 dist/WorkBuddyCheckin.exe
+    python build/build_exe.py --python <解释器>   # 指定解释器
 """
 from __future__ import annotations
 
 import glob
+import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
+SRC = ROOT / "src"
+ENTRY = ROOT / "build" / "entry.py"
 
 # 运行时才用到的标准库（PyInstaller 静态分析有时漏掉，显式声明更稳）
 HIDDEN_IMPORTS = [
     "base64", "binascii", "json", "re", "secrets", "socket", "ssl",
     "threading", "urllib.parse", "urllib.request", "urllib.error",
     "http.server", "http.client", "email", "email.utils",
-    "_socket", "_ssl",
+    "_socket", "_ssl", "tkinter", "tkinter.ttk",
+    "wb_config", "wb_notify", "wb_oauth", "wb_task", "win_quiet",
+    "workbuddy_checkin", "checkin_gui",
 ]
 
 
@@ -65,7 +76,8 @@ def pick_interpreter() -> str:
         "找不到带 tkinter 的 Python 解释器，无法打包。\n"
         "当前解释器：{}\n"
         "请安装官方 Python（勾选 tcl/tk）后重试，或用参数指定：\n"
-        "    build_exe.py --python C:\\path\\to\\python.exe".format(sys.executable))
+        "    python build/build_exe.py --python C:\\path\\to\\python.exe".format(
+            sys.executable))
 
 
 def build_env() -> dict:
@@ -79,10 +91,11 @@ def build_env() -> dict:
 
 
 def verify_bundle(exe: Path) -> bool:
-    """打包后校验：跑一次 --selftest，tkinter 缺失会立刻崩在这里。
+    """打包后校验：跑一次 --selftest，确认是冻结态且 tkinter 没缺。
 
     先删掉旧的自检产物再跑：文件存在不代表这次跑过，上一次留下的
-    selftest.json 会让校验无条件通过（踩过）。
+    selftest.json 会让校验无条件通过（踩过）。所以除了退出码，还要看
+    `frozen` 字段——源码态自检也会生成同样的文件。
     """
     if not exe.is_file():
         return False
@@ -99,11 +112,29 @@ def verify_bundle(exe: Path) -> bool:
     except Exception as e:
         print("自检执行失败：{}".format(e))
         return False
-    if r.returncode == 0 and stale.is_file():
-        return True
-    print("自检输出：{}".format(
-        (r.stderr or r.stdout or b"").decode("utf-8", "replace")[:500]))
-    return False
+    if r.returncode != 0 or not stale.is_file():
+        print("自检输出：{}".format(
+            (r.stderr or r.stdout or b"").decode("utf-8", "replace")[:500]))
+        return False
+    try:
+        data = json.loads(stale.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print("自检结果读不出来：{}".format(e))
+        return False
+    if data.get("frozen") is not True:
+        print("自检结果不是冻结态，产物可能并没有真正打包")
+        return False
+    tok = data.get("token") or {}
+    if not tok.get("present"):
+        auth = "未授权"
+    elif tok.get("disabled") or tok.get("expired"):
+        auth = "已失效"
+    else:
+        auth = "有效（剩 {} 天）".format(tok.get("days_left"))
+    print("自检通过：v{}，{}，推送 {}".format(
+        data.get("version"), auth,
+        "、".join(data.get("push_channels") or []) or "未配置"))
+    return True
 
 
 def main(argv: "list[str]") -> int:
@@ -118,18 +149,23 @@ def main(argv: "list[str]") -> int:
     if interpreter != sys.executable:
         print("当前解释器不带 tkinter，自动改用：{}".format(interpreter))
     print("打包解释器：{}".format(interpreter))
+    print("源码目录：{}".format(SRC))
+    print("入口：{}".format(ENTRY))
 
     args = [
         interpreter, "-m", "PyInstaller",
-        "--noconfirm", "--onefile", "--windowed",
+        "--noconfirm", "--clean", "--onefile", "--windowed",
         "--name", "WorkBuddyCheckin",
-        "--distpath", str(ROOT / "dist"),
+        "--paths", str(SRC),
+        # 先出到 .build/out 再复制进 dist：dist 里的 exe 可能正在运行，
+        # 直接往里写会 PermissionError（改时间戳/校验和那一步最容易踩）。
+        "--distpath", str(ROOT / ".build" / "out"),
         "--workpath", str(ROOT / ".build" / "pyi" / "work"),
         "--specpath", str(ROOT / ".build" / "pyi"),
     ]
     for m in HIDDEN_IMPORTS:
         args += ["--hidden-import", m]
-    args.append(str(ROOT / "checkin_gui.py"))
+    args.append(str(ENTRY))
 
     print("PyInstaller:", " ".join(args[:4]), "...")
     try:
@@ -140,14 +176,32 @@ def main(argv: "list[str]") -> int:
         print("  <python> -m pip install --target .build/pylibs pyinstaller")
         return e.returncode
 
+    staged = ROOT / ".build" / "out" / "WorkBuddyCheckin.exe"
+    if not staged.is_file():
+        print("打包结束但没找到产物：{}".format(staged))
+        return 3
     exe = ROOT / "dist" / "WorkBuddyCheckin.exe"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(str(staged), str(exe))
+    except OSError as e:
+        print("复制到 dist 失败（exe 可能正在运行）：{}".format(e))
+        return 4
     print("\n完成：{}".format(exe))
     if not verify_bundle(exe):
         print("！！校验未通过：exe 里可能没有 tkinter，别发布这一版")
-        return 3
-    print("校验通过：tkinter 已打包")
-    print("提示：改中文名直接复制改名即可，例如 dist/WorkBuddy签到.exe")
+        return 5
+
+    # 中文名是真正发出去的文件名，打包时顺手复制一份，省掉手工改名
+    cn = exe.with_name("WorkBuddy签到.exe")
+    try:
+        shutil.copy2(str(exe), str(cn))
+        print("已生成中文名：{}".format(cn))
+    except OSError as e:
+        print("中文名复制失败（不影响主产物）：{}".format(e))
+    print("打包完成。")
     return 0
+
 
 
 if __name__ == "__main__":

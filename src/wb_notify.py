@@ -8,7 +8,7 @@
 * 同时兼容三种写法：裸 key、`key=xxx` 片段、整条 webhook 链接。
   看着像链接却抽不出参数时**拒发**，不硬拼。
 * 两个渠道互相独立，一个失败不影响另一个。
-* 服务端脚本（wb_auth_server.py）也复用这里，所以不能 import Windows 专有模块。
+* 服务端脚本（wb_server.py）也复用这里，所以不能 import Windows 专有模块。
 """
 from __future__ import annotations
 

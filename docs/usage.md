@@ -102,7 +102,7 @@ WorkBuddyCheckin.exe --import-token D:\auth_oauth.json
 - 任务指向别的路径 → 改指当前 exe；
 - 本来就对 → 什么都不做（只读一次任务定义，约 0.5 毫秒）。
 
-源码运行（`python run.py`）**不会**做这件事，避免开发时的注册动作把
+源码运行（`python src/desktop/checkin_gui.py`）**不会**做这件事，避免开发时的注册动作把
 用户已装好的 exe 任务抢走。
 
 ### 取消

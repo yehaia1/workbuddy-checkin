@@ -8,25 +8,28 @@
 ## 1. 两个产品，一份逻辑
 
 ```
-                     ┌──────────────────────────┐
-    本地运行 ────────▶│  run.py（源码入口）       │
-                     └────────────┬─────────────┘
-                                  │ sys.path += src/
-    独立运行 ────────▶ ┌──────────▼─────────────┐ ◀──── build/entry.py（打包入口）
-    （exe）            │  src/  业务逻辑 + 界面  │
-    服务端 ──────────▶ │  wb_server.py（cron）   │
-    （脚本）            └──────────┬─────────────┘
-                                  ▼
-                    数据目录：缓存 / 脚本目录 / 仓库根
+    src/common/   wb_config · wb_oauth · wb_notify · workbuddy_checkin
+         ▲                        ▲
+         │                        │
+    src/desktop/             src/server/
+    checkin_gui · wb_task    wb_server
+    win_quiet                     │
+         │                        │  build/make_server.py（import 闭包 + zipapp）
+         │ build/entry.py         ▼
+         ▼                  dist/server/wb_server.pyz   ← 单文件，拷到哪都能跑
+  dist/WorkBuddyCheckin.exe
+
+    数据目录：exe → 用户缓存；pyz → 脚本目录；仓库里跑 → 仓库根
 ```
 
 | 产品 | 形态 | 调度 | 授权方式 |
 |---|---|---|---|
 | Windows 版 | `WorkBuddyCheckin.exe`（GUI） | Windows 计划任务 | 本机浏览器 |
-| 服务端版 | `wb_server.py`（无界面） | cron | 推链接到手机 |
+| 服务端版 | `wb_server.pyz`（无界面单文件） | cron | 推链接到手机 |
 
-两者共用 `workbuddy_checkin.py` / `wb_oauth.py` / `wb_notify.py` / `wb_config.py`，
-差别只在入口和调度方式。**不要在同一账号上同时跑两边**（见第 6 节）。
+两者共用 `src/common/` 下的 `workbuddy_checkin.py` / `wb_oauth.py` /
+`wb_notify.py` / `wb_config.py`，差别只在入口和调度方式。
+**不要在同一账号上同时跑两边**（见第 6 节）。
 
 ---
 
@@ -34,13 +37,18 @@
 
 | 层 | 目录 | 允许做的事 | 不允许做的事 |
 |---|---|---|---|
-| 业务逻辑 | `src/` | 读写配置、调接口、画界面 | import `build/` 里的任何东西 |
-| 本地入口 | `run.py` | 挂 `src/` 到 sys.path、调 `main()` | 写业务逻辑 |
-| 构建 | `build/` | 选解释器、调 PyInstaller、校验产物 | 写业务逻辑 |
+| 共用逻辑 | `src/common/` | 读写配置、调接口、签到、推送 | import `desktop/`、`server/`、`build/` |
+| exe 版 | `src/desktop/` | 画界面、写计划任务、抑制弹窗 | 被 `common/` 或 `server/` import |
+| 服务端 | `src/server/` | 只做 CLI 入口、编排授权与签到 | import `desktop/` 里的任何东西 |
+| 构建 | `build/` | 选解释器、调 PyInstaller / zipapp、校验产物 | 写业务逻辑 |
 | 回归 | `tools/` | 驱动上面的代码做检查 | 参与发布 |
 
-这样分之后，"改 bug"永远只动 `src/`，"改打包参数"永远只动 `build/`，
-不会出现「打包脚本里藏了一段签到逻辑」这种谁都找不到的东西。
+`src/` 里为什么是"按版本分"而不是"按技术分"：服务端部署时只该拿自己那一份。
+`make_server.py` 按 import 闭包收模块，闭包里一出现 `checkin_gui` / `wb_task` /
+`win_quiet` 就直接构建失败——这条边界是**可执行**的，不靠自觉。
+
+这样分之后，"改 bug"基本只动 `common/`，"改界面"只动 `desktop/`，
+"改打包参数"只动 `build/`，不会出现「打包脚本里藏了一段签到逻辑」这种谁都找不到的东西。
 
 ---
 
@@ -51,8 +59,8 @@
 | 运行方式 | 数据目录 | 谁来定 |
 |---|---|---|
 | 独立运行（exe） | `%LOCALAPPDATA%\WorkBuddyCheckin` | `build/entry.py` |
-| 服务端（脚本） | `wb_server.py` 所在目录 / `--config` 的上级 | `wb_server.main()` |
-| 源码运行（开发） | 仓库根目录 | `run.py` |
+| 服务端（单文件） | `wb_server.pyz` 所在目录 / `--config` 的上级 | `wb_server.main()` |
+| 源码运行（开发） | 仓库根目录 | 入口脚本 `main()` 里的 `prepare()` |
 
 ### 为什么 exe 不写在自己旁边
 
@@ -85,16 +93,16 @@ v3.0 首次运行 exe 时，会把旧版留在 exe 旁边的 `config.json` /
 
 ## 4. 模块职责
 
-| 模块 | 职责 | 能在服务器跑 |
-|---|---|---|
-| `wb_config.py` | 配置默认值、读写、数据目录、版本号 | ✅ |
-| `wb_notify.py` | 企业微信 / 钉钉推送 | ✅ |
-| `wb_oauth.py` | 设备授权、令牌落盘、续期、导入码 | ✅ |
-| `workbuddy_checkin.py` | 签到三步、文案、到期提醒、CLI | ✅ |
-| `wb_server.py` | 服务端入口：检查授权 → 授权（退避重试）→ 签到 → 推送 | ✅（本来就是给服务器用的） |
-| `wb_task.py` | Windows 计划任务 | ❌ 仅 Windows |
-| `win_quiet.py` | 子进程不弹黑框 | ❌ 仅 Windows |
-| `checkin_gui.py` | tkinter 界面 + 无界面分流 | ❌ 仅桌面 |
+| 模块 | 位置 | 职责 | 能在服务器跑 |
+|---|---|---|---|
+| `wb_config.py` | `common/` | 配置默认值、读写、数据目录、版本号 | ✅ |
+| `wb_notify.py` | `common/` | 企业微信 / 钉钉推送 | ✅ |
+| `wb_oauth.py` | `common/` | 设备授权、令牌落盘、续期、导入码 | ✅ |
+| `workbuddy_checkin.py` | `common/` | 签到三步、文案、到期提醒、CLI | ✅ |
+| `wb_server.py` | `server/` | 服务端入口：检查授权 → 授权（退避重试）→ 签到 → 推送 | ✅（本来就是给服务器用的） |
+| `wb_task.py` | `desktop/` | Windows 计划任务 | ❌ 仅 Windows |
+| `win_quiet.py` | `desktop/` | 子进程不弹黑框 | ❌ 仅 Windows |
+| `checkin_gui.py` | `desktop/` | tkinter 界面 + 无界面分流 | ❌ 仅桌面 |
 
 服务端那一列打 ✅ 的必须保持**零 Windows 依赖**（不 import `tkinter` /
 `ctypes.windll` / `wb_task`），否则 Linux 上跑不起来。回归里有专门的断言。
@@ -119,7 +127,7 @@ v3.0 首次运行 exe 时，会把旧版留在 exe 旁边的 `config.json` /
 
 计划任务里只有两条契约：**exe 的绝对路径 + `--run`**。
 `wb_task.launcher()` 是唯一决定这件事的地方——冻结态永远是 exe 自己，
-源码态才是 `pythonw run.py --run`（只用于开发自测）。
+源码态才是 `pythonw src/common/workbuddy_checkin.py --run`（只用于开发自测）。
 
 绝对路径的代价是"exe 一挪就失效"，所以 v3.0 加了**启动自愈**：
 `ensure_current()` 比对任务里的命令与当前程序，不一致就按当前配置重新注册。
@@ -127,7 +135,7 @@ v3.0 首次运行 exe 时，会把旧版留在 exe 旁边的 `config.json` /
 
 ### 服务端版
 
-cron 直接调 `python3 wb_server.py`，脚本自己决定要不要先授权。
+cron 直接调 `python3 wb_server.pyz`，脚本自己决定要不要先授权。
 调度器不理解"授权"这件事，所有状态都在脚本里，所以换 cron 表达式、换机器
 都不影响行为。
 

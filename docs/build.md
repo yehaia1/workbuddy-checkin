@@ -2,7 +2,7 @@
 
 ## 1. 版本管理
 
-**版本号只有一个来源**：`src/wb_config.py` 的 `VERSION`
+**版本号只有一个来源**：`src/common/wb_config.py` 的 `VERSION`
 
 ```python
 VERSION = "3.0.0"
@@ -23,7 +23,7 @@ exe 属性里的版本就跟着变**，不需要另外维护 `.rc` 文件。
 
 发版流程：
 
-1. 改 `src/wb_config.py` 的 `VERSION` / `RELEASE_DATE`
+1. 改 `src/common/wb_config.py` 的 `VERSION` / `RELEASE_DATE`
 2. 在 `CHANGELOG.md` 顶部加一节（`## [3.1.0] - 2026-xx-xx`）
 3. `python build/build_exe.py`
 4. 打包脚本末尾会打印 `打包完成：v3.1.0`，异常说明版本没进产物
@@ -80,29 +80,28 @@ build/entry.py  PyInstaller 的入口（冻结态启动 + 设数据目录）
 
 ---
 
-## 4. 打服务端包
+## 4. 打服务端单文件
 
-服务端版是脚本，不是 exe，但**也不能把整个 `src/` 拷过去**——里面混着
-`checkin_gui.py`（tkinter 界面）、`wb_task.py`（Windows 计划任务）、
-`win_quiet.py`（弹窗抑制），服务器上一概用不到。
+服务端版是脚本，不是 exe，但**也不能把整个 `src/` 拷过去**——`src/desktop/` 里
+是界面（tkinter）、Windows 计划任务和弹窗抑制，服务器上一概用不到。
 
 ```bash
-python build/make_server_bundle.py            # 产出 dist/server/
-python build/make_server_bundle.py --out /tmp/wb   # 换输出目录
+python build/make_server.py                        # 产出 dist/server/wb_server.pyz
+python build/make_server.py --out /tmp/wb.pyz      # 换输出路径
 ```
 
-它从 `wb_server.py` 出发做 **import 闭包**（AST 静态解析，只看模块级导入），
-自动决定要带哪几个文件：
+用 Python 自带的 `zipapp` 打成一个可执行 zip（`.pyz`）：模块在 zip 内部，
+`import` 照常工作，天然隔离——这也顺手绕开了"合并成单文件会撞名"的坑
+（`wb_config.load` / `wb_oauth.load`、两个 `main`、`token_path` 各有一份）。
+
+装进包里的模块由 **import 闭包**决定（AST 静态解析，只看模块级导入）：
 
 ```
-wb_server.py          入口
-workbuddy_checkin.py  签到流程
-wb_oauth.py           设备授权 / 续期
-wb_notify.py          推送
-wb_config.py          配置与路径
-config.example.json   配置模板（复用 wb_config.DEFAULT_CONFIG，键名不会写歪）
-README.txt            三步部署说明
-_bundle.json          清单，下次打包据此清理旧文件
+wb_server            入口
+workbuddy_checkin    签到流程
+wb_oauth             设备授权 / 续期
+wb_notify            推送
+wb_config            配置与路径
 ```
 
 几条设计约束：
@@ -111,14 +110,18 @@ _bundle.json          清单，下次打包据此清理旧文件
   提示把那处导入改成函数内惰性导入。这条拦住过一次真实回归：
   `workbuddy_checkin.diagnose()` 里 `import wb_task` 查计划任务，
   虽然被 try 包着不会崩，但静态闭包会把它算进依赖。
-- 只清理**上一次由自己放进去的 `.py`**（读 `_bundle.json`），
-  不碰 `config.json` / `auth_oauth.json` / `checkin.log`——那可能是线上数据。
-- 打完自动在产物目录跑一次 `wb_server.py --version`，闭包缺文件会立刻暴露。
-- 产物里的 `.py` 统一写成 LF；`__pycache__` 用 `-B` 避免生成。
+- 只看模块级导入：函数体内的 `import` 是惰性的，服务器上不执行，
+  不该算成必需依赖。
+- 打完在产物所在目录跑一次 `python wb_server.pyz --version`，
+  闭包缺模块会立刻暴露。
+- 暂存目录在 `.build/serverpkg/`，文件统一 LF，压缩存放（约 30 KB）。
 
-> 服务端目录是**平铺**的，`wb_config.is_repo_layout()` 靠 `run.py` / `.git` /
-> `build/` 判断是不是在开发仓库里：不是就认为数据目录 = 脚本目录，
-> 而不是脚本的父目录。`--version` 会显示「脚本运行」以区分。
+> **单文件里 `__file__` 指向 zip 内部**（`/opt/wbcheckin/wb_server.pyz/wb_config.py`），
+> 它的 parent 是**文件**不是目录。所以 `wb_config` 用 `_script_dir()` 兜底：
+> 发现 parent 不是目录就退到 `sys.argv[0]` 的目录。这样配置、日志、令牌
+> 仍然落在 pyz 旁边，`--version` 显示「脚本运行」。
+> `is_repo_layout()` 用**绝对判据**（`src/common/` 且有 `build/build_exe.py`），
+> 不能"往上找标志物"——`dist/server/` 往上两级也正好是仓库根。
 
 ---
 
@@ -159,10 +162,10 @@ _bundle.json          清单，下次打包据此清理旧文件
 - [ ] `--sched-status` 不弹控制台黑框
 - [ ] `--run` 退出码 0（**测之前先清空 `push_channels`**，别真发消息）
 - [ ] 未授权时打开界面，除「立即授权」外按钮全灰
-- [ ] `python build/make_server_bundle.py` 成功，`dist/server/` 里**没有**
-      `checkin_gui.py` / `wb_task.py` / `win_quiet.py`
-- [ ] 服务端包拷到仓库外的空目录后 `python3 wb_server.py --version` 正常
-      （输出「脚本运行」，数据目录就是该目录）
+- [ ] `python build/make_server.py` 成功，`dist/server/` 里**只有**
+      `wb_server.pyz` 一个文件
+- [ ] `wb_server.pyz` 拷到仓库外的空目录后 `--version` / `--init-config` 正常
+      （输出「脚本运行」，`config.json` 生成在 pyz 旁边）
 - [ ] 没有把 `config.json` / `auth_oauth.json` / `*.log` 打进发布包
 - [ ] README 截图与当前界面一致
 

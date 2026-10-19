@@ -1,6 +1,6 @@
 # 服务端版（cron 定时脚本）
 
-`src/wb_server.py`：无界面、无浏览器，一条命令跑完「授权（必要时）→ 签到 → 推送」，
+`wb_server.pyz`：无界面、无浏览器，一条命令跑完「授权（必要时）→ 签到 → 推送」，
 交给 cron 定时调用即可。
 
 和 Windows 版是**两套部署，选一个用**。两边同时定时会因为 `refreshToken`
@@ -10,58 +10,60 @@
 
 ## 1. 部署
 
-**不要拷整个 `src/`**。`src/` 里混着 exe 版的东西（`checkin_gui.py` 是 tkinter
-界面、`wb_task.py` 是 Windows 计划任务、`win_quiet.py` 是弹窗抑制），服务器上
-用不到。正确做法是打一个服务端包：
+服务端只发**一个文件**：`dist/server/wb_server.pyz`（约 30 KB）。
 
 ```bash
-python3 build/make_server_bundle.py      # 产出 dist/server/
+python3 build/make_server.py       # 本机构建，产出 dist/server/wb_server.pyz
+scp dist/server/wb_server.pyz server:/opt/wbcheckin/
 ```
 
-它是按 `wb_server.py` 的 **import 闭包**自动收集的，不多带也不漏带，产物就这些：
+包里装了哪些模块不需要你操心——它按 `wb_server` 的 **import 闭包**自动收集
+（源码在 `src/server/` + `src/common/`），只装服务端真正用到的：
 
 ```
-dist/server/
-  wb_server.py          入口
-  workbuddy_checkin.py  签到流程（服务端复用它的核心，不启动界面）
-  wb_oauth.py           设备授权 / 续期
-  wb_notify.py          推送
-  wb_config.py          配置与路径
-  config.example.json   配置模板（不含任何 key）
-  README.txt            三步部署说明
-  _bundle.json          清单，下次打包据此清理旧文件
+wb_server            入口
+workbuddy_checkin    签到流程（不含界面）
+wb_oauth             设备授权 / 续期
+wb_notify            推送
+wb_config            配置与路径
 ```
 
-整个 `dist/server/` 拷到服务器就是一个完整可运行的服务端：
+`src/desktop/` 里的界面（tkinter）、Windows 计划任务、弹窗抑制**不会**进包；
+闭包里一旦出现它们，构建会直接失败并告诉你是哪处导入。
+
+服务器上：
 
 ```bash
-# 1) 拷过去
-scp -r dist/server/ server:/opt/wbcheckin
-
-# 2) 生成配置
 cd /opt/wbcheckin
-python3 wb_server.py --init-config
 
-# 3) 填 key（企业微信 key 或钉钉 access_token），勾选渠道
+# 1) 生成配置（写在 pyz 同目录）
+python3 wb_server.pyz --init-config
+
+# 2) 填 key（企业微信 key 或钉钉 access_token），勾选渠道
 vi config.json
 
-# 4) 体检：不联网，只看配置和授权状态
-python3 wb_server.py --check
+# 3) 体检：不联网，只看配置和授权状态
+python3 wb_server.pyz --check
+
+# 4) 先手工跑一次：会推授权链接到手机，等 3 分钟
+python3 wb_server.pyz
 ```
 
 要求：Python 3.8+，**零第三方依赖**，Linux / Windows 都能跑
-（不 import tkinter，也不碰 Windows 计划任务）。
+（不 import tkinter，也不碰 Windows 计划任务）。也可以直接 `./wb_server.pyz`
+执行（文件带 shebang）。
 
-**配置跟着脚本走**：默认读脚本同目录的 `config.json`，日志
-`checkin.log`、令牌 `auth_oauth.json` 也写在同一层。整个目录拷走就能换机器。
-平铺目录里 `--version` 显示「脚本运行」，数据目录就是脚本目录（不会写到父目录）。
+**配置跟着脚本走**：`config.json`、`checkin.log`、`auth_oauth.json` 都写在
+`wb_server.pyz` 所在目录。`wb_config` 认得出自己在 zip 里，会退到
+`sys.argv[0]` 的目录，不会往父目录或 zip 内部写。
+`--version` 显示「脚本运行」，与源码运行区分。
 
 ---
 
 ## 2. 每次运行做什么
 
 ```
-python3 wb_server.py
+python3 wb_server.pyz
 ```
 
 ```
@@ -102,12 +104,12 @@ python3 wb_server.py
 
 ```cron
 # 每天 09:30，输出追加到 checkin.log
-30 9 * * * cd /opt/wbcheckin && python3 wb_server.py >> checkin.log 2>&1
+30 9 * * * cd /opt/wbcheckin && python3 wb_server.pyz >> checkin.log 2>&1
 ```
 
 几点建议：
 
-- **一定 `cd` 到脚本目录**，或写全路径 `/opt/wbcheckin/wb_server.py`；
+- **一定 `cd` 到脚本目录**，或写全路径 `/opt/wbcheckin/wb_server.pyz`；
 - 用 `>> checkin.log 2>&1` 留下输出，出问题时不用猜；
 - 退出码非 0 说明这次没签上，可以接报警（如 `|| echo fail | mail ...`）；
 - 想错开高峰，让 cron 在 09:30 触发、脚本内部不需要再做随机延迟。
@@ -116,7 +118,7 @@ python3 wb_server.py
 
 ```bash
 env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin \
-  sh -c 'cd /opt/wbcheckin && python3 wb_server.py --check'
+  sh -c 'cd /opt/wbcheckin && python3 wb_server.pyz --check'
 ```
 
 ---
@@ -125,7 +127,7 @@ env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin \
 
 | 命令 | 作用 |
 |---|---|
-| `python3 wb_server.py` | 日常：该授权就授权，然后签到 |
+| `python3 wb_server.pyz` | 日常：该授权就授权，然后签到 |
 | `--check` | 体检配置与授权状态（不联网、不签到） |
 | `--init-config [PATH]` | 生成配置模板（`--force` 才覆盖） |
 | `--auth-only` | 只授权，不签到（首次部署时先跑这个） |

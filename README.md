@@ -7,7 +7,7 @@
 | 版本 | 形态 | 适合 |
 |---|---|---|
 | **Windows 版** | 单文件 `WorkBuddyCheckin.exe`（带界面） | 自己的电脑：双击配置，计划任务每天自动跑 |
-| **服务端版** | `wb_server.py` 脚本（无界面） | 服务器 / NAS：交给 cron，授权链接推到手机上 |
+| **服务端版** | `wb_server.pyz` 单文件脚本（无界面） | 服务器 / NAS：交给 cron，授权链接推到手机上 |
 
 两个版本各自授权、各存一份令牌，**同一账号只在一处跑**即可
 （两边同时跑会互相踢掉，见 [授权机制](#授权机制)）。
@@ -34,29 +34,33 @@
 ### 服务端版
 
 ```bash
-# 1) 打一个服务端包（只含该带的 5 个 .py，不带 GUI / Windows 模块）
-python3 build/make_server_bundle.py     # 产出 dist/server/
+# 1) 打一个单文件脚本（约 30 KB，不含 GUI / Windows 模块）
+python3 build/make_server.py            # 产出 dist/server/wb_server.pyz
 
-# 2) 拷到服务器，比如 /opt/wbcheckin
-scp -r dist/server/ server:/opt/wbcheckin
+# 2) 只拷这一个文件，比如 /opt/wbcheckin
+scp dist/server/wb_server.pyz server:/opt/wbcheckin/
 cd /opt/wbcheckin
 
 # 3) 生成配置模板，填机器人 key
-python3 wb_server.py --init-config
-python3 wb_server.py --check          # 体检：渠道、key、授权状态
+python3 wb_server.pyz --init-config
+python3 wb_server.pyz --check          # 体检：渠道、key、授权状态
 
 # 4) 先手工跑一次（会推授权链接到手机，等 3 分钟）
-python3 wb_server.py
+python3 wb_server.pyz
 
 # 5) 交给 cron
-30 9 * * * cd /opt/wbcheckin && python3 wb_server.py >> checkin.log 2>&1
+30 9 * * * cd /opt/wbcheckin && python3 wb_server.pyz >> checkin.log 2>&1
 ```
 
-别把整个 `src/` 拷到服务器：`checkin_gui.py`（tkinter 界面）、`wb_task.py`
-（Windows 计划任务）、`win_quiet.py`（弹窗抑制）只在 exe 版用。服务端包是按
-`wb_server.py` 的 import 闭包自动收集的，以后改了导入关系也不会漏文件。
+服务器上**只有这一个文件**。配置、日志、令牌都由它生成在同目录，
+`--init-config` 写 `config.json`，不需要另拷模板或依赖目录。
 
-`wb_server.py` 每次运行的顺序是固定的：
+> 别把 `src/` 拷到服务器：`src/desktop/` 里是 exe 版的界面（tkinter）、
+> Windows 计划任务和弹窗抑制，服务器用不到。`make_server.py` 按
+> `wb_server` 的 import 闭包把需要的模块打进 `.pyz`，闭包里一旦出现
+> `checkin_gui` / `wb_task` / `win_quiet` 就直接报错。
+
+`wb_server` 每次运行的顺序是固定的：
 
 1. 检查授权：没有 / 损坏 / 失效 → 进入授权流程
 2. 授权：推链接 → 等 180 秒 → 失败隔 60 秒再来（指数退避，最多 3 轮）
@@ -91,7 +95,7 @@ python3 wb_server.py
 | 运行方式 | 数据目录 | 说明 |
 |---|---|---|
 | Windows 版（exe） | `%LOCALAPPDATA%\WorkBuddyCheckin` | 当前用户的缓存目录，exe 放哪都能跑 |
-| 服务端版（脚本） | `wb_server.py` 所在目录 | 配置跟着脚本走，整个目录拷走就能换机器 |
+| 服务端版（单文件） | `wb_server.pyz` 所在目录 | 配置跟着脚本走，换机器只拷这一个文件 |
 | 源码运行（开发） | 仓库根目录 | 调试用，不污染系统 |
 
 三种位置都放同样的三样东西：
@@ -167,11 +171,11 @@ WorkBuddyCheckin.exe --sched-status    # 查看计划任务状态
 WorkBuddyCheckin.exe --version         # 版本 / 运行方式 / 数据目录
 
 # 服务端版
-python3 wb_server.py                   # 授权（如需）+ 签到 + 推送
-python3 wb_server.py --check            # 体检（不联网）
-python3 wb_server.py --auth-only        # 只授权
-python3 wb_server.py --checkin-only     # 只签到
-python3 wb_server.py --version
+python3 wb_server.pyz                  # 授权（如需）+ 签到 + 推送
+python3 wb_server.pyz --check           # 体检（不联网）
+python3 wb_server.pyz --auth-only       # 只授权
+python3 wb_server.pyz --checkin-only    # 只签到
+python3 wb_server.pyz --version
 ```
 
 退出码：`0` 成功（含"今天已签到"）、`2` 未授权 / 配置不可用、
@@ -182,21 +186,33 @@ python3 wb_server.py --version
 ## 目录结构
 
 ```
-run.py              本地源码运行入口
-src/                业务逻辑
-  checkin_gui.py      界面（tkinter，无第三方依赖）
-  workbuddy_checkin.py 签到流程 + 推送文案 + 到期提醒
-  wb_oauth.py         设备授权与令牌续期
-  wb_notify.py        企业微信 / 钉钉推送
-  wb_task.py          Windows 计划任务
-  wb_server.py        服务端入口（cron 用）
-  wb_config.py        配置与路径（唯一版本号来源）
-  win_quiet.py        子进程不弹黑框（仅 Windows）
-build/              构建：entry.py（冻结入口）+ build_exe.py（打 exe）
-                    + make_server_bundle.py（打服务端包）
+src/
+  common/           两边共用
+    workbuddy_checkin.py  签到流程 + 推送文案 + 到期提醒（也可单独当 CLI）
+    wb_oauth.py           设备授权与令牌续期
+    wb_notify.py          企业微信 / 钉钉推送
+    wb_config.py          配置与路径（唯一版本号来源）
+  desktop/          只有 exe 版用
+    checkin_gui.py        界面（tkinter，无第三方依赖）
+    wb_task.py            Windows 计划任务
+    win_quiet.py          子进程不弹黑框
+  server/           只有服务端用
+    wb_server.py          服务端入口（cron 用，打成 wb_server.pyz）
+build/              构建
+  entry.py              冻结入口（PyInstaller 用）
+  build_exe.py          打 exe
+  make_server.py        打单文件 wb_server.pyz
 tools/              回归检查（不参与发布）
-dist/               产物：WorkBuddyCheckin.exe、server/（服务端包）、界面截图
+dist/               产物：WorkBuddyCheckin.exe、server/wb_server.pyz、界面截图
 docs/               使用 / 构建 / 架构 / 排障 / 服务端
+```
+
+**源码运行**（开发用，需要带 tkinter 的 Python）：
+
+```bash
+python src/desktop/checkin_gui.py              # 界面
+python src/desktop/checkin_gui.py --selftest   # 自检
+python src/common/workbuddy_checkin.py --run   # 无界面签到一次
 ```
 
 ---

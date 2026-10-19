@@ -11,8 +11,8 @@
 | 运行方式 | 启动 | 数据目录 |
 |---|---|---|
 | Windows 版（exe） | `WorkBuddyCheckin.exe` | `%LOCALAPPDATA%\WorkBuddyCheckin` |
-| 服务端版（脚本） | `python3 wb_server.py` | 脚本所在目录 |
-| 源码运行（开发） | `python run.py` | 仓库根目录 |
+| 服务端版（单文件） | `python3 wb_server.pyz` | 脚本所在目录 |
+| 源码运行（开发） | `python src/desktop/checkin_gui.py` | 仓库根目录 |
 
 界面日志第一行、`--version`、`--selftest` 都会打印数据目录。先对一下：
 如果你在改根目录的 `config.json`，而实际跑的是 exe，那当然"改了没反应"。
@@ -106,7 +106,7 @@ windowed exe 没有控制台，`print` 没人看见，所以结果同时写进 `
 |---|---|---|
 | 状态行「未注册」 | 只改了配置，没点「应用到系统」 | 点一次 |
 | 状态行「路径失效」 | exe 挪了位置 | 打开程序会自动修；或重新「应用到系统」 |
-| 「指向当前 否」 | 任务还指向旧路径（如旧版 `run.py`） | 同上 |
+| 「指向当前 否」 | 任务还指向旧路径（如旧版入口脚本） | 同上 |
 | 上次结果「未完成（客户端未就绪或未登录）」，退出码 2 | 授权没了 | 重新授权 |
 | 上次结果系统标记异常（0x…） | 实例冲突 / 被安全软件拦 | 稍后重试，检查杀软 |
 | 上次结果「尚未运行过」 | 新建任务还没到点 | 不是故障 |
@@ -175,7 +175,7 @@ pythonw tools/no_popup_check.py --exe "dist/WorkBuddyCheckin.exe" -- --sched-sta
 ### 先别猜，跑体检
 
 ```bash
-python3 wb_server.py --check
+python3 wb_server.pyz --check
 ```
 
 不联网，只告诉你授权状态和每个渠道是「可用 / 勾了没填 key / 填了没勾 / 未启用」。
@@ -206,7 +206,7 @@ python3 wb_server.py --check
 
 ```bash
 env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin \
-  sh -c 'cd /opt/wbcheckin && python3 wb_server.py --check'
+  sh -c 'cd /opt/wbcheckin && python3 wb_server.pyz --check'
 ```
 
 ### 服务端读的是哪份配置
@@ -214,7 +214,7 @@ env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin \
 默认是**脚本同目录**的 `config.json`。放别处：
 
 ```bash
-python3 wb_server.py --config /etc/wbcheckin/config.json
+python3 wb_server.pyz --config /etc/wbcheckin/config.json
 ```
 
 此时日志和令牌也跟着写到 `/etc/wbcheckin/`。

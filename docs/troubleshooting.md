@@ -45,20 +45,27 @@ python run.py --diagnose
 
 ## 2. 提示「尚未授权」
 
-本机没有 `auth_oauth.json`，或文件不完整。三种办法：
+本机没有 `auth_oauth.json`，或文件不完整。此时界面上除「立即授权」外**全部按钮
+都是灰的**——这是设计好的门禁，不是按钮坏了。
 
-1. 「账号授权」→ **立即授权**（本机浏览器，最快）
-2. 「账号授权」→ **推到手机授权**（机器没浏览器时用）
-3. 服务器跑 `python src/wb_auth_server.py`，把 `WBAT1.…` 导入码粘到 **导入授权**
+1. 点 **立即授权**，在本机浏览器登录一次即可
+2. 这台机器没有浏览器 / 没人守着 → 走服务端流程：服务器跑
+   `wb_auth_server.py`，再用命令行把令牌交给这台机器
+   （`--import-token` 或 `--pull-token`，见 [server.md](server.md)）。
+   **界面里没有导入入口**，只能在命令行做。
 
 ---
 
-## 3. 提示「授权已失效」
+## 3. 提示「授权已失效」/ 收到「授权还剩 2 天」
 
 `refreshToken` 也过期了：约 30 天没跑过，或服务端提前撤销。重新授权一次即可。
 
-> 隐蔽情况：**刚在服务器授权完，又在本机导入了旧令牌**。两边刷新会互相踢掉
-> （`refreshToken` 轮换），服务端返回 `12153`。令牌只能有一份。
+「还剩 N 天」的提醒是**每次签到后顺手检查**发出来的（阈值 `expiry_warn_days`，
+默认 2 天）。它出现说明**自动续期没成功**——别等，直接重新授权。
+
+> 隐蔽情况：**服务器那边还留着一份令牌在续期**（比如用了 `--save-token`），
+> 两边刷新会互相踢掉（`refreshToken` 轮换），服务端返回 `12153`。
+> 令牌只能有一份，删掉多余那份。
 
 ---
 
@@ -168,32 +175,47 @@ pythonw tools/no_popup_check.py --exe "dist/WorkBuddy签到.exe" -- --sched-stat
 
 ## 9. 服务端脚本
 
+完整说明见 [server.md](server.md)，这里只列最常卡住的地方。
+
+### 先别猜，跑体检
+
+```bash
+python src/wb_auth_server.py --config /etc/wbcheckin/config.json --check
+```
+
+它不联网，只告诉你每个渠道是「可用 / 勾了没填 key / 填了没勾 / 未启用」。
+没有可用渠道时退出码 `2`。
+
 ### 推送不出去
 
 服务器要能访问 `qyapi.weixin.qq.com` / `oapi.dingtalk.com`。很多内网只放行白名单。
+单独试推送：`--push-only --url "https://example.com"`。
 
 ### 授权链接点开是空的 / 打不开
 
-链接有效期有限（默认 10 分钟），过期就重新跑一次脚本。
+链接有效期有限（默认 10 分钟），过期就重新跑一次脚本，或把 `--timeout` 调大。
 
 ### `--handoff` 取不到令牌
 
-- Windows 端要能访问服务器端口（`telnet <ip> 8787` 试一下）
+- Windows 端要能访问服务器端口（先在 Windows 上 `curl http://<ip>:8787/status`）
 - 端口被占用时脚本会自动换一个，用控制台打印出来的那个地址
 - secret 一次性有效：取过之后再取会返回 `410`
+- 超过 `--handoff-timeout`（默认 600 秒）没人取，脚本退出码 `4`
 
 ### 导入码报「无法解析」
 
-多半是复制不全。整段重新复制，或让服务端用 `--save-token` 导出文件后走
-「从文件导入」。
+多半是复制不全。整段重新复制；或让服务端用 `--save-token` 导出文件，再
+`--import-token <文件路径>`。
 
 ### 服务端读的是哪份配置
 
-默认是**仓库根目录**的 `config.json`（不是 `src/`）。服务器上没有仓库结构时：
+默认是**数据目录**的 `config.json`。服务器上没有仓库结构时显式指定：
 
 ```bash
 python src/wb_auth_server.py --config /etc/wbcheckin/config.json
 ```
+
+还没有配置文件就先 `--init-config` 生成一份模板。
 
 ---
 

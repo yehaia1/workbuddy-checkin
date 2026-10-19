@@ -155,6 +155,49 @@ GET  /v2/plugin/auth/token?state=<state>  → 轮询：
 - Windows 端导入后独占，之后所有续期都发生在那一台；
 - `--handoff` 用一次性随机 secret 把令牌直接交给客户端，取走即关端口。
 
+### 界面只保留本机浏览器授权
+
+远程授权（把链接推到手机）和令牌交接（导入码 / 一次性端口）都**只存在于
+服务端流程**，界面里没有入口。两个原因：
+
+1. **场景本来就不同**：会用到远程授权的机器，通常根本没人在跟前开界面；
+2. **界面越小越不容易错**：三个按钮并排时，用户分不清"推到手机"和"导入"的
+   区别，也不知道该先配推送还是先授权。现在只剩一个「立即授权」。
+
+对应地，`--auth-push` 这个"本地发起远程授权"的参数被删掉了：服务端脚本本来
+就会推链接，本地再推一遍纯属重复。
+
+### 未授权就把界面锁住
+
+`App.refresh_auth()` 是唯一判断点，算出 `authorized` 后交给 `_sync_controls()`：
+
+```
+authorized = 令牌存在 且 未损坏 且 未 disabled 且 未过期
+enabled    = authorized and not busy
+```
+
+`enabled` 决定签到按钮、② 每日定时、③ 消息推送三处是否可点；
+「立即授权」永远可点——否则就成了"要授权才能授权"的死锁。
+
+按钮状态**只在 `_sync_controls()` 里改**。以前是各任务收尾时自己
+`configure(state="normal")`，结果签到结束会把按钮全开，哪怕授权此刻已经失效。
+
+### 到期提醒
+
+令牌 28 天有效、提前 5 天自动续期，所以正常情况下不该出现"快过期"。
+一旦出现，说明续期失败（`refreshToken` 也快到期），只能重新授权。
+
+`check_expiry_notice()` 挂在**每次签到之后**（`run_once` 的收尾处）：
+
+| 剩余天数 | 行为 |
+|---|---|
+| > `expiry_warn_days`（默认 2） | 返回 `None`，什么都不做 |
+| ≤ 阈值 | 推一条提醒，`result["expiry_notice"]` 里留证据 |
+| 已过期 | 文案直接说"授权已过期" |
+
+放在签到之后而不是单独定时：签到每天本来就要跑一次，顺手看一眼不增加任何
+调度；重复触发也只是每天多一条消息，不需要额外的去重状态文件。
+
 ### 续期策略
 
 | 时机 | 动作 |
@@ -272,11 +315,11 @@ pythonw tools/no_popup_check.py --exe "dist/WorkBuddy签到.exe" -- --sched-stat
 
 | 脚本 | 覆盖什么 | 依赖 |
 |---|---|---|
-| `tools/oauth_mode_check.py` | 轮询、字段兼容、令牌轮换、401 重试、12153、导入码、推送渠道筛选 | 本地桩服务器，不碰真接口 |
+| `tools/oauth_mode_check.py` | 轮询、字段兼容、令牌轮换、401 重试、12153、导入码、到期提醒、推送渠道筛选、服务端体检 | 本地桩服务器，不碰真接口 |
 | `tools/no_popup_check.py` | 运行时是否弹出控制台窗口 | 需要 `pythonw` 运行，Windows |
 
 ```bash
-python tools/oauth_mode_check.py        # 41 项断言
+python tools/oauth_mode_check.py        # 52 项断言，结果写 .build/oauth_mode_check.json
 python build/build_exe.py               # 打包并自检
 pythonw tools/no_popup_check.py --exe "dist/WorkBuddy签到.exe" -- --sched-status
 ```

@@ -27,52 +27,40 @@
 签到接口需要登录态。本工具用 CodeBuddy CLI 的设备授权流程换一份明文令牌，
 之后纯 HTTP 调用，不启动客户端。
 
-### 方式 A：本机授权（默认）
+**本地版只有一种授权方式：本机浏览器。** 界面上的「立即授权」是唯一入口。
 
 1. 点 **立即授权**
 2. 自动打开浏览器 → 登录 → 确认
-3. 窗口检测到结果后自动关闭，授权状态变成"有效"
+3. 窗口检测到结果后自动关闭，授权状态变成"已授权"
 
 有效期约 28 天。程序会在到期前 5 天自动刷新；遇到 401 会刷新一次再重试。
 
-### 方式 B：推到手机
+### 未授权时界面会锁住
 
-1. 先在「设置推送」里配好至少一个渠道，并发一条测试确认能收到
-2. 点 **推到手机授权**
-3. 链接发到你的企业微信 / 钉钉 → 手机上点开登录
-4. 本机在后台轮询，拿到令牌后窗口自己关掉
+打开程序时如果检测到**没有授权**（没令牌 / 令牌损坏 / 会话已失效），
+除了「立即授权」，**签到、只查状态、设置定时、设置推送全部变灰不可点**——
+这样不会出现"点了才报错"的按钮。授权成功后它们自动恢复。
 
-适合目标机器没有浏览器，或人不在机器前。
+![未授权时按钮全灰](../dist/ui_locked.png)
 
-### 方式 C：服务端授权后导入
+> 想远程授权（把链接推到手机）或跨机器交接令牌，属于**服务端流程**：
+> 在服务器上跑 `wb_auth_server.py`，再用命令行把令牌交给这台机器。
+> 见 [server.md](server.md)。界面里没有这些入口，是刻意的。
 
-服务器上执行：
+### 到期提醒
 
-```bash
-python src/wb_auth_server.py
-```
+每次签到结束后都会顺便看一眼令牌还剩多久（`--run` 定时任务同样生效）：
 
-它会：生成授权链接 → 推到配置的渠道 → 等人扫码 → 输出一段 `WBAT1.…` 导入码。
+| 剩余天数 | 行为 |
+|---|---|
+| > `expiry_warn_days`（默认 2） | 什么都不做 |
+| ≤ 2 天 | 往已配置的推送渠道发一条「授权还剩 N 天」提醒 |
+| 已过期 | 提醒里直接写"授权已过期，签到会失败" |
 
-然后在 Windows 端点 **导入授权**，粘贴导入码即可（也可以给一个包含导入码的文件）。
+界面上也会同步提示：横幅变黄 + 「账号授权」那一行标出"快到期了"。
 
-![导入授权](../dist/ui_import.png)
-
-> **令牌只能有一份。** `refreshToken` 每次刷新都会轮换。服务端默认不落盘、
-> 只给导入码，就是为了让 Windows 端独占续期。若两台机器各存一份，先刷新的一方
-> 会让另一方立刻失效（返回码 `12153`）。
-
-### 无人值守：`--handoff`
-
-```bash
-# 服务器：授权成功后开一个一次性端口等取件
-python src/wb_auth_server.py --handoff --port 8787
-
-# Windows：执行它打印出来的命令
-WorkBuddy签到.exe --pull-token "http://<服务器>:8787/token" "<secret>"
-```
-
-取件成功后端口立即关闭，服务器不留令牌。端口需要能从 Windows 访问到。
+> 收到这条提醒说明**自动续期没成功**（`refreshToken` 也快到期了），
+> 点一次「立即授权」重新登录即可。阈值设 `0` 等于关闭提醒。
 
 ---
 
@@ -82,9 +70,9 @@ WorkBuddy签到.exe --pull-token "http://<服务器>:8787/token" "<secret>"
 
 | 项 | 说明 |
 |---|---|
-| 启用 | 勾上才会写入计划任务；取消勾选会删除任务 |
+| 启用 | 勾上才能「应用到系统」；要停止定时点「取消定时」删掉任务 |
 | 时间 | `HH:MM`，可加多个（逗号分隔），例如 `09:00, 21:30` |
-| 随机抖动 | 0–60 分钟。设 15 表示在 09:00–09:15 之间随机触发 |
+| 随机抖动 | 0–120 分钟。设 15 表示在 09:00–09:15 之间随机触发 |
 | 应用后退出 | 默认开启。定时写好就关掉程序，系统里不留常驻进程 |
 
 点 **应用到系统** 后：
@@ -128,23 +116,37 @@ python run.py --sched-status
 
 ---
 
-## 4. 服务端脚本
+## 4. 服务端授权（人不在电脑前）
 
-`src/wb_auth_server.py`，零依赖，Python 3.7+。
+完整指南见 [server.md](server.md)，这里只给最短路径：
 
 ```bash
-python src/wb_auth_server.py                     # 默认：链接→推送→等扫码→导入码
-python src/wb_auth_server.py --channel dingtalk  # 强制走某个渠道
-python src/wb_auth_server.py --timeout 900       # 等授权的秒数
+# ① 一次性的准备（不联网）
+python src/wb_auth_server.py --init-config    # 生成 config.json 模板
+python src/wb_auth_server.py --check          # 体检渠道与 key
+
+# ② 发起授权：生成链接 → 推到手机 → 等人登录 → 输出导入码
+python src/wb_auth_server.py
+
+# ③ 或者无人值守：授权后开一次性端口，Windows 端自己来取
 python src/wb_auth_server.py --handoff --port 8787
+
+# ④ 只转发一条已有链接
 python src/wb_auth_server.py --push-only --url "https://..."
-python src/wb_auth_server.py --save-token token.json   # 显式在服务器留一份
 ```
 
-- 默认读**仓库根目录**的 `config.json`；服务器上没有仓库时用 `--config` 指定
-- `--handoff` 会打印 Windows 端该执行的命令，复制即用
-- 退出码：`0` 成功、`1` 推送失败（`--push-only`）、`2` 授权超时 / 参数问题 /
-  没有可用渠道、`3` 申请授权或响应异常、`4` handoff 没人来取令牌
+Windows 端交接令牌（界面没有入口，只有命令行）：
+
+```powershell
+WorkBuddy签到.exe --import-token "WBAT1.……"                 # 导入码
+WorkBuddy签到.exe --import-token auth_oauth.json             # 令牌文件
+WorkBuddy签到.exe --pull-token "http://<服务器>:8787/token" "<secret>"
+```
+
+- 默认读数据目录的 `config.json`；服务器上没有仓库时用 `--config` 指定
+- 默认**不落盘**：令牌只交给 Windows 端独占续期，否则两边会被互相踢掉
+- 退出码：`0` 成功、`1` 推送失败、`2` 配置/参数问题、`3` 申请授权或响应异常、
+  `4` handoff 没人来取、`130` 被中断
 
 ---
 
@@ -159,6 +161,7 @@ python src/wb_auth_server.py --save-token token.json   # 显式在服务器留�
 | `dingtalk_key` | `""` | 钉钉机器人 access_token |
 | `oauth_token_file` | `""` | 令牌路径，留空 = 数据目录下 `auth_oauth.json` |
 | `oauth_auth_timeout` | `300` | 等授权完成的秒数 |
+| `expiry_warn_days` | `2` | 令牌剩余天数 ≤ 此值时签到后推提醒；`0` = 关闭 |
 | `schedule_enabled` | `false` | 是否已写入计划任务 |
 | `schedule_times` | `["09:00"]` | 触发时间点 |
 | `schedule_jitter` | `15` | 随机抖动分钟数 |
@@ -185,6 +188,6 @@ python src/wb_auth_server.py --save-token token.json   # 显式在服务器留�
 ## 7. 数据与隐私
 
 - 令牌是明文的，放在 `auth_oauth.json`；文件权限继承目录，不要放共享盘
-- 导入码 `WBAT1.…` 等同于令牌，不要发群、不要截图
+- 导入码 `WBAT1.…`（服务端流程用的那串）等同于令牌，不要发群、不要截图
 - 推送 key 存在 `config.json`，不要提交到公开仓库
 - 日志只记录结果与错误摘要，不记录令牌内容

@@ -114,6 +114,7 @@ pythonw tools/no_popup_check.py --exe "dist/WorkBuddy签到.exe" -- --sched-stat
 
 # 4) 授权链路回归（本地桩服务器，不碰真接口）
 python tools/oauth_mode_check.py
+#    结果写 .build/oauth_mode_check.json
 ```
 
 `selftest.json` 里重点看：
@@ -129,10 +130,12 @@ python tools/oauth_mode_check.py
 
 ## 5. 发布前检查清单
 
-- [ ] `python tools/oauth_mode_check.py` 全绿
+- [ ] `python tools/oauth_mode_check.py` 全绿（当前 52 项）
 - [ ] `dist/WorkBuddy签到.exe --selftest` 退出码 0，`frozen=true`
 - [ ] `--sched-status` 不弹控制台黑框
-- [ ] `--run` 退出码 0（测之前把 `push_channels` 临时清空）
+- [ ] `--run` 退出码 0（测之前把**两套**配置的 `push_channels` 都临时清空，
+      跑完还原）
+- [ ] 未授权状态下启动界面，除「立即授权」外按钮全灰
 - [ ] `dist/config.json` 里没有真实 key（发布包不带配置）
 - [ ] 不在 `dist/` 里留下 `auth_oauth.json`、`checkin.log`
 - [ ] README 的截图与新界面一致

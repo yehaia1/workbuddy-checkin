@@ -392,10 +392,11 @@ def remove(task_name: str = TASK_NAME) -> Tuple[bool, str]:
 def launcher() -> Tuple[str, str]:
     """返回计划任务应当执行的 (程序, 参数)。
 
-    冻结态（独立运行）：exe 自己，加 --run
-    源码态（本地运行）：pythonw + 仓库根目录的 run.py，同样加 --run
+    **独立运行（exe）永远是"exe 自己 + --run"**：定时执行的脚本就是 exe
+    内部的无界面入口，不依赖 Python、不依赖源码目录，exe 拷到哪台机器都能跑。
 
-    两种情况都用无控制台的解释器 / 窗口程序，避免每次触发闪一下黑框。
+    源码态只是开发自测：pythonw + 仓库根目录的 run.py（同样 --run）。
+    两种情况都用无控制台程序，避免每次触发闪一下黑框。
     """
     if getattr(sys, "frozen", False):
         return str(Path(sys.executable).resolve()), RUN_ARG
@@ -407,6 +408,49 @@ def launcher() -> Tuple[str, str]:
     # wb_task.py 在 src/ 下，仓库根目录是它上一级
     entry = Path(__file__).resolve().parent.parent / "run.py"
     return str(pyw), '"{}" {}'.format(entry, RUN_ARG)
+
+
+def _norm_cmd(text: Any) -> str:
+    """比较命令行用：忽略大小写、引号、多余空格。"""
+    return " ".join(str(text or "").replace('"', " ").split()).lower()
+
+
+def same_target(info: Dict[str, Any], program: str = "",
+                arguments: str = "") -> bool:
+    """计划任务指向的是不是当前这个程序（+ 同样的参数）。"""
+    if not info.get("exists"):
+        return False
+    program = program or launcher()[0]
+    arguments = arguments or launcher()[1]
+    cmd = str(info.get("command") or "").strip()
+    if not cmd:
+        return False
+    try:
+        same_exe = (os.path.normcase(os.path.abspath(cmd))
+                    == os.path.normcase(os.path.abspath(program)))
+    except (OSError, ValueError):
+        same_exe = _norm_cmd(cmd) == _norm_cmd(program)
+    return same_exe and _norm_cmd(info.get("arguments")) == _norm_cmd(arguments)
+
+
+def ensure_current(times: List[str], jitter_minutes: int = 0,
+                   task_name: str = TASK_NAME) -> Dict[str, Any]:
+    """任务不存在 / 指向旧路径时，按当前程序重新注册一次。
+
+    为什么要静默修：exe 换个目录（桌面 → D 盘）、或者从旧版本升级上来，
+    任务里的绝对路径就失效了，症状是"定时突然不跑了"而又没有明显提示。
+    每次启动顺手校一次，代价只有一次 XML 读取（约 0.5 毫秒）。
+
+    返回 {"changed", "ok", "message"}：changed=False 表示本来就对，没动它。
+    """
+    program, arguments = launcher()
+    info = query_fast(task_name)
+    if same_target(info, program, arguments):
+        return {"changed": False, "ok": True, "message": ""}
+    if not times:
+        return {"changed": False, "ok": False, "message": "没有可用的触发时间"}
+    ok, msg = apply(program, arguments, times, jitter_minutes, task_name)
+    return {"changed": True, "ok": ok, "message": msg}
 
 
 # 任务计划自身的状态码（SCHED_S_*），它们**不是**失败，别误报成异常

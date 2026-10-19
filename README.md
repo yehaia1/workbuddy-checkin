@@ -21,7 +21,8 @@
 ### Windows 版
 
 1. 双击 `WorkBuddyCheckin.exe`（放哪都行，桌面、D 盘、U 盘都可以）
-2. 「账号授权」→ **立即授权** → 浏览器登录一次
+2. 「账号授权」→ **立即授权** → 复制链接到手机打开，登录确认
+   （手机点完，程序自己会拿到令牌，电脑上不用再操作）
 3. 「每日定时」→ 填时间 → **应用到系统**，程序随后可以关掉
 
 之后每天到点由 Windows 计划任务拉起 `WorkBuddyCheckin.exe --run`，
@@ -117,7 +118,7 @@ checkin.log        运行日志（每次签到一行 JSON）
 签到接口需要登录态。本工具走 **CodeBuddy CLI 的设备授权流程**换一份令牌：
 
 1. 申请授权会话 → 拿到一条登录链接
-2. 在浏览器（Windows 版）或手机（服务端版）里登录并确认
+2. 用手机或任意设备的浏览器打开链接，登录并确认（**链接不绑定设备**）
 3. 轮询到结果 → 令牌落盘，之后纯 HTTP 调用
 
 有效期约 28 天。程序会在到期前 5 天自动续期；遇到 401 会续期一次再重试。
@@ -162,7 +163,7 @@ Windows 版（`dist/WorkBuddyCheckin.exe`）与服务端版参数不同：
 # Windows 版
 WorkBuddyCheckin.exe --run             # 无界面签到一次（计划任务用）
 WorkBuddyCheckin.exe --check-only      # 只查状态
-WorkBuddyCheckin.exe --auth            # 本机浏览器授权（界面外入口）
+WorkBuddyCheckin.exe --auth            # 发起授权，打印链接并等待
 WorkBuddyCheckin.exe --import-token X  # 导入授权（迁移/救急）
 WorkBuddyCheckin.exe --test-notify     # 发一条测试消息
 WorkBuddyCheckin.exe --diagnose        # 输出诊断快照（不含令牌）

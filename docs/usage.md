@@ -34,7 +34,14 @@ v2.x 把 `config.json`、`auth_oauth.json` 写在 exe 旁边。v3.0 首次运行
 
 ## 2. 账号授权
 
-点「立即授权」→ 自动打开浏览器 → 登录并确认 → 窗口检测到结果后自动关闭。
+点「立即授权」→ 窗口里出现一条授权链接 → 复制到手机打开、登录并确认 →
+窗口检测到结果后自动关闭。
+
+**链接不绑定设备**：本机浏览器、手机、另一台电脑都行。手机点完确认，本机
+这边靠同一个 `state` 轮询到结果，几秒内自动拿到令牌并落盘——手机上不需要
+回传任何东西。默认不自动弹本机浏览器；习惯在电脑上操作可以点「在本机打开」。
+
+![授权窗口](../dist/ui_auth.png)
 
 有效期约 28 天，到期前 5 天自动续期。**未授权时界面是锁住的**：
 除「立即授权」外，签到、只查状态、设置定时、设置推送全部灰掉：
@@ -61,7 +68,8 @@ v2.x 把 `config.json`、`auth_oauth.json` 写在 exe 旁边。v3.0 首次运行
 只在命令行，供排查或迁移用（服务端流程不需要从这里导入，见 [server.md](server.md)）：
 
 ```bash
-WorkBuddyCheckin.exe --auth                    # 不开界面，直接走浏览器授权
+WorkBuddyCheckin.exe --auth                    # 发起授权：打印链接 + 弹本机浏览器
+WorkBuddyCheckin.exe --auth --no-browser       # 只打印链接（手机授权 / 无图形环境）
 WorkBuddyCheckin.exe --import-token "<导入码>"  # 从另一台机器搬一份令牌
 WorkBuddyCheckin.exe --import-token D:\auth_oauth.json
 ```
@@ -142,7 +150,7 @@ WorkBuddyCheckin.exe --import-token D:\auth_oauth.json
 | `wecom_key` | `""` | 企业微信机器人 key |
 | `dingtalk_key` | `""` | 钉钉机器人 key |
 | `oauth_token_file` | `""` | 令牌路径，留空 = 数据目录下 `auth_oauth.json` |
-| `oauth_auth_timeout` | `300` | 等浏览器授权的秒数 |
+| `oauth_auth_timeout` | `300` | 等授权的秒数（手机操作也够） |
 | `expiry_warn_days` | `2` | 剩余多少天时提醒，`0` 关闭 |
 | `schedule_enabled` | `false` | 是否已写入计划任务（界面维护） |
 | `schedule_times` | `["09:00"]` | 触发时间 |
@@ -160,7 +168,8 @@ WorkBuddyCheckin.exe --import-token D:\auth_oauth.json
 |---|---|
 | `--run` | 无界面签到一次（计划任务用的就是它） |
 | `--check-only` | 只查状态，不领 |
-| `--auth` | 本机浏览器授权 |
+| `--auth` | 发起授权（打印链接并等待） |
+| `--no-browser` | 配合 `--auth`：不自动打开本机浏览器 |
 | `--import-token <码或文件>` | 导入令牌（迁移 / 救急） |
 | `--test-notify` | 发一条测试消息 |
 | `--selftest` | 环境自检，结果写 `selftest.json` |

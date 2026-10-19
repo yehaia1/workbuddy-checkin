@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 APP_ID = "WorkBuddyCheckin"          # 目录名 / 计划任务名 / 产物名，全英文
 APP_TITLE = "WorkBuddy 签到"
-VERSION = "3.1.0"                    # 唯一版本号来源，打包时也读这里
+VERSION = "3.1.1"                    # 唯一版本号来源，打包时也读这里
 RELEASE_DATE = "2026-10-19"
 
 TOKEN_FILE_NAME = "auth_oauth.json"
@@ -66,7 +66,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "dingtalk_key": "",             # 钉钉机器人：链接里 access_token= 后面那段
     # ---- 授权 ----
     "oauth_token_file": "",         # 留空 = 数据目录下 auth_oauth.json
-    "oauth_auth_timeout": 300,      # 本机浏览器授权等待上限（秒）
+    "oauth_auth_timeout": 300,      # 授权等待上限（秒），手机操作也够用
     # 服务端自动授权：等多久（秒）/ 最多几轮 / 轮次间的退避基数（秒，指数增长）
     "auth_wait_seconds": 180,
     "auth_attempts": 3,

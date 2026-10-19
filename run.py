@@ -12,7 +12,7 @@
     本地运行（本文件）          独立运行（build/entry.py → exe）
     ----------------------      --------------------------------
     需要 Python + tkinter       目标机器什么都不用装
-    配置写在仓库根目录          配置写在 exe 旁边
+    配置写在仓库根目录          配置写在用户缓存目录
     有控制台，print 直接可见    窗口程序，没有控制台
     改一行代码立刻生效          每次都要重新打包
 
@@ -43,8 +43,13 @@ except ImportError:
     sys.exit(
         "当前 Python 没有 tkinter，无法显示图形界面。\n"
         "  * 装官方 Python 时勾选 tcl/tk，或\n"
-        "  * 改用独立运行版本：dist/WorkBuddy签到.exe\n"
+        "  * 改用独立运行版本：dist/WorkBuddyCheckin.exe\n"
         "只跑签到（--run）不需要界面，但本入口仍然要求完整 Python 环境。")
+
+import wb_config  # noqa: E402
+
+# 源码运行的数据目录 = 仓库根目录（exe 才用用户缓存目录）
+wb_config.prepare()
 
 import checkin_gui  # noqa: E402  （必须在 sys.path 之后导入）
 

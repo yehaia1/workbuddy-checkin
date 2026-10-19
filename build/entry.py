@@ -22,6 +22,13 @@ if not getattr(sys, "frozen", False):
     if SRC not in sys.path:
         sys.path.insert(0, SRC)
 
+import wb_config  # noqa: E402
+
+# 冻结态的数据目录 = 当前用户的缓存目录（%LOCALAPPDATA%\WorkBuddyCheckin），
+# 不写 exe 旁边 —— exe 放桌面、U 盘、只读目录都能正常跑。
+# 顺便把旧版留在 exe 旁边的 config.json / auth_oauth.json 搬过来。
+wb_config.prepare()
+
 import checkin_gui  # noqa: E402
 
 

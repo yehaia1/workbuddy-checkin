@@ -241,7 +241,7 @@ class AuthDialog:
     否则只能靠再点一次签到去试，失败了也说不清是授权没完成还是别的问题。
 
     **远程授权（把链接推到手机）不在这里**：那是服务端流程的一部分，
-    由 wb_auth_server.py 发起、命令行交接（见 docs/server.md）。
+    由 wb_server.py 自己完成（见 docs/server.md）。
     本地版只保留这一个入口，界面和心智负担都最简单。
 
     线程模型：网络轮询在后台线程，结果通过队列回主线程刷控件。
@@ -529,10 +529,7 @@ class ScheduleDialog:
 
     @staticmethod
     def _is_stale(info: dict) -> bool:
-        prog, _args = wb_task.launcher()
-        return bool(info.get("exists")
-                    and os.path.normcase(str(info.get("command") or ""))
-                    != os.path.normcase(prog))
+        return bool(info.get("exists") and not wb_task.same_target(info))
 
     def _show(self, info):
         self.lbl_on_hint.configure(
@@ -910,13 +907,18 @@ class App:
         self.log("运行方式：{}".format(
             "独立运行（exe）" if wb_config.run_mode() == "frozen"
             else "本地源码运行"))
-        self.log("程序目录：{}".format(wb_config.SCRIPT_DIR))
+        self.log("程序位置：{}".format(wb_config.install_dir()))
+        self.log("数据目录（{}）：{}".format(wb_config.data_origin(),
+                                        wb_config.data_dir()))
         self.log("配置文件：{}".format(cfg_path))
         self.log("系统 DPI {}（缩放 {:.0f}%）".format(
             system_dpi() or 96, PX * 100))
 
         self.refresh_all()
         self.start_task(self.task_env_check, quiet=True)
+        # 定时任务指向的是绝对路径：exe 换过目录、或从旧版升级上来，
+        # 任务就失效了。启动后静默校一次，不对就按当前程序重新注册。
+        self.root.after(900, self._guard_schedule)
 
     # ---------------- 界面搭建 ----------------
 
@@ -1114,11 +1116,8 @@ class App:
             self.sec_sched.set("● 未启用", "每天不会自动签到，只能手动点。", C_MUTED)
             return
         info = wb_task.query_fast()
-        prog, _args = wb_task.launcher()
-        info["stale"] = bool(
-            info.get("exists")
-            and os.path.normcase(str(info.get("command") or ""))
-            != os.path.normcase(prog))
+        info["stale"] = bool(info.get("exists")
+                             and not wb_task.same_target(info))
         self.sched_state = info
         times = "、".join(info.get("times") or []) or "?"
         jit = int(info.get("jitter_minutes") or 0)
@@ -1136,6 +1135,35 @@ class App:
     def apply_config(self, cfg: dict) -> None:
         self.cfg = cfg
         self.refresh_all()
+
+    # ---------------- 定时任务自愈 ----------------
+
+    def _guard_schedule(self) -> None:
+        # 只在 exe 里做：源码运行时 pythonw + run.py 也能注册任务，但那会
+        # 把用户已经装好的「exe 任务」抢过来，等于开发动作改坏了别人机器。
+        if wb_config.run_mode() != "frozen":
+            return
+        if not self.cfg.get("schedule_enabled"):
+            return
+        threading.Thread(target=self._guard_schedule_work, daemon=True).start()
+
+    def _guard_schedule_work(self) -> None:
+        """任务不在 / 指向旧路径 → 按当前程序重新注册（不打扰用户）。"""
+        try:
+            res = wb_task.ensure_current(
+                self.cfg.get("schedule_times") or [],
+                int(self.cfg.get("schedule_jitter") or 0))
+        except Exception:
+            self.log("检查定时任务失败：\n" + traceback.format_exc())
+            return
+        if not res.get("changed"):
+            return
+        if res.get("ok"):
+            self.log("定时任务已自动修正（程序位置变了）：{}".format(
+                res.get("message")))
+        else:
+            self.log("定时任务需要重新应用：{}".format(res.get("message")))
+        self.post("refresh")
 
     # ---------------- 线程与消息 ----------------
 
@@ -1397,14 +1425,16 @@ class App:
 # ---------------- 无界面入口 ----------------
 
 def selftest() -> int:
-    """无界面自检：把结果写到程序目录的 selftest.json（排查环境问题用）。"""
+    """无界面自检：把结果写到数据目录的 selftest.json（排查环境问题用）。"""
     enable_dpi_awareness()
     cfg = core.load_config()
     out = {
         "version": VERSION,
         "system_dpi": system_dpi(),
         "frozen": bool(getattr(sys, "frozen", False)),
-        "app_dir": str(wb_config.SCRIPT_DIR),
+        "data_dir": str(wb_config.data_dir()),
+        "data_origin": wb_config.data_origin(),
+        "install_dir": str(wb_config.install_dir()),
         "config_path": str(wb_config.config_path()),
         "token_file": core.oauth_token_path(cfg),
         "push_channels": wb_notify.selected_channels(cfg),
@@ -1422,7 +1452,7 @@ def selftest() -> int:
     except Exception:
         out["schedule_error"] = traceback.format_exc()
     try:
-        (wb_config.SCRIPT_DIR / "selftest.json").write_text(
+        (wb_config.data_dir() / "selftest.json").write_text(
             json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
         return 0
     except OSError:
@@ -1431,7 +1461,7 @@ def selftest() -> int:
 
 # 这些参数表示「无界面执行」，绝不能创建窗口
 HEADLESS_FLAGS = ("--run", "--check-only", "--diagnose", "--test-notify",
-                  "--auth", "--import-token", "--pull-token")
+                  "--auth", "--import-token", "--version")
 
 
 def _redirect_output() -> None:
@@ -1491,6 +1521,9 @@ def sched_status() -> int:
             "  上次运行  {}（{}）".format(info.get("last_run") or "—", desc),
             "  执行命令  {} {}".format(info.get("command"),
                                       info.get("arguments")),
+            "  指向当前  {}".format(
+                "是" if wb_task.same_target(info)
+                else "否（打开程序会自动修正，或重新「应用到系统」）"),
         ])
     try:
         print(text)
@@ -1507,6 +1540,9 @@ def sched_status() -> int:
 
 def main() -> int:
     argv = sys.argv[1:]
+    # 入口没定过数据目录时兜底（exe 由 build/entry.py 定，源码由 run.py 定）
+    if not wb_config.is_prepared():
+        wb_config.prepare()
     if "--selftest" in argv:
         return selftest()
     if SCHED_FLAG in argv:

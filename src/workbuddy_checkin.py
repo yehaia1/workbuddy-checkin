@@ -23,14 +23,10 @@
     python run.py --auth                   # 本机浏览器授权（界面唯一入口）
     python run.py --test-notify
     python run.py --diagnose
+    python run.py --version
   以上均可加 --json 输出单行 JSON
 
-下面是**服务端授权流程**专用的两条命令，界面上没有对应入口
-（详见 docs/server.md）：服务器跑 wb_auth_server.py 拿到令牌后，用它们把
-令牌交到真正执行签到的那台 Windows 上。
-
-    python run.py --import-token <导入码|令牌文件>
-    python run.py --pull-token <url> <secret>
+服务端（定时脚本）不是这套参数，见 src/wb_server.py。
 """
 from __future__ import annotations
 
@@ -39,7 +35,6 @@ import json
 import os
 import sys
 import time
-import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import wb_config
@@ -56,9 +51,6 @@ CLAIM_KEYS = ("credit", "credits", "today_credit", "streak_days",
 
 # 兼容旧名字：外部脚本/回归检查里还在用 core.DEFAULT_CONFIG
 DEFAULT_CONFIG = wb_config.DEFAULT_CONFIG
-SCRIPT_DIR = wb_config.SCRIPT_DIR
-CONFIG_PATH = wb_config.CONFIG_PATH
-LOG_PATH = wb_config.LOG_PATH
 
 
 class CheckinError(RuntimeError):
@@ -79,7 +71,7 @@ def load_config(path: Optional[str] = None) -> Dict[str, Any]:
 
 
 def oauth_token_path(cfg: Optional[Dict[str, Any]] = None) -> str:
-    return wb_oauth.token_path(cfg or {}, base_dir=str(wb_config.SCRIPT_DIR))
+    return wb_oauth.token_path(cfg or {}, base_dir=str(wb_config.data_dir()))
 
 
 # ---------------- 进度与日志 ----------------
@@ -326,7 +318,7 @@ def login_oauth(cfg: Optional[Dict[str, Any]] = None,
     """走一遍设备授权，把令牌落到本机（本机浏览器，界面唯一入口）。
 
     远程授权（把链接推到手机）不在这里：那属于服务端流程，
-    由 wb_auth_server.py 发起，见 docs/server.md。
+    由 wb_server.py 自己完成，见 docs/server.md。
 
     on_url(url)   拿到链接的瞬间回调（界面靠它立刻把链接显示出来）
     should_stop() 返回 True 时中断等待（用户点了取消）
@@ -398,34 +390,6 @@ def import_token(code_or_file: str,
         "token_file": path,
     }
     append_log({"result": "IMPORTED", "note": "uid={}".format(result["uid"])})
-    return result
-
-
-def pull_token(url: str, secret: str,
-               cfg: Optional[Dict[str, Any]] = None,
-               timeout: int = 60) -> Dict[str, Any]:
-    """从服务端的一次性领取端口取令牌（对应 wb_auth_server.py --handoff）。"""
-    cfg = cfg or load_config()
-    sep = "&" if "?" in url else "?"
-    full = "{}{}k={}".format(url, sep, secret)
-    try:
-        with urllib.request.urlopen(full, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8", "replace"))
-    except Exception as e:
-        raise CheckinError("PULL_FAILED", "从服务端领取令牌失败：{}".format(e), 3)
-    record = payload.get("token") if isinstance(payload, dict) else None
-    if not isinstance(record, dict):
-        raise CheckinError("PULL_FAILED",
-                           "服务端没有返回令牌：{}".format(
-                               payload.get("error") if isinstance(payload, dict)
-                               else payload), 3)
-    path = oauth_token_path(cfg)
-    wb_oauth.save(record, path)
-    acct = record.get("account") or {}
-    result = {"result": "IMPORTED", "uid": acct.get("uid") or "",
-              "nickname": acct.get("nickname") or "", "token_file": path}
-    append_log({"result": "IMPORTED", "note": "from server, uid={}".format(
-        result["uid"])})
     return result
 
 
@@ -510,7 +474,9 @@ def diagnose(path: Optional[str] = None) -> Dict[str, Any]:
     cfg = load_config(path)
     out: Dict[str, Any] = {
         "version": wb_config.VERSION,
-        "app_dir": str(wb_config.SCRIPT_DIR),
+        "run_mode": wb_config.run_mode(),
+        "data_dir": str(wb_config.data_dir()),
+        "install_dir": str(wb_config.install_dir()),
         "config_path": str(wb_config.config_path(path)),
         "push_channels": wb_notify.selected_channels(cfg),
         "token_file": oauth_token_path(cfg),
@@ -584,9 +550,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--auth", action="store_true",
                         help="本机浏览器授权（界面唯一入口）")
     parser.add_argument("--import-token", metavar="CODE_OR_FILE",
-                        help="服务端流程：导入服务端授权结果（导入码或令牌文件）")
-    parser.add_argument("--pull-token", nargs=2, metavar=("URL", "SECRET"),
-                        help="服务端流程：从服务端一次性端口领取令牌")
+                        help="导入授权结果（导入码或令牌文件），令牌迁移/救急用")
+    parser.add_argument("--version", action="store_true", help="显示版本后退出")
     parser.add_argument("--json", action="store_true", help="输出单行 JSON")
     # 无界面签到入口：计划任务调起时用
     parser.add_argument("--run", action="store_true", help=argparse.SUPPRESS)
@@ -594,7 +559,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    if not wb_config.is_prepared():
+        wb_config.prepare()
     args = parse_args(argv)
+
+    if args.version:
+        text = wb_config.version_text()
+        print(json.dumps({"version": wb_config.VERSION,
+                          "run_mode": wb_config.run_mode(),
+                          "data_dir": str(wb_config.data_dir())},
+                         ensure_ascii=False) if args.json else text)
+        return 0
+
     cfg = load_config()
 
     if args.test_notify:
@@ -627,16 +603,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.import_token:
         try:
             result = import_token(args.import_token, cfg)
-        except SESSION_ERRORS as e:
-            result = {"result": e.result, "message": str(e),
-                      "exit_code": e.exit_code}
-            append_log(result)
-        render(result, args.json)
-        return int(result.get("exit_code", 0))
-
-    if args.pull_token:
-        try:
-            result = pull_token(args.pull_token[0], args.pull_token[1], cfg)
         except SESSION_ERRORS as e:
             result = {"result": e.result, "message": str(e),
                       "exit_code": e.exit_code}

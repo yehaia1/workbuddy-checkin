@@ -19,169 +19,97 @@
 
 这么分的原因：
 
-- **界面不能常驻**。用户不会为了签到一直开着窗口，而且常驻会占内存
-  （实测约 78 MB）。
-- **调度必须交给系统**。自己写循环 sleep 的话，电脑重启、休眠、关机就全废了。
+- **界面不能常驻**。用户不会为了签到一直开着窗口，常驻还要占内存。
+- **调度必须交给系统**。自己写循环 sleep，电脑重启、休眠、关机就全废了。
 - **执行必须无界面**。计划任务调起的进程如果弹窗，会在用户毫无预期的时候打断他。
 
 三者之间只有两条契约：计划任务里记录的**可执行文件路径 + `--run` 参数**，
 以及 `config.json`。
 
-### 单次签到流程
+### 模块职责
 
-```
-查状态 ──▶ 已签到？ ──是──▶ 直接返回 ALREADY_CLAIMED（幂等）
-              │
-              否
-              ▼
-          领积分 ──▶ code=10001 表示"今天已领过"（并发下的兜底）
-              │
-              ▼
-          复核状态 ──▶ 确认今日已签到
-              │
-              ▼
-          消息推送（按已配置渠道逐个发，互不影响）
-```
-
-整体是**幂等**的：重复执行不会重复领取，只会在日志里记一条"今日已签到"。
-
----
-
-## 环境检测：为什么要分两层
-
-"检测不到客户端"是最容易误报的地方，所以判断被刻意拆成两层：
-
-| 层次 | 判据 | 为什么不能合并 |
+| 模块 | 职责 | 能否在服务器上跑 |
 |---|---|---|
-| 装没装 | 配置路径 → 运行中进程的镜像路径 → 注册表 `Uninstall` / `App Paths` → 常见安装目录 | 客户端**没开**不等于**没装**，合并会把这两种情况混为一谈 |
-| 在不在跑 | Win32 `CreateToolhelp32Snapshot` 枚举进程 | 只有进程在跑，宿主通道才可能存在 |
-| 通道通不通 | `~/.workbuddy/wbipc/endpoint.json` 是否存在 | 通道文件不在，调接口必然失败 |
-| 登录没登录 | 读账号快照 `primary.uid`，**再真连一次 IPC 调状态接口** | 登出后账号快照文件**可能残留**，只看文件会误判成"已登录" |
+| `wb_config.py` | 配置默认值、读写、路径 | ✅ |
+| `wb_notify.py` | 企业微信 / 钉钉推送 | ✅ |
+| `wb_oauth.py` | 设备授权、令牌落盘、续期、导入码 | ✅ |
+| `workbuddy_checkin.py` | 签到三步、文案、CLI | ✅ |
+| `wb_auth_server.py` | 服务端授权 | ✅（本来就是给服务器用的） |
+| `wb_task.py` | Windows 计划任务 | ❌ 仅 Windows |
+| `checkin_gui.py` | tkinter 界面 | ❌ 仅 Windows 桌面 |
 
-第 4 步是唯一可靠的一步。前三步都只是为了让报错信息更精确、让用户知道该点什么按钮。
-
-> **为什么客户端通道必须先开着并登录**：签到接口的鉴权头由客户端**主进程**注入，
-> 本程序不接触、不存储任何令牌。这条通道绕不过客户端进程。
->
-> v1.7 起还有**账号直连**通道（`auth_mode: "oauth"`）：自行走设备授权换一份令牌，
-> 纯 HTTP 签到，**不需要客户端在跑**。代价是令牌明文落在本机、调用身份变成 CLI。
-> 两条通道的 `fetch(method, path)` 接口一致，业务代码共用一份（见 wb_oauth.py）。
+服务端脚本复用前四个模块，所以它们**不能 import 任何 Windows 专有东西**
+（`tkinter` / `ctypes.windll`）。
 
 ---
 
-## 内置模块发现：为什么不能写死路径
-
-`workbuddy_ipc` 是客户端**自带**的模块（不是 pip 装的），运行时靠往 `sys.path`
-插一个目录再 `import`。麻烦在于：**它的父目录在不同安装方式/版本下并不统一**。
-实测同一台机器上就同时存在三种布局：
+## 单次签到流程
 
 ```
-<安装目录>/resources/app.asar.unpacked/resources/plugins/
-    workbuddy-builtin/skills/library/                          ← 主路径
-    workbuddy-builtin/builtin-plugins/<插件>/skills/<技能>/     ← 插件式布局
-<用户目录>/.workbuddy/plugins/cache/<厂商>/<插件>/<版本>/…/     ← 插件缓存
+POST /v2/billing/meter/checkin-activity-status   查：今天签了吗
+  ├─ active=false            → INACTIVE，结束
+  ├─ today_checked_in=true   → ALREADY_CLAIMED，结束
+  └─ 否则
+POST /v2/billing/meter/daily-checkin             领（code=10001 = 已领过）
+POST /v2/billing/meter/checkin-activity-status   复核：真签上了吗
 ```
 
-早期版本只探测前两类中的固定几条，一旦对不上就整体报
-`IPC_MODULE_NOT_FOUND` —— 表现为"明明装了客户端也登录了，却说找不到模块"。
-本机跑得好好的、换台机器就坏，根源就在这里。
-
-### v1.6 的做法：约定路径 + 有界递归兜底
-
-`module_roots()` 按可信度依次产出候选目录：
-
-1. 配置里手工指定的 `ipc_dir`（最后一根救命稻草；**界面上不提供入口**，
-   正常安装用不到，摆出来只会让使用者以为必须填——需要时手工改 config.json）
-2. 环境变量（存在时）
-3. 安装目录内的约定路径（命中即用，最快）
-4. 用户插件缓存的多种 glob 布局
-5. **有界递归扫描**：在安装目录 / 插件缓存 / `~/.workbuddy` 下逐层找
-   `workbuddy_ipc` 的父目录（深度 ≤ 9，条目数封顶，跳过纯缓存目录）
-
-实测代价：安装目录约 20 ms、插件缓存约 30 ms，整体 `module_roots()` 约 0.15 s。
-因为一次运行里目录不会变，结果做了**进程级缓存**（`_MODULE_ROOTS_CACHE`，
-key = 配置里的 `ipc_dir`），否则启动自检和 `load_ipc` 会各付一次扫描；
-排查用的 `probe_module_roots()` 走 `refresh=True` 强制实扫，不吃缓存。
-
-找到若干候选目录后仍然落空时，抛给用户的是一句干净的话
-（"未找到内置模块 workbuddy_ipc。"），**候选目录数量、安装目录位置、
-逐条导入失败原因只写进 `checkin.log` 与 `selftest.json`**。
-早期版本把这些细节拼进报错正文，界面上等于用噪声挤掉了真正的建议。
-
-### 两个踩过的坑
-
-- **命中后不能提前收工**。同一个 base 下可能并存多种布局
-  （`skills/workbuddy_ipc` 与 `skills/library/workbuddy_ipc` 同时存在），
-  找到第一个就 `continue` 会把后者漏掉。
-- **不能"跳过所有点号目录"**。`~/.workbuddy` 本身就是最关键的位置；
-  必须用显式黑名单（`.git` / `.venv` / `node_modules` …）而不是前缀判断。
-
-### 报错要能远程定位
-
-失败时把 `候选目录 N 个；客户端安装目录 X` 拼进报错信息。这条信息决定了
-远程排查是"再猜一轮"还是"一眼看出是哪个环节断了"。自检还会输出每条候选目录的
-`exists` / `has_package`，见 `tools/module_discovery_check.py`。
+三步都幂等，重复触发安全。领取报错时**先复核再判定失败**——服务端偶发 5xx
+但实际已入账的情况真的存在，不复核会把成功报成失败。
 
 ---
 
-## 后台运行：怎么做到不跳窗打断你
+## 授权：为什么是"设备授权"
 
-### 先试官方参数：没有
-
-全量扫描了客户端的 `app.asar`，主进程的 `process.argv` 只解析 `--debug` 和 `--serve`。
-
-网上能搜到的 `--hidden` / `--background`，在它的代码里**全是 CSS 类名**，
-不是启动开关。所以**没有官方静默启动参数**。
-
-### 所以改用"拉起后隐藏窗口"
-
-客户端原生支持托盘 + 关闭到托盘，也就是说"**窗口隐藏、进程继续跑**"是它自己就支持的状态。
-做法是：正常拉起客户端，然后用 Win32 `ShowWindow(SW_HIDE)` 把主窗口藏起来。
-
-实测（`probe_hidden_launch.py --test-hide`）：
+客户端 5.6.2 起把本地登录态改成字段级 AES-GCM 加密（at-rest），
+"读本地 token 直接调接口"的老路子已经死了。所以这里换一条：
 
 ```
-选中的主窗口：hwnd=2687368 title='WorkBuddy'
-→ 隐藏… 成功
-  隐藏后窗口 visible=False
-  IPC 是否仍可用：OK          ← 关键：进程还在，宿主通道没断
-→ 恢复窗口… 成功
+POST /v2/plugin/auth/state?platform=CLI   → {state, authUrl}
+GET  /v2/plugin/auth/token?state=<state>  → 轮询：
+                                               code=0     拿到令牌
+                                               code=11217 还在等（不是失败！）
+                                               code=12153 会话失效，只能重新授权
 ```
 
-**隐藏窗口不影响 IPC**，这条路成立。
+两个端点都是**无状态 HTTP**，`state` 只是服务端一段会话 id，所以：
+**谁拿着 state，谁就能取到令牌，跟发起请求的机器无关**。这正是服务端脚本
+（`wb_auth_server.py`）能跨机器工作的原因。
 
-### 代价：会闪现 1~5 秒
+### 令牌只有一份（最容易踩的坑）
 
-从"进程启动"到"隐藏成功"之间，窗口会闪现约 1~5 秒，可能抢一次焦点。
-这是没有官方静默参数导致的，**绕不过去**。
+`refreshToken` 每次刷新都会**轮换**。两台机器各存一份 → 谁先刷新，另一份立刻失效
+（服务端 `12153`），表现为"授权莫名其妙失效"。所以：
+
+- 服务端脚本默认**不落盘**，只把令牌包成一次性导入码交出去；
+- Windows 端导入后独占，之后所有续期都发生在那台机器上；
+- `--handoff` 模式用一次性随机 secret 把令牌直接交给客户端，取走即关端口。
+
+### 续期策略
+
+| 时机 | 动作 |
+|---|---|
+| 距过期 < 5 天 | 预刷新（服务端可能提前撤销，别卡最后一刻） |
+| 调用遇到 401 / 403 | 刷新并**重试一次**，仍被拒才判定失效 |
+| 刷新返回 12153 | 标记 `disabled` 并落盘，提示重新授权 |
+
+刷新后必须**立刻原子写回**（`.tmp` + `os.replace`）。否则下一次运行读到的是旧
+refreshToken，直接判死。
 
 ---
 
 ## 高 DPI（为什么字会变小）
 
-Windows 缩放到 125% / 150% / 250% 时，**DPI 感知必须在创建 Tk 之前声明**。
+Windows 缩放到 125% / 250% 时，进程必须在**创建 Tk 之前**声明 DPI 感知。
+否则 Tk 初始化时按 96DPI 换算字体；等 Tk 建完再声明感知就晚了——窗口不再被
+位图放大，字体却仍按 96DPI 算，250% 下会小 2.5 倍。
 
-如果先建 `tk.Tk()` 再声明，时序是这样的：
+声明之后还要用实际 DPI 校准两样东西：
 
-1. Tk 初始化时进程还不感知 DPI → Windows 把屏幕虚拟化成 96 DPI
-2. Tk 按 `96 / 72` 算完了所有字体
-3. 之后进程才变成 DPI 感知 → 窗口不再被系统位图放大
+- `tk scaling`（管字号，单位是「每 point 多少像素」）
+- `PX` 系数（管 padding / width 这些**物理像素**参数，它们不跟 tk scaling 走）
 
-结果就是**字体物理尺寸小 2.5 倍**（250% 缩放下）。本程序的做法：
-
-1. `tk.Tk()` **之前**调用 `SetProcessDpiAwareness(1)`
-2. 建完窗口后按实际 DPI 校准 `tk scaling`（管字体）
-3. 边距、窗口尺寸这些**物理像素**参数统一乘一个 `PX` 系数（管间距）
-
-另外两个高 DPI 的坑：
-
-- tk 原生 `Checkbutton` 的指示器是**固定尺寸位图**，高 DPI 下会缩成一个小方块。
-  设置窗口里的控件因此换成了 `ttk`（`clam` 主题，尺寸按字体度量算）。
-- 250% 下 ttk(`clam`) 的 `Checkbutton` 指示器**画不出勾选态**，
-  所以「定时签到」里的复选框改成了自绘开关（方框 + ✓ + `var.trace_add` 重绘）。
-
-> 写截图 / 测量脚本时也要记得声明 DPI 感知，否则 `GetWindowRect` 返回的是被虚拟化的
-> 逻辑坐标，量出来小 2.5 倍、`BitBlt` 会错位。
+只做前者的话，250% 下字号对了，但间距会挤成一团。
 
 ---
 
@@ -189,126 +117,105 @@ Windows 缩放到 125% / 150% / 250% 时，**DPI 感知必须在创建 Tk 之前
 
 ### 现象
 
-点界面上某些按钮时，会弹出一个 PowerShell 窗口。
-
-### 原因
-
-程序打包成**无控制台**的窗口程序后，自身没有控制台。
-此时它去拉 `powershell.exe` / `tasklist.exe` / `taskkill.exe` 这些**控制台程序**，
-Windows 找不到可继承的控制台，就会**给子进程新建一个控制台窗口**。
-
-任务本身执行是正常的，纯粹是窗口不该出现。
+窗口程序（`--windowed` 的 exe，或 `pythonw.exe` 跑的源码）自身没有控制台。
+它去拉 `powershell.exe` 这类**控制台程序**时，Windows 会**给子进程新建一个
+控制台窗口**——用户看到的就是"点一下按钮，冒出一个黑框闪一下"。
 
 ### 修法
 
-所有子进程调用统一加 `win_quiet.quiet_kwargs()`：
+`win_quiet.quiet_kwargs()` 给所有 `subprocess` 调用加上：
 
 ```python
-subprocess.run(cmd, capture_output=True, timeout=30, **quiet_kwargs())
+creationflags = CREATE_NO_WINDOW      # 从根上不分配控制台
+startupinfo.dwFlags |= STARTF_USESHOWWINDOW; wShowWindow = SW_HIDE   # 双保险
 ```
 
-其中：
-
-- `creationflags = CREATE_NO_WINDOW (0x08000000)` —— 从根上不分配控制台，
-  管道读写一切照旧
-- `startupinfo.dwFlags |= STARTF_USESHOWWINDOW; wShowWindow = SW_HIDE` —— 双保险
-
-注意 `CREATE_NO_WINDOW` 与 `DETACHED_PROCESS` **互斥**，不能同时用。
+注意 `CREATE_NO_WINDOW` 与 `DETACHED_PROCESS` 互斥，不能同时用。
 
 ### 怎么验证（别靠肉眼）
 
-用 `EnumWindows` 枚举全系统可见顶层窗口，按类名判定：
+用 `EnumWindows` 枚举可见顶层窗口，按类名挑控制台窗口。**不要只匹配
+`ConsoleWindowClass`**：Win11 的控制台由 Windows Terminal 托管，类名是
+`CASCADIA_HOSTING_WINDOW_CLASS`（还有 `PseudoConsoleWindow`），
+只匹配老类名会得出"没问题"的错误结论。
 
-| 类名 | 出现场景 |
-|---|---|
-| `ConsoleWindowClass` | 传统 conhost 控制台 |
-| `CASCADIA_HOSTING_WINDOW_CLASS` | **Win11 交给 Windows Terminal 托管** |
-| `PseudoConsoleWindow` | OpenConsole |
+现成的：
 
-> **踩坑记录**：第一版探针只匹配 `ConsoleWindowClass`，结果对照组也是 0，
-> 差点误判成"本来就没问题"。Win11 上必须把
-> `CASCADIA_HOSTING_WINDOW_CLASS` 也算进去。
-
-A/B 实测结果：
-
-| 组 | 新出现的可见控制台窗口 |
-|---|---|
-| 裸调用 | **2 个**（`WindowsTerminal.exe` + `OpenConsole.exe`） |
-| 加 `quiet_kwargs()` | **0 个** |
-
-验证脚本（需要 `pythonw.exe` 运行以模拟无控制台环境）见
-[troubleshooting.md](troubleshooting.md#点按钮闪出黑框)。
+```bash
+pythonw tools/no_popup_check.py --exe "dist\WorkBuddy签到.exe" -- --sched-status
+```
 
 ---
 
 ## 计划任务：为什么不用 schtasks.exe
 
-改用 PowerShell 的 `ScheduledTasks` 模块（Win8+ 系统自带），原因有三个：
+- 命令行转义麻烦，中文路径极易踩编码坑
+- 「随机抖动」（`RandomDelay`）几乎没法拼
+- 一个任务挂多个触发器要另外写 XML
 
-1. **命令行转义麻烦**，中文路径极易踩编码坑
-2. **随机抖动（`RandomDelay`）几乎没法用命令行拼出来**
-3. 一个任务挂多个触发器需要额外写 XML
-
-实现方式是：把 PowerShell 脚本用 `-EncodedCommand` 以 **Base64 / UTF-16LE**
-传进去，彻底绕开引号与编码问题；脚本把结果 `ConvertTo-Json` 输出，Python 侧解析。
-这样即使失败也能拿到可读的错误原因。
+改用 PowerShell 的 `ScheduledTasks` 模块（Win8+ 自带），通过 `-EncodedCommand`
+传脚本（Base64/UTF-16LE），彻底绕开引号与编码问题；结果以 JSON 输出。
 
 ### 权限设计
 
-以「**当前用户 + `InteractiveToken` + `RunLevel Limited`**」注册：
+以「当前用户 + 仅登录时运行（InteractiveToken）+ 普通权限（Limited）」注册，
+**不弹 UAC、不需要管理员**。代价是触发前提为"用户已登录"——本场景正好合适。
 
-- **不需要管理员权限，也不弹 UAC**
-- 代价是触发条件为"用户已登录"——本场景正好合适
+### 查状态为什么要分两条路
 
-### 其它设置
+| 方法 | 耗时 | 拿得到什么 |
+|---|---|---|
+| `query_fast()` 直读 `System32\Tasks\<任务名>`（UTF-16 XML） | ~0.5 ms | 在不在、几点跑、指向哪个程序、抖动多少 |
+| `query()` 走 PowerShell | **~5 秒** | 上面这些 + 下次/上次运行时间、上次返回码 |
 
-- `StartWhenAvailable`：关机 / 休眠错过后，开机补跑一次
-- `ExecutionTimeLimit` 1 小时：防止卡死的实例一直挂着
-- 随机抖动是**计划任务原生能力**，不是脚本里 sleep：
-  到点前由系统在窗口内挑一个时刻触发，所以"下次执行时间"显示的是已加过抖动的具体时刻
+启动自检、界面刷新一律走 `query_fast()`；只有「每日定时」对话框和
+`--sched-status` 才用 `query()`。把 5 秒的查询挂在启动流程上，就是
+"开程序后横幅转半天"的元凶。
+
+> XML 里 `StartBoundary` 是 **UTC**，要换算成本地时间再展示。
 
 ### 状态码翻译
 
-`LastTaskResult` 不全是退出码，`SCHED_S_*` 系列是状态而不是失败，必须单独识别：
+计划任务的返回码通常就是被调进程的退出码（本工具：0 成功、2 授权/环境问题、
+其它非零异常），但 `SCHED_S_*` 系列**不是失败**：
 
-| 码 | 含义 | 是否算成功 |
-|---|---|---|
-| `0` | 成功 | ✅ |
-| `2` | 未完成（客户端未就绪或未登录） | ❌ |
-| `267009` | 正在运行 | ✅ |
-| `267010` | 任务已被禁用 | ❌ |
-| `267011` | **尚未运行过**（新建任务第一次触发前就是这个值） | ✅ |
-| `267012` | 没有后续计划 | ❌ |
-| `267013` | 任务被终止 | ❌ |
-| `267014` | 就绪，尚未运行 | ✅ |
-
-> 早期版本没做这张表，把 `267011` 误报成「系统标记为异常」。
+| 码 | 含义 |
+|---|---|
+| 267009 | 正在运行 |
+| 267011 | 尚未运行过（新建任务第一次触发前就是这个值，别误报） |
+| 267014 | 就绪，尚未运行 |
 
 ---
 
-## 打包：两个只有打完才知道的坑
+## 打包：一个只有打完才知道的坑
 
-1. **动态导入的依赖不会被自动收集**。`workbuddy_ipc` 是运行时从客户端安装目录
-   动态 `import` 的，PyInstaller 静态分析看不到它，于是它依赖的
-   `hmac` / `secrets` / `socket` / `ssl` 都不进包，exe 运行时报
-   `ModuleNotFoundError: No module named 'hmac'`，还会被上层逻辑误判成"客户端未登录"。
-   → 在 `build_exe.py` 里显式声明为 `--hidden-import`。
+**打包用的解释器必须带 tkinter。** 用不带 tkinter 的解释器打包，PyInstaller
+**不报任何错**，只是悄悄少收集 `_tkinter.pyd` 和 tcl/tk 运行时，打出来的 exe
+一启动就 `ModuleNotFoundError: No module named 'tkinter'` 直接崩。
+唯一线索是体积小掉约 3 MB（正常约 11 MB，坏版约 8 MB）。
 
-2. **打包用的解释器必须带 tkinter**。用不带 tkinter 的解释器打包，
-   PyInstaller **不报任何错**，只是悄悄少收集 `_tkinter.pyd` 和 tcl/tk 运行时，
-   打出来的 exe 一启动就 `ModuleNotFoundError: No module named 'tkinter'` 崩掉。
-   **唯一线索是体积小掉约 3 MB**（正常约 11 MB，损坏版约 8 MB）。
-   → `build_exe.py` 会主动挑一个带 tkinter 的解释器，并在打包后跑一次
-   `--selftest` 校验，不通过直接报错、不放行。
+`build_exe.py` 因此做三件事：挑带 tkinter 的解释器 → 打包 → 跑一次 `--selftest`
+校验，不通过就不放行。
 
 ### 无界面入口的输出重定向
 
-`--windowed` 打包后，`sys.stdout` 可能是 `None`，也可能是 **GBK 文本流**。
-两者都会让无界面执行"签到成功但退出码非 0"：
+`--windowed` 打包后 `sys.stdout` / `sys.stderr` 可能是 `None`，任何 `print()`
+都会抛 `AttributeError`；即使存在，也可能是 GBK 文本流，中文 / emoji 触发
+`UnicodeEncodeError`。这两种都会导致**签到明明成功、退出码却是非 0**，
+从而被计划任务标记成失败。
 
-- `None` → `print()` 直接抛 `AttributeError`
-- GBK 文本流 → 打印中文 / emoji 时抛 `UnicodeEncodeError`
+所以无界面入口在冻结态无条件把输出重定向到 UTF-8 的 `checkin.log`；
+源码态且有控制台时不抢用户的终端。
 
-计划任务只看退出码，于是会把成功的签到标记为失败。
-所以 `run_headless()` 里**无条件**把 stdout / stderr 重定向到 UTF-8 的 `checkin.log`，
-两个坑一起覆盖。
+---
+
+## 回归检查
+
+| 脚本 | 覆盖什么 | 依赖 |
+|---|---|---|
+| `tools/oauth_mode_check.py` | 轮询、字段兼容、令牌轮换、401 重试、12153、导入码、推送渠道筛选 | 本地桩服务器，不碰真接口 |
+| `tools/no_popup_check.py` | 运行时是否弹出控制台窗口 | 需要 `pythonw` 运行，Windows |
+
+```bash
+python tools/oauth_mode_check.py       # 39 项断言
+```

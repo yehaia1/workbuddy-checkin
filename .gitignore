@@ -10,7 +10,6 @@ config.json
 checkin.log
 selftest.json
 no_popup_check.json
-module_discovery_check.json
 oauth_mode_check.json
 *.log
 

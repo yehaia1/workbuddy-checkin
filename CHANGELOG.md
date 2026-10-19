@@ -3,6 +3,58 @@
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)，
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [2.0] - 2026-10-19
+
+**不兼容的大改版：只保留「账号直连」一条通道，其它全部删掉。**
+
+### 移除
+
+- **客户端通道（WBIPC）整体删除**：不再借用客户端注入的鉴权，也不再
+  自动拉起 / 隐藏窗口 / 签到后关闭客户端。账号直连本来就不需要客户端，
+  两套通道并存只会让界面和配置翻倍。
+- 随之删除的文件：`wb_host.py`（进程/窗口/登录态辅助）、
+  `probe_hidden_launch.py`（后台拉起探针）、
+  `tools/module_discovery_check.py`（内置模块发现回归检查）。
+- 配置项 `auth_mode`、`workbuddy_exe`、`ipc_dir`、`launch_workbuddy`、
+  `launch_timeout`、`hide_window`、`hide_window_timeout`、
+  `close_after_checkin`、`close_timeout`、`close_force`、
+  `auto_env_check`、`ui_scale`、`wecom_webhook`、`dingtalk_webhook`。
+  旧配置文件里残留的这些键在下次保存时自动剔除（值不丢，只删键）。
+- 界面里的「工作流自检」式诊断：`detect_env` 只剩授权与接口两项。
+
+### 新增
+
+- **`wb_auth_server.py`：服务端授权脚本**。在服务器上生成授权链接 →
+  推送到企业微信 / 钉钉 → 用户手机点开登录 → 脚本拿回令牌。
+  支持三种交付方式：
+  - 默认输出一次性导入码（`WBAT1.…`，base64），在 Windows 端粘贴导入；
+  - `--handoff` 开一次性端口，Windows 端 `--pull-token` 自动领取，全程无人工；
+  - `--push-only` 只把已有链接转发到渠道。
+  默认**不在服务器落盘**——`refreshToken` 会轮换，令牌必须只有一份。
+- **「推到手机授权」**（`--auth-push`）：本机生成链接、推到手机、本机轮询。
+  没有浏览器 / 人不在机器前也能完成授权，全程不启动客户端。
+- **导入授权**（`--import-token`）：粘贴导入码或选令牌文件，界面与命令行都支持。
+- 配置项 `push_channels`：推送类型从"填了 key 就算开"改成**显式勾选**，
+  界面上的三块（授权 / 定时 / 推送）与配置一一对应。
+- `wb_config.py`：配置与路径统一到一处，GUI 与服务端脚本共用。
+- `wb_notify.py`：推送独立成模块，零依赖、跨平台，含域名白名单校验。
+- `--diagnose` 现在输出一份完整证据快照（令牌摘要、billing 基址、接口返回、
+  计划任务状态），排查时不用再翻代码。
+
+### 变更
+
+- 界面**重做**：只保留「账号授权」「每日定时」「消息推送」三块 + 状态卡片 +
+  运行日志。设置窗口、登录方式单选、客户端路径、超时设置、界面缩放全部移除。
+- 无界面入口在**源码态且有控制台**时不再抢走 stdout（以前 `--diagnose | head`
+  什么也看不到，输出全被重定向进了日志）。
+- `--login-oauth` 更名为 `--auth`，语义不变。
+
+### 回归
+
+- `tools/oauth_mode_check.py` 重写：39 项断言，覆盖轮询 / 字段兼容 /
+  令牌轮换 / 401 重试 / 12153 / 导入码往返 / 坏码拒绝 / 推送渠道筛选 /
+  服务端脚本可导入。
+
 ## [1.7] - 2026-10-19
 
 ### 新增

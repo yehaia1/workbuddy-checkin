@@ -45,12 +45,21 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# 源码目录是分层的（server/ 与 common/ 平级），部署时是平铺 / 单文件 zipapp。
+# 这里两条都挂上：源码态靠 ../common，单文件态靠 zip 内部的模块。
+for _p in (str(Path(__file__).resolve().parent),
+           str(Path(__file__).resolve().parent.parent / "common")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 import wb_config
 import wb_notify
 import wb_oauth
 import workbuddy_checkin as core
 
-HERE = Path(__file__).resolve().parent
+# 配置、日志、令牌都放脚本所在目录。单文件 zipapp 里 __file__ 指向 .pyz 内部，
+# 所以统一用 wb_config 算好的 SRC_DIR，不要自己从 __file__ 推。
+HERE = wb_config.SRC_DIR
 
 # 需要重新授权的几种情况（其余是网络/接口问题，重试授权没有意义）
 AUTH_BROKEN = ("OAUTH_NOT_AUTHORIZED", "OAUTH_TOKEN_BAD", "OAUTH_SESSION_DEAD")

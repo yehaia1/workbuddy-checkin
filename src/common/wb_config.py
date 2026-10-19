@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 APP_ID = "WorkBuddyCheckin"          # 目录名 / 计划任务名 / 产物名，全英文
 APP_TITLE = "WorkBuddy 签到"
-VERSION = "3.0.0"                    # 唯一版本号来源，打包时也读这里
+VERSION = "3.1.0"                    # 唯一版本号来源，打包时也读这里
 RELEASE_DATE = "2026-10-19"
 
 TOKEN_FILE_NAME = "auth_oauth.json"
@@ -34,7 +34,25 @@ TOKEN_FILE_NAME = "auth_oauth.json"
 PUSH_CHANNEL_LABELS = {"wecom": "企业微信", "dingtalk": "钉钉"}
 
 
-SRC_DIR = Path(__file__).resolve().parent
+def _script_dir() -> Path:
+    """本模块真正所在的**磁盘目录**。
+
+    * 源码 / 打包成目录：就是文件所在目录
+    * 单文件 zipapp（`wb_server.pyz`）：`__file__` 是
+      `/opt/wbcheckin/wb_server.pyz/wb_config.py`，它的 parent 是**文件本身**
+      而不是目录，此时退到 `sys.argv[0]` 的目录——也就是脚本放的地方
+    """
+    here = Path(__file__).resolve()
+    if here.parent.is_dir():
+        return here.parent
+    argv0 = (sys.argv[0] or "").strip()
+    if argv0:
+        cand = Path(argv0).expanduser().resolve()
+        return cand if cand.is_dir() else cand.parent
+    return Path.cwd()
+
+
+SRC_DIR = _script_dir()
 
 # 由 set_data_dir() 决定；未指定时按运行方式取默认值
 _DATA_DIR: Optional[Path] = None
@@ -80,20 +98,23 @@ def run_mode() -> str:
     return "frozen" if getattr(sys, "frozen", False) else "source"
 
 
-def is_repo_layout() -> bool:
-    """是不是在开发仓库里跑（而不是服务端那种平铺目录）。
+def repo_root() -> Optional[Path]:
+    """开发仓库的根目录；服务端平铺目录、打包产物目录都返回 None。
 
-    区分这两种「源码运行」很必要：
-
-    * 仓库：`<repo>/src/wb_config.py`，数据落在**仓库根**（`src/` 的上一级）
-    * 服务端：`<dir>/wb_server.py` + `<dir>/wb_config.py` 平铺，数据落在
-      **脚本目录本身**
-
-    判据用仓库根的标志物（`run.py` / `.git` / `build/`），不看目录名——
-    服务端目录可能叫任何名字，也可能就叫 `src`。
+    布局是 `src/common/wb_config.py`，所以从 `SRC_DIR` 往上两级才是仓库根。
+    判据必须**绝对**不能"往上找标志物"：`dist/server/` 往上两级也正好是仓库根，
+    那样服务端包会被误判成开发仓库，数据就写到仓库里去了。
     """
-    root = SRC_DIR.parent
-    return any((root / mark).exists() for mark in ("run.py", ".git", "build"))
+    if SRC_DIR.name == "common" and SRC_DIR.parent.name == "src":
+        cand = SRC_DIR.parent.parent
+        if (cand / "build" / "build_exe.py").is_file():
+            return cand
+    return None
+
+
+def is_repo_layout() -> bool:
+    """是不是在开发仓库里跑（而不是服务端平铺目录 / 产物目录）。"""
+    return repo_root() is not None
 
 
 def install_dir() -> Path:
@@ -130,7 +151,7 @@ def default_data_dir() -> Path:
     """
     if run_mode() == "frozen":
         return cache_dir()
-    return SRC_DIR.parent if is_repo_layout() else SRC_DIR
+    return repo_root() or SRC_DIR
 
 
 def data_dir() -> Path:
@@ -144,7 +165,7 @@ def data_origin() -> str:
         return _DATA_ORIGIN
     if run_mode() == "frozen":
         return "用户缓存目录"
-    if is_repo_layout() and data_dir() == SRC_DIR.parent:
+    if repo_root() is not None and data_dir() == repo_root():
         return "仓库根目录"
     return "脚本目录"
 

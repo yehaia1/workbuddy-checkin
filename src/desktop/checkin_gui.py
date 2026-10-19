@@ -20,6 +20,14 @@ import sys
 import threading
 import time
 import traceback
+from pathlib import Path
+
+# 源码直接运行时（python src/desktop/checkin_gui.py）把 common/ 挂进 sys.path；
+# 打包后 PyInstaller 已经把两条路径都收进去了，这段是无害的空操作。
+_HERE = Path(__file__).resolve().parent
+for _p in (str(_HERE), str(_HERE.parent / "common")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk

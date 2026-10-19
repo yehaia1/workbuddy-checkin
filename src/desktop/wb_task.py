@@ -395,8 +395,11 @@ def launcher() -> Tuple[str, str]:
     **独立运行（exe）永远是"exe 自己 + --run"**：定时执行的脚本就是 exe
     内部的无界面入口，不依赖 Python、不依赖源码目录，exe 拷到哪台机器都能跑。
 
-    源码态只是开发自测：pythonw + 仓库根目录的 run.py（同样 --run）。
+    源码态只是开发自测：pythonw + `src/common/workbuddy_checkin.py`（同样 --run）。
     两种情况都用无控制台程序，避免每次触发闪一下黑框。
+
+    注意 `src/` 是分层的（desktop/ 与 common/ 平级），入口在 common/ 下，
+    所以路径要从本文件往上两级再进 common。
     """
     if getattr(sys, "frozen", False):
         return str(Path(sys.executable).resolve()), RUN_ARG
@@ -405,8 +408,7 @@ def launcher() -> Tuple[str, str]:
     if not pyw.is_file():
         alt = exe.with_name(exe.name.replace("python", "pythonw"))
         pyw = alt if alt.is_file() else exe
-    # wb_task.py 在 src/ 下，仓库根目录是它上一级
-    entry = Path(__file__).resolve().parent.parent / "run.py"
+    entry = Path(__file__).resolve().parent.parent / "common" / "workbuddy_checkin.py"
     return str(pyw), '"{}" {}'.format(entry, RUN_ARG)
 
 

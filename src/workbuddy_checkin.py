@@ -496,11 +496,12 @@ def diagnose(path: Optional[str] = None) -> Dict[str, Any]:
     except Exception as e:
         out["connected"] = False
         out["error"] = str(e)
-    try:
-        import wb_task
-        out["schedule"] = wb_task.query_fast()
-    except Exception:
-        pass
+    if os.name == "nt":  # 计划任务是 Windows 专有，服务端（Linux）没有这一段
+        try:
+            import wb_task
+            out["schedule"] = wb_task.query_fast()
+        except Exception:
+            pass
     return out
 
 

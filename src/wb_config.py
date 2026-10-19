@@ -80,6 +80,22 @@ def run_mode() -> str:
     return "frozen" if getattr(sys, "frozen", False) else "source"
 
 
+def is_repo_layout() -> bool:
+    """是不是在开发仓库里跑（而不是服务端那种平铺目录）。
+
+    区分这两种「源码运行」很必要：
+
+    * 仓库：`<repo>/src/wb_config.py`，数据落在**仓库根**（`src/` 的上一级）
+    * 服务端：`<dir>/wb_server.py` + `<dir>/wb_config.py` 平铺，数据落在
+      **脚本目录本身**
+
+    判据用仓库根的标志物（`run.py` / `.git` / `build/`），不看目录名——
+    服务端目录可能叫任何名字，也可能就叫 `src`。
+    """
+    root = SRC_DIR.parent
+    return any((root / mark).exists() for mark in ("run.py", ".git", "build"))
+
+
 def install_dir() -> Path:
     """程序本体所在目录。
 
@@ -106,10 +122,15 @@ def cache_dir() -> Path:
 
 
 def default_data_dir() -> Path:
-    """没显式指定时用哪个目录。"""
+    """没显式指定时用哪个目录。
+
+    * 独立运行（exe）：用户缓存目录
+    * 仓库源码运行：仓库根目录
+    * 服务端平铺目录：**脚本所在目录**（配置跟着脚本走）
+    """
     if run_mode() == "frozen":
         return cache_dir()
-    return SRC_DIR.parent
+    return SRC_DIR.parent if is_repo_layout() else SRC_DIR
 
 
 def data_dir() -> Path:
@@ -123,7 +144,9 @@ def data_origin() -> str:
         return _DATA_ORIGIN
     if run_mode() == "frozen":
         return "用户缓存目录"
-    return "仓库根目录" if data_dir() == SRC_DIR.parent else "脚本目录"
+    if is_repo_layout() and data_dir() == SRC_DIR.parent:
+        return "仓库根目录"
+    return "脚本目录"
 
 
 def set_data_dir(path: Path) -> Path:
@@ -208,9 +231,13 @@ LOG_PATH = DATA_DIR / "checkin.log"
 
 def version_text() -> str:
     """版本行（`--version` 与日志共用）。"""
-    return "{} {} ({})　{}".format(APP_ID, VERSION, RELEASE_DATE,
-                                   "独立运行" if run_mode() == "frozen"
-                                   else "源码运行")
+    if run_mode() == "frozen":
+        mode = "独立运行"
+    elif is_repo_layout():
+        mode = "源码运行"
+    else:
+        mode = "脚本运行"  # 服务端那种平铺目录
+    return "{} {} ({})　{}".format(APP_ID, VERSION, RELEASE_DATE, mode)
 
 
 # ---------------- 配置读写 ----------------

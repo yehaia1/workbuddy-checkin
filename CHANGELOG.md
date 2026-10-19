@@ -3,6 +3,51 @@
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)，
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [3.1.0] - 2026-10-19
+
+**源码按版本分层（`common` / `desktop` / `server`）；服务端交付从"一包文件"
+变成"一个文件"。**
+
+### 变更
+
+- **`src/` 拆成三层**，不再平铺：
+  - `src/common/`：`wb_config`、`wb_oauth`、`wb_notify`、`workbuddy_checkin`
+    （两边共用，禁止 import Windows / tkinter）
+  - `src/desktop/`：`checkin_gui`、`wb_task`、`win_quiet`（只有 exe 版用）
+  - `src/server/`：`wb_server`（只有服务端用）
+  入口脚本自己在文件顶部把 `common/` 挂进 `sys.path`，所以
+  `python src/desktop/checkin_gui.py`、`python src/common/workbuddy_checkin.py --run`
+  都能直接跑，不需要根目录的启动脚本。
+- **服务端产物改为单文件 `dist/server/wb_server.pyz`**（约 30 KB，zipapp）：
+  服务器上只要拷这一个文件，`python3 wb_server.pyz --init-config` /
+  `--check` / 直接运行都行。模块在 zip 内天然隔离，不存在"合并单文件撞名"
+  的问题。构建脚本 `build/make_server_bundle.py` 相应改名为
+  **`build/make_server.py`**，仍按 import 闭包收模块，闭包里出现
+  `checkin_gui` / `wb_task` / `win_quiet` 直接构建失败。
+- `wb_config` 新增 `_script_dir()`：单文件里 `__file__` 指向 zip 内部
+  （`.../wb_server.pyz/wb_config.py`，parent 是文件不是目录），此时退到
+  `sys.argv[0]` 的目录。配置、日志、令牌仍落在 pyz 旁边，
+  `--version` 显示「脚本运行」。
+- `is_repo_layout()` 改为**绝对判据**（`src/common/` 下且仓库根有
+  `build/build_exe.py`）。之前"往上找 `run.py` / `build/`"的写法会让
+  `dist/server/` 往上两级命中仓库根，把服务端误判成开发仓库。
+
+### 删除
+
+- **根目录 `run.py`**：源码运行改用
+  `python src/desktop/checkin_gui.py`（界面）/
+  `python src/common/workbuddy_checkin.py --run`（无界面）。
+  计划任务在源码态（仅开发自测）相应指向后者。
+- 遗留配置与运行残留：根目录 `config.json`（只有 `push_channels`、无 key）、
+  `dist/config.json`（与缓存目录那份完全等价，exe 早已不读它）、
+  根目录 `checkin.log` / `selftest.json` / `__pycache__`。
+  删除前已备份到 `.build/legacy/`。
+
+### 修正
+
+- 回归从 77 项扩到 **81 项**：新增"服务端产物是单文件 .pyz""pyz 里没有
+  GUI/Windows 模块""pyz 有 `__main__` 入口""单文件在空目录能跑"等断言。
+
 ## [3.0.0] - 2026-10-19
 
 **Windows 版变成真正的"拷到哪都能跑"的单文件程序；服务端版从"授权工具"

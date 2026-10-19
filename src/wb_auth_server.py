@@ -35,6 +35,16 @@ Windows 那台机器可能没人守着（或者干脆没有浏览器）。与其
 3) 只转发：把一条已有链接推到渠道（本机生成的链接也能借服务器发出去）
        python src/wb_auth_server.py --push-only --url https://copilot.tencent.com/login?...
 
+首次部署先跑这两条（不联网、不创建授权会话）：
+       python src/wb_auth_server.py --init-config     # 生成一份 config.json 模板
+       python src/wb_auth_server.py --check           # 检查渠道与 key 是否可用
+
+分工：**远程授权只属于服务端流程**
+--------------------------------
+本地版的界面只有「立即授权」（本机浏览器），没有"推到手机"、也没有"导入"。
+要跨机器交接令牌，一律在命令行完成（--import-token / --pull-token），
+因为这一步本来就是给无人值守的机器准备的。
+
 零依赖，Python 3.7+，Linux / Windows 都能跑。
 """
 from __future__ import annotations
@@ -48,6 +58,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import wb_config
@@ -58,6 +69,70 @@ import workbuddy_checkin as core
 
 def say(msg: str = "") -> None:
     print(msg, flush=True)
+
+
+# ---------------- 配置体检 / 生成模板 ----------------
+
+def channel_rows(cfg: dict) -> list:
+    """每个渠道一行：是否勾选、key 是否有效。**不打印 key 本身**。"""
+    picked = [str(c) for c in (cfg.get("push_channels") or [])]
+    rows = []
+    for name, (title, resolve, _send) in wb_notify.CHANNELS.items():
+        configured = bool(resolve(cfg))
+        on = name in picked
+        if on and configured:
+            state = "可用"
+        elif on:
+            state = "已勾选，但 key 缺失或不合法"
+        elif configured:
+            state = "key 已填，但没勾选（不会推送）"
+        else:
+            state = "未启用"
+        rows.append({"name": name, "title": title, "on": on,
+                     "configured": configured, "state": state,
+                     "usable": on and configured})
+    return rows
+
+
+def do_check(cfg: dict, config_file: str) -> int:
+    say("配置文件：{}".format(config_file))
+    say("数据目录：{}".format(wb_config.SCRIPT_DIR))
+    say("")
+    rows = channel_rows(cfg)
+    for row in rows:
+        say("  {}：{}".format(row["title"], row["state"]))
+    usable = [r["name"] for r in rows if r["usable"]]
+    say("")
+    if not usable:
+        say("✗ 没有可用的推送渠道。按上面的提示修配置（勾选 + 填有效 key）后重跑：")
+        say("    python src/wb_auth_server.py --config \"{}\" --check"
+            .format(config_file))
+        say("  还没有配置文件时先生成模板：python src/wb_auth_server.py --init-config")
+        return 2
+    say("✅ 可用渠道：{}".format("、".join(wb_notify.label(c) for c in usable)))
+    say("下一步：python src/wb_auth_server.py"
+        + ("" if len(usable) == 1 else " --channel " + usable[0]))
+    return 0
+
+
+def do_init_config(target: str, force: bool) -> int:
+    path = Path(target).expanduser().resolve() if target \
+        else wb_config.config_path()
+    if path.exists() and not force:
+        say("✗ 文件已存在：{}".format(path))
+        say("  要覆盖就加 --force（会丢掉现有 key）。")
+        return 2
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(wb_config.DEFAULT_CONFIG, ensure_ascii=False,
+                               indent=2) + "\n", encoding="utf-8")
+    say("✅ 已生成配置模板：{}".format(path))
+    say("")
+    say("接下来：")
+    say("  1) 填 wecom_key（企业微信机器人 key）或 dingtalk_key")
+    say("  2) 勾选要用的渠道：push_channels = [\"wecom\"]")
+    say("  3) 体检：python src/wb_auth_server.py --config \"{}\" --check"
+        .format(path))
+    return 0
 
 
 # ---------------- 推送 ----------------
@@ -183,7 +258,7 @@ def local_ip() -> str:
 def do_auth(cfg: dict, channels: list, timeout: int,
             handoff: bool, port: int, bind: str,
             handoff_timeout: int, save_token: str, as_json: bool) -> int:
-    say("正在申请授权会话…")
+    say("① 申请授权会话…")
     try:
         info = wb_oauth.begin_auth()
     except wb_oauth.OAuthError as e:
@@ -199,7 +274,8 @@ def do_auth(cfg: dict, channels: list, timeout: int,
     say("")
 
     if channels:
-        say("推送到 {}…".format("、".join(wb_notify.label(c) for c in channels)))
+        say("② 推送授权链接到 {}…".format(
+            "、".join(wb_notify.label(c) for c in channels)))
         if not push_url(cfg, url, channels, timeout):
             say("✗ 所有渠道都推送失败。链接仍可从上面手动复制。")
     else:
@@ -207,7 +283,8 @@ def do_auth(cfg: dict, channels: list, timeout: int,
             "请手动把链接发给用户。")
 
     say("")
-    say("等待用户打开链接并完成登录（最多 {} 分钟）…".format(max(1, timeout // 60)))
+    say("③ 等待用户打开链接并完成登录（最多 {} 分钟）…".format(
+        max(1, timeout // 60)))
 
     def on_tick(elapsed, remain):
         if elapsed and elapsed % 15 == 0:
@@ -229,7 +306,7 @@ def do_auth(cfg: dict, channels: list, timeout: int,
     auth = record.get("auth") or {}
     who = acct.get("nickname") or "已登录账号"
     say("")
-    say("✅ 授权成功：{}（uid {}）".format(who, acct.get("uid") or "?"))
+    say("④ ✅ 授权成功：{}（uid {}）".format(who, acct.get("uid") or "?"))
 
     if save_token:
         wb_oauth.save(record, save_token)
@@ -261,23 +338,34 @@ def do_auth(cfg: dict, channels: list, timeout: int,
         return 0
 
     say("")
-    say("把下面这段一次性导入码交给 Windows 端，"
-        "在那台机器上执行：")
+    say("把下面这段一次性导入码交给 Windows 端，在那台机器上执行：")
     say('  WorkBuddy签到.exe --import-token "<粘贴下面的码>"')
-    say("（界面上也可以：「账号授权」→「导入授权」直接粘贴）")
+    say('  python run.py --import-token "<粘贴下面的码>"     # 源码运行')
     say("")
     say(code)
     say("")
     say("⚠ 导入码等同于令牌本身（只是 base64），别贴群里、别进工单系统。")
     say("⚠ 本脚本没有在服务器保留令牌：Windows 端导入后由它独占续期。")
+    say("⚠ 界面上的「账号授权」只有本机浏览器一条路，导入只能在命令行做。")
     return 0
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="服务端发起 WorkBuddy 账号授权，把链接推到手机并在本地等待结果")
+        description="服务端发起 WorkBuddy 账号授权：生成链接 → 推到手机 → "
+                    "等人登录 → 把令牌交给跑签到的那台 Windows",
+        epilog=(
+            "典型流程\n"
+            "  1) python src/wb_auth_server.py --init-config\n"
+            "     填 wecom_key / dingtalk_key 与 push_channels\n"
+            "  2) python src/wb_auth_server.py --check\n"
+            "  3) python src/wb_auth_server.py                # 人工取导入码\n"
+            "     或 python src/wb_auth_server.py --handoff    # Windows 自动取件\n"
+            "\n"
+            "令牌只有一份：本脚本默认不落盘，交给 Windows 端独占续期。"),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="",
-                    help="配置文件路径（默认仓库根目录的 config.json）")
+                    help="配置文件路径（默认数据目录的 config.json）")
     ap.add_argument("--channel", choices=["wecom", "dingtalk"], default="",
                     help="强制只用某个推送渠道（默认按配置里的 push_channels）")
     ap.add_argument("--timeout", type=int, default=600,
@@ -295,10 +383,24 @@ def main(argv=None) -> int:
     ap.add_argument("--push-only", action="store_true",
                     help="只把 --url 推出去，不发起授权")
     ap.add_argument("--url", default="", help="配合 --push-only 使用")
+    ap.add_argument("--init-config", nargs="?", const="", default=None,
+                    metavar="PATH", help="生成配置模板后退出（默认写到数据目录）")
+    ap.add_argument("--force", action="store_true",
+                    help="配合 --init-config：文件已存在也覆盖")
+    ap.add_argument("--check", action="store_true",
+                    help="只体检配置（渠道是否勾选、key 是否可用），不联网")
     ap.add_argument("--json", action="store_true", help="输出单行 JSON")
     args = ap.parse_args(argv)
 
+    cfg_path = str(wb_config.config_path(args.config or None))
+
+    if args.init_config is not None:
+        return do_init_config(args.init_config, args.force)
+
     cfg = wb_config.load(args.config or None)
+    if args.check:
+        return do_check(cfg, cfg_path)
+
     channels = resolve_channels(cfg, args.channel)
 
     if args.push_only:
@@ -306,16 +408,24 @@ def main(argv=None) -> int:
             say("✗ --push-only 需要配合 --url 指定链接")
             return 2
         if not channels:
-            say("✗ 没有可用的推送渠道，检查 config.json")
+            say("✗ 没有可用的推送渠道，先跑 --check 看看")
             return 2
         say("推送到 {}…".format("、".join(wb_notify.label(c) for c in channels)))
         return 0 if push_url(cfg, args.url, channels, args.timeout) else 1
 
+    say("配置文件：{}".format(cfg_path))
     if not channels:
-        say("⚠ 当前配置里没有可用的推送渠道，链接只能手动复制。")
+        say("⚠ 当前配置里没有可用的推送渠道，链接只能手动复制。"
+            "（先跑 --check 看看缺什么）")
 
-    return do_auth(cfg, channels, args.timeout, args.handoff, args.port,
-                   args.bind, args.handoff_timeout, args.save_token, args.json)
+    try:
+        return do_auth(cfg, channels, args.timeout, args.handoff, args.port,
+                       args.bind, args.handoff_timeout, args.save_token,
+                       args.json)
+    except KeyboardInterrupt:
+        say("")
+        say("已中断，未交出任何令牌。重新跑一次脚本即可。")
+        return 130
 
 
 if __name__ == "__main__":

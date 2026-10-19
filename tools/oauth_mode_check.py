@@ -9,12 +9,14 @@
   4. 401 自动续期重试：第一次 401、刷新后第二次成功，业务层应当无感；
   5. 12153 会话失效：标记 disabled 并提示"重新授权"，而不是含糊的网络错误；
   6. 导入码：服务端导出的码必须能原样导入，坏码必须明确报错；
-  7. 推送：只推选中的渠道，没填 key 的渠道不参与。
+  7. 到期提醒：剩余天数 <= expiry_warn_days 才提醒，阈值设 0 等于关闭；
+  8. 推送：只推选中的渠道，没填 key 的渠道不参与。
 
 用法：
     python tools/oauth_mode_check.py
 
-结果写入 oauth_mode_check.json，退出码反映是否全部通过。
+结果写入 .build/oauth_mode_check.json（构建缓存目录，不入库），
+退出码反映是否全部通过。
 """
 from __future__ import annotations
 
@@ -273,7 +275,32 @@ def main():
               wb_oauth.load(token_file)["auth"]["accessToken"]
               == fresh["auth"]["accessToken"])
 
-        # 8) 推送：只推选中的渠道，没填 key 的不参与
+        # 8) 到期提醒：只在剩余天数 <= expiry_warn_days 时触发，且不碰真实渠道
+        quiet = dict(cfg, push_channels=[])          # 没有渠道 = 不真发
+        check("令牌充足时不提醒", core.check_expiry_notice(quiet) is None)
+        near = json.loads(json.dumps(fresh))
+        near["auth"]["expiresAt"] = int(time.time()) + 86400 + 5
+        wb_oauth.save(near, token_file)
+        notice = core.check_expiry_notice(quiet)
+        check("剩 1 天会提醒", bool(notice) and notice.get("days_left") == 1,
+              notice)
+        check("提醒里带到期时间", bool((notice or {}).get("expires_text")),
+              notice)
+        check("提醒不写坏令牌",
+              wb_oauth.load(token_file)["auth"]["expiresAt"]
+              == near["auth"]["expiresAt"])
+        far = json.loads(json.dumps(fresh))
+        far["auth"]["expiresAt"] = int(time.time()) + 86400 * 3 + 5
+        wb_oauth.save(far, token_file)
+        check("剩 3 天（阈值 2）不提醒",
+              core.check_expiry_notice(quiet) is None)
+        check("阈值设为 0 等于关闭",
+              core.check_expiry_notice(dict(quiet, expiry_warn_days=0)) is None)
+        check("已过期文案明确", "已过期" in core.build_expiry_message(-1))
+        check("提醒文案含天数",
+              "还剩 1 天" in core.build_expiry_message(1, "2026-11-01 09:00"))
+
+        # 9) 推送：只推选中的渠道，没填 key 的不参与
         check("只推选中的渠道", wb_notify.selected_channels(cfg) == ["wecom"],
               wb_notify.selected_channels(cfg))
         check("企业微信地址只拼官方域名",
@@ -291,22 +318,31 @@ def main():
         check("看着像链接却不合法就拒发",
               wb_notify.wecom_url({"wecom_key": "https://evil.example/x?k=1"}) == "")
 
-        # 9) 文案里必须带链接和有效期，否则手机上没法用
+        # 10) 文案里必须带链接和有效期，否则手机上没法用
         msg = core.build_auth_message("https://example.invalid/login?state=x", 10)
         check("授权文案含链接", "https://example.invalid/login?state=x" in msg, msg)
         check("授权文案含有效期", "10 分钟" in msg, msg)
 
-        # 10) 服务端脚本必须能导入（服务器上没有 tkinter / 没有 wb_task）
+        # 11) 服务端脚本必须能导入（服务器上没有 tkinter / 没有 wb_task）
         try:
             import wb_auth_server
             chans = wb_auth_server.resolve_channels(cfg, "")
             check("服务端脚本可导入并解析渠道", chans == ["wecom"], chans)
             forced = wb_auth_server.resolve_channels(cfg2, "dingtalk")
             check("服务端可强制指定渠道", forced == ["dingtalk"], forced)
+            rows = {r["name"]: r for r in wb_auth_server.channel_rows(cfg2)}
+            check("体检：勾选且填了 key 才算可用",
+                  rows["wecom"]["usable"] and rows["dingtalk"]["usable"], rows)
+            rows = {r["name"]: r
+                    for r in wb_auth_server.channel_rows(
+                        dict(cfg2, wecom_key=""))}
+            check("体检：没填 key 不算可用", not rows["wecom"]["usable"], rows)
+            check("体检结果不含 key 本身",
+                  "WECOM-KEY" not in json.dumps(rows, ensure_ascii=False))
         except Exception as e:
             check("服务端脚本可导入并解析渠道", False, repr(e))
 
-        # 11) 请求头：鉴权与身份头都要带齐
+        # 12) 请求头：鉴权与身份头都要带齐
         with wb_oauth.OAuthSession(token_file) as sess:
             sess.fetch("POST", core.STATUS_PATH)
         hdrs = stub.headers_seen[-1]
@@ -325,7 +361,9 @@ def main():
     ok = all(r["ok"] for r in RESULTS)
     print("\n{} / {} 通过".format(sum(1 for r in RESULTS if r["ok"]),
                                   len(RESULTS)))
-    out = os.path.join(os.getcwd(), "oauth_mode_check.json")
+    out_dir = os.path.join(ROOT, ".build")
+    os.makedirs(out_dir, exist_ok=True)
+    out = os.path.join(out_dir, "oauth_mode_check.json")
     with open(out, "w", encoding="utf-8") as fh:
         json.dump({"ok": ok, "results": RESULTS}, fh,
                   ensure_ascii=False, indent=2)

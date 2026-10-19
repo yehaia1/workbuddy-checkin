@@ -35,7 +35,8 @@ workbuddy_checkin.py / wb_server.py + config.json）拷到服务器上就能跑�
       申请会话 → 无头浏览器取二维码链接 → 推到企业微信/钉钉 → 等 180 秒
       等不到就隔 60 秒再来一轮（等 180 秒），再等 120 秒 → 第三轮
       等待期间用户随时可以回来改 config.json（每轮都会重读配置）
-      没有 playwright 时退回推授权页链接（--no-qr 可强制，仅排障用）
+      没有 playwright / 浏览器起不来 → **立刻退出（退出码 2），不等待**
+      （--no-qr 可强制推授权页链接，仅排障用，那个链接手机打开拿不到令牌）
 3. 拿到授权后立刻签到，并把结果推到同一批渠道
 4. 全部失败则推一条失败通知，退出码非 0（cron 会因此报警）
 
@@ -43,7 +44,7 @@ workbuddy_checkin.py / wb_server.py + config.json）拷到服务器上就能跑�
 ------
     0   成功（含"今天已签到"）
     1   推送失败（--push-only）
-    2   授权没完成 / 配置不可用
+    2   授权没完成 / 授权无法进行（缺 playwright 等）/ 配置不可用
     3   网络或接口异常
     130 被 Ctrl+C 中断
 
@@ -171,6 +172,11 @@ def do_check(cfg: dict, config_file: str) -> int:
     say("✅ 可用渠道：{}".format("、".join(wb_notify.label(c) for c in usable)))
 
     if not info.get("present") or info.get("disabled") or info.get("expired"):
+        if not qr_ok:
+            say("✗ 这套环境目前授权不了：没有二维码能力，而手机打开授权页链接"
+                "拿不到令牌。")
+            say("  按上面的命令装好 playwright / 浏览器依赖，再跑一次 --check。")
+            return 2
         say("⚠ 目前没有可用授权：下次运行会先生成二维码推给你扫，等 {} 秒，".format(
             int(cfg.get("auth_wait_seconds") or 180)))
         say("  失败则指数退避重试（最多 {} 轮）。".format(
@@ -289,12 +295,17 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
     if use_qr:
         ready, reason = wb_qrlogin.available()
         if not ready:
-            use_qr = False
-            say("⚠ 二维码授权不可用：{}".format(reason))
-            say("  装上它，服务端才能自己生成二维码：")
+            # 没有 playwright 就生成不了二维码；而「把授权页链接发到手机」
+            # 那条路永远拿不到令牌（登录态落在手机浏览器里）。所以这里
+            # **直接退出**，不推链接、不等待、也不空转 3 轮：等待毫无意义，
+            # 只会让 cron 每天白占十几分钟，还留下一堆「授权失败」的假象。
+            say("✗ 二维码授权不可用：{}".format(reason))
+            say("  没有它就生成不了二维码，授权不可能完成 —— 直接退出，不等待。")
+            say("  装上之后重跑：")
             say("    " + wb_qrlogin.install_hint())
-            say("  本轮退回推送授权链接（手机点链接登录拿不到令牌，"
-                "只对桌面浏览器有效）。")
+            say("  确实只想推授权页链接（得在桌面浏览器里打开）：加 --no-qr")
+            return {"ok": False, "attempts": 0, "fatal": True,
+                    "message": "二维码授权不可用：{}".format(reason)}
 
     last = ""
     for i in range(1, attempts + 1):
@@ -323,9 +334,15 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
                     try:
                         session = wb_qrlogin.QRSession(url).open()
                     except wb_qrlogin.QRError as e:
-                        say("⚠ 取二维码失败：{}".format(e))
-                        say("  本轮退回推送授权页链接。")
-                        session = None
+                        # 拿不到二维码 = 没法扫码 = 本轮等下去也是空等。
+                        # 重试大概率还是同一个原因（缺浏览器依赖 / 沙箱权限），
+                        # 所以同样直接退出，让人去修环境，而不是退避 3 轮。
+                        say("✗ 取二维码失败：{}".format(e))
+                        say("  没有二维码就没法完成授权，直接退出，不空等。")
+                        say("  常见原因是浏览器依赖没装齐，重跑前先执行：")
+                        say("    " + wb_qrlogin.install_hint())
+                        return {"ok": False, "attempts": i, "fatal": True,
+                                "message": "取二维码失败：{}".format(e)}
                     else:
                         say("   ✓ 二维码链接：{}".format(session.qr_url or "（只有截图）"))
                         if session.png:
@@ -474,6 +491,13 @@ def run_daily(cfg_file: str, opts: argparse.Namespace) -> int:
         res = authorize(cfg_file, opts)
         if not res.get("ok"):
             cfg = wb_config.load(cfg_file)
+            if res.get("fatal"):
+                # 环境缺东西，等和重试都不解决问题：不推失败通知、直接退出，
+                # 上面 authorize() 已经把原因和修复命令打出来了。
+                say("")
+                say("✗ 授权无法进行：{}".format(res.get("message")))
+                say("  签到已跳过（没有等待，也没有重试）。")
+                return 2
             notify_failure(
                 cfg,
                 "【WorkBuddy 签到】❌ 服务端授权未完成\n"
@@ -576,7 +600,9 @@ def main(argv=None) -> int:
         if args.auth_only:
             res = authorize(cfg_file, args)
             if not res.get("ok"):
-                say("✗ 授权失败：{}".format(res.get("message")))
+                say("✗ {}：{}".format(
+                    "授权无法进行" if res.get("fatal") else "授权失败",
+                    res.get("message")))
                 return 2
             return 0
         if args.checkin_only:

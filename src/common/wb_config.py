@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 APP_ID = "WorkBuddyCheckin"          # 目录名 / 计划任务名 / 产物名，全英文
 APP_TITLE = "WorkBuddy 签到"
-VERSION = "3.2.0"                    # 唯一版本号来源，打包时也读这里
+VERSION = "3.2.1"                    # 唯一版本号来源，打包时也读这里
 RELEASE_DATE = "2026-10-19"
 
 TOKEN_FILE_NAME = "auth_oauth.json"

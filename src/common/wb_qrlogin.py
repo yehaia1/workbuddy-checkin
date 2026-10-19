@@ -96,7 +96,10 @@ def available() -> Tuple[bool, str]:
 def install_hint() -> str:
     """给用户看的安装指引（只有在 available() 为 False 时才该展示）。"""
     return ("pip install playwright && python -m playwright install chromium\n"
-            "    （Windows 有 Chrome / Edge 时只装库即可，不用下 chromium）")
+            "    Linux 服务器缺依赖时用："
+            "python -m playwright install --with-deps chromium\n"
+            "    （Windows / macOS 有 Chrome 或 Edge 时只装库即可，"
+            "不用下 chromium）")
 
 
 class QRSession:

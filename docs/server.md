@@ -92,6 +92,10 @@ python3 wb_server.pyz
      轮 3：（隔 120 秒）同上
    拿到令牌立刻关掉浏览器；最坏耗时约 12 分钟
 
+   没装 playwright / 浏览器起不来 → 打一行原因 + 安装命令，
+                                    **立即退出码 2，不推链接、不等待、不重试**
+                                   （没有二维码就扫不了码，等下去也是白等）
+
 ② 执行签到：查 → 领 → 复核
 
 ③ 推送结果到同一批渠道（含授权到期提醒）
@@ -201,8 +205,8 @@ env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin \
 | 现象 | 原因 / 处理 |
 |---|---|
 | `✗ 没有可用的推送渠道` | `push_channels` 勾了但 key 没填对。跑 `--check` 看是哪一种 |
-| `二维码授权：不可用` | 没装 playwright。`pip install playwright`（Linux 再加 `python -m playwright install --with-deps chromium`） |
-| `⚠ 取二维码失败：起不了浏览器` | 服务器上没有可用浏览器。装 chromium，或以非 root 运行（脚本已带 `--no-sandbox`） |
+| `二维码授权：不可用` | 没装 playwright。`pip install playwright`（Linux 再加 `python -m playwright install --with-deps chromium`）。**这时脚本会直接退出（退出码 2），不会等待** |
+| `✗ 取二维码失败：起不了浏览器` | 服务器上没有可用浏览器（缺系统依赖 / 权限）。装 chromium 后重跑；同样直接退出，不重试 |
 | 二维码链接点开是空白 | 过期了（约 5 分钟）。重跑脚本会重新申请 |
 | 3 轮都超时 | 人没在 3 分钟内扫码。加大 `--wait 300`，或先 `--auth-only` 单独授权 |
 | `12153 Offline user session not found` | 令牌被别处刷新过（两台机器都在跑）。只留一处 |

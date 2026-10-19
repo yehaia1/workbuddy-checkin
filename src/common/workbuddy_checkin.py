@@ -162,29 +162,57 @@ def run(sess: wb_oauth.OAuthSession, check_only: bool) -> Dict[str, Any]:
 
 # ---------------- 消息文案 ----------------
 
-def build_message(result: Dict[str, Any]) -> str:
-    """签到结果 -> 推送文案（各渠道共用）。"""
+def account_label(cfg: Optional[Dict[str, Any]] = None) -> str:
+    """推送里显示的账号，形如「张三（uid 1234abcd…）」。取不到就返回空串。
+
+    桌面版和服务端版都从**各自那份令牌**里读，所以两边显示的是同一个账号，
+    也不用把昵称抄进配置（多账号/多机器时最容易抄错的地方）。
+    """
+    try:
+        info = wb_oauth.summary(oauth_token_path(cfg))
+    except Exception:                # 令牌文件损坏/不存在：宁可不显示
+        return ""
+    nick = str(info.get("nickname") or "").strip()
+    uid = str(info.get("uid") or "").strip()
+    if not nick and not uid:
+        return ""
+    if not uid:
+        return nick
+    short = uid[:8] + ("…" if len(uid) > 8 else "")
+    return "{}（uid {}）".format(nick, short) if nick else "uid " + short
+
+
+def build_message(result: Dict[str, Any], account: str = "") -> str:
+    """签到结果 -> 推送文案（各渠道共用，桌面版与服务端版**必须完全一致**）。
+
+    account 由 `account_label()` 从令牌里取；拿不到就整行省略，
+    不留一个空的「账号：」。
+    """
     code = result.get("result")
     stamp = time.strftime("%Y-%m-%d %H:%M")
+    # 账号单独一行，且只在拿得到时出现 —— 两条运行线（exe / 服务端）都走这里，
+    # 所以格式天然一致，不存在"哪边少一行"的问题。
+    who = "账号：{}\n".format(account) if account else ""
     if code == "CLAIMED":
         amount = result.get("credit", result.get("credits",
                        result.get("today_credit", "?")))
-        return ("【WorkBuddy 签到】✅ 签到成功\n"
-                "本次领取：+{} 积分\n"
+        title = "✅ 签到成功"
+        body = ("本次领取：+{} 积分\n"
                 "连续签到：{} 天｜本期累计：{} 积分\n"
-                "时间：{}".format(amount, result.get("streak_days", "?"),
-                                  result.get("total_credits", "?"), stamp))
-    if code == "ALREADY_CLAIMED":
-        return ("【WorkBuddy 签到】ℹ️ 今日已签到，无需重复领取\n"
-                "连续签到：{} 天｜本期累计：{} 积分\n"
-                "时间：{}".format(result.get("streak_days", "?"),
-                                  result.get("total_credits", "?"), stamp))
-    if code == "INACTIVE":
-        return ("【WorkBuddy 签到】⏸ 签到活动已结束，脚本自动跳过\n"
-                "时间：{}".format(stamp))
-    return ("【WorkBuddy 签到】❌ 执行失败：{}\n"
-            "详情：{}\n"
-            "时间：{}".format(code, result.get("message", ""), stamp))
+                "时间：{}").format(amount, result.get("streak_days", "?"),
+                                  result.get("total_credits", "?"), stamp)
+    elif code == "ALREADY_CLAIMED":
+        title = "ℹ️ 今日已签到，无需重复领取"
+        body = ("连续签到：{} 天｜本期累计：{} 积分\n"
+                "时间：{}").format(result.get("streak_days", "?"),
+                                  result.get("total_credits", "?"), stamp)
+    elif code == "INACTIVE":
+        title = "⏸ 签到活动已结束，脚本自动跳过"
+        body = "时间：{}".format(stamp)
+    else:
+        title = "❌ 执行失败：{}".format(code)
+        body = "详情：{}\n时间：{}".format(result.get("message", ""), stamp)
+    return "【WorkBuddy 签到】{}\n{}{}".format(title, who, body)
 
 
 def build_auth_message(url: str, minutes: int) -> str:
@@ -261,8 +289,13 @@ def check_expiry_notice(cfg: Optional[Dict[str, Any]] = None,
 
 def notify_result(cfg: Dict[str, Any], result: Dict[str, Any],
                   emit: Callable[[str], None]) -> List[Tuple[str, bool, str]]:
-    """把结果推到所有已选渠道，并把每个渠道的成败写进日志。"""
-    pushed = wb_notify.push(cfg, build_message(result))
+    """把结果推到所有已选渠道，并把每个渠道的成败写进日志。
+
+    文案里的账号从**本机/本服务端那份令牌**里读（`account_label`），
+    桌面版和服务端版因此显示同一行「账号：…」，不用各自维护。
+    """
+    text = build_message(result, account_label(cfg))
+    pushed = wb_notify.push(cfg, text)
     for name, ok, detail in pushed:
         emit("{}：{}".format(name, detail))
     if pushed:

@@ -2,7 +2,8 @@
 """把「独立运行」版本打包成单文件 exe（发布用，与逻辑源码分开）。
 
 本脚本只负责构建，不掺业务逻辑：
-    ROOT/src/          逻辑源码（GUI、签到、授权、推送、计划任务）
+    ROOT/src/common/   两边共用（配置、授权、推送、签到核心）
+    ROOT/src/desktop/  exe 版专用（界面、计划任务、弹窗抑制）
     ROOT/build/entry.py 冻结态入口（PyInstaller 从这里进）
     ROOT/dist/          产物
 
@@ -33,6 +34,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
+SRC_COMMON = SRC / "common"
+SRC_DESKTOP = SRC / "desktop"
 ENTRY = ROOT / "build" / "entry.py"
 EXE_NAME = "WorkBuddyCheckin"
 
@@ -51,14 +54,14 @@ HIDDEN_IMPORTS = [
 
 
 def app_version() -> str:
-    """版本号唯一来源：src/wb_config.py 的 VERSION。"""
-    if str(SRC) not in sys.path:
-        sys.path.insert(0, str(SRC))
+    """版本号唯一来源：src/common/wb_config.py 的 VERSION。"""
+    if str(SRC_COMMON) not in sys.path:
+        sys.path.insert(0, str(SRC_COMMON))
     try:
         import wb_config  # noqa: WPS433（构建期临时导入，只为读版本）
         return str(wb_config.VERSION)
     except Exception as e:
-        raise SystemExit("读不到版本号（src/wb_config.py）：{}".format(e))
+        raise SystemExit("读不到版本号（src/common/wb_config.py）：{}".format(e))
 
 
 def write_version_file(version: str) -> Path:
@@ -212,7 +215,7 @@ def main(argv: "list[str]") -> int:
         print("当前解释器不带 tkinter，自动改用：{}".format(interpreter))
     print("版本：v{}".format(version))
     print("打包解释器：{}".format(interpreter))
-    print("源码目录：{}".format(SRC))
+    print("源码目录：{}、{}".format(SRC_COMMON, SRC_DESKTOP))
     print("入口：{}".format(ENTRY))
 
     version_file = write_version_file(version)
@@ -223,7 +226,8 @@ def main(argv: "list[str]") -> int:
         "--noconfirm", "--clean", "--onefile", "--windowed",
         "--name", EXE_NAME,
         "--version-file", str(version_file),
-        "--paths", str(SRC),
+        "--paths", str(SRC_COMMON),
+        "--paths", str(SRC_DESKTOP),
         # 先出到 .build/out 再复制进 dist：dist 里的 exe 可能正在运行，
         # 直接往里写会 PermissionError（改时间戳/校验和那一步最容易踩）。
         "--distpath", str(ROOT / ".build" / "out"),

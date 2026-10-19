@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """一键把 checkin_gui.py 打包成单文件 exe（开发/发布用）。
 
-为什么不能直接敲 pyinstaller 命令：
-  workbuddy_ipc 是运行时从客户端安装目录「动态 import」的，PyInstaller 的
-  静态分析看不到它，于是它依赖的标准库（hmac / secrets / socket / ssl ...）
-  不会被收集，打出来的 exe 会报
-      ModuleNotFoundError: No module named 'hmac'
-  从而误判成"客户端未登录"。这里把这些依赖显式声明为 hidden-import。
+为什么要包一层脚本：**打包用的解释器必须带 tkinter**。
+用不带 tkinter 的解释器打包，PyInstaller 不报任何错，只是悄悄少收集
+`_tkinter.pyd` 和 tcl/tk 运行时，打出来的 exe 一启动就
+    ModuleNotFoundError: No module named 'tkinter'
+直接崩。唯一线索是体积小掉约 3 MB（正常约 11 MB，坏版约 8 MB），
+极易被忽略。所以这里先挑一个能 `import tkinter` 的解释器，打完再自检。
 
 用法：
-    python build_exe.py          # 产出 dist/WorkBuddyCheckin.exe
+    python build_exe.py                   # 产出 dist/WorkBuddyCheckin.exe
+    python build_exe.py --python <解释器>  # 指定解释器
 """
 from __future__ import annotations
 
@@ -18,22 +19,19 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Tuple
 
 ROOT = Path(__file__).resolve().parent
 
-# workbuddy_ipc + _common 用到的标准库（含其间接依赖）
+# 运行时才用到的标准库（PyInstaller 静态分析有时漏掉，显式声明更稳）
 HIDDEN_IMPORTS = [
-    "base64", "binascii", "ctypes", "ctypes.wintypes", "errno", "hashlib",
-    "hmac", "json", "os", "random", "re", "secrets", "select", "socket",
-    "ssl", "struct", "threading", "time", "warnings",
-    "urllib.parse", "urllib.request", "urllib.error",
-    "_ctypes", "_hashlib", "_socket", "_ssl",
+    "base64", "binascii", "json", "re", "secrets", "socket", "ssl",
+    "threading", "urllib.parse", "urllib.request", "urllib.error",
+    "http.server", "http.client", "email", "email.utils",
+    "_socket", "_ssl",
 ]
 
 
 def _has_tkinter(exe: str) -> bool:
-    """该解释器能不能 import tkinter。"""
     try:
         r = subprocess.run(
             [exe, "-c", "import tkinter"],
@@ -45,17 +43,10 @@ def _has_tkinter(exe: str) -> bool:
 
 
 def pick_interpreter() -> str:
-    """挑一个**带 tkinter** 的解释器来打包。
-
-    为什么必须检查：本程序是 tkinter GUI。用不带 tkinter 的解释器打包，
-    PyInstaller 不会报任何错，只是悄悄少收集 `_tkinter.pyd` 和 tcl/tk 运行时
-    （exe 会小掉约 3 MB），打出来的 exe 一启动就
-        ModuleNotFoundError: No module named 'tkinter'
-    直接崩。体积偏小是唯一的线索，极易被忽略——所以这里主动拦一道。
-    """
+    """挑一个带 tkinter 的解释器来打包。"""
     candidates = [sys.executable]
     here = Path(sys.executable).parent
-    for name in ("python3.exe", "python.exe"):          # 同目录的正式解释器
+    for name in ("python3.exe", "python.exe"):
         candidates.append(str(here / name))
     for pat in (
         r"C:\Users\*\AppData\Local\Programs\Python\Python3*\python3.exe",
@@ -77,8 +68,8 @@ def pick_interpreter() -> str:
         "    build_exe.py --python C:\\path\\to\\python.exe".format(sys.executable))
 
 
-def find_pyinstaller_python() -> dict:
-    """返回打包用的环境变量（必要时带上本地隔离依赖目录）。"""
+def build_env() -> dict:
+    """打包环境（必要时带上本地隔离的 PyInstaller）。"""
     env = os.environ.copy()
     libs = ROOT / ".build" / "pylibs"
     if libs.is_dir():
@@ -87,8 +78,35 @@ def find_pyinstaller_python() -> dict:
     return env
 
 
+def verify_bundle(exe: Path) -> bool:
+    """打包后校验：跑一次 --selftest，tkinter 缺失会立刻崩在这里。
+
+    先删掉旧的自检产物再跑：文件存在不代表这次跑过，上一次留下的
+    selftest.json 会让校验无条件通过（踩过）。
+    """
+    if not exe.is_file():
+        return False
+    stale = exe.parent / "selftest.json"
+    try:
+        stale.unlink()
+    except OSError:
+        pass
+    try:
+        r = subprocess.run([str(exe), "--selftest"], cwd=str(exe.parent),
+                           capture_output=True, timeout=300,
+                           creationflags=getattr(subprocess,
+                                                 "CREATE_NO_WINDOW", 0))
+    except Exception as e:
+        print("自检执行失败：{}".format(e))
+        return False
+    if r.returncode == 0 and stale.is_file():
+        return True
+    print("自检输出：{}".format(
+        (r.stderr or r.stdout or b"").decode("utf-8", "replace")[:500]))
+    return False
+
+
 def main(argv: "list[str]") -> int:
-    interpreter = None
     if "--python" in argv:
         interpreter = argv[argv.index("--python") + 1]
         if not _has_tkinter(interpreter):
@@ -101,7 +119,6 @@ def main(argv: "list[str]") -> int:
         print("当前解释器不带 tkinter，自动改用：{}".format(interpreter))
     print("打包解释器：{}".format(interpreter))
 
-    env = find_pyinstaller_python()
     args = [
         interpreter, "-m", "PyInstaller",
         "--noconfirm", "--onefile", "--windowed",
@@ -116,7 +133,7 @@ def main(argv: "list[str]") -> int:
 
     print("PyInstaller:", " ".join(args[:4]), "...")
     try:
-        subprocess.check_call(args, cwd=str(ROOT), env=env)
+        subprocess.check_call(args, cwd=str(ROOT), env=build_env())
     except subprocess.CalledProcessError as e:
         print("\n打包失败，退出码 {}".format(e.returncode))
         print("若提示没有 pyinstaller：")
@@ -125,7 +142,7 @@ def main(argv: "list[str]") -> int:
 
     exe = ROOT / "dist" / "WorkBuddyCheckin.exe"
     print("\n完成：{}".format(exe))
-    if not verify_bundle(exe, interpreter):
+    if not verify_bundle(exe):
         print("！！校验未通过：exe 里可能没有 tkinter，别发布这一版")
         return 3
     print("校验通过：tkinter 已打包")
@@ -133,25 +150,5 @@ def main(argv: "list[str]") -> int:
     return 0
 
 
-def verify_bundle(exe: Path, interpreter: str) -> bool:
-    """打包后校验：exe 自检能否通过（tkinter 缺失会立刻崩在这里）。"""
-    if not exe.is_file():
-        return False
-    try:
-        r = subprocess.run([str(exe), "--selftest"], cwd=str(exe.parent),
-                           capture_output=True, timeout=300,
-                           creationflags=getattr(subprocess,
-                                                 "CREATE_NO_WINDOW", 0))
-    except Exception as e:
-        print("自检执行失败：{}".format(e))
-        return False
-    if r.returncode == 0 or (exe.parent / "selftest.json").is_file():
-        return True
-    print("自检输出：{}".format(
-        (r.stderr or r.stdout or b"").decode("utf-8", "replace")[:500]))
-    return False
-
-
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
-

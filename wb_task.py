@@ -30,11 +30,6 @@ from win_quiet import quiet_kwargs
 
 TASK_NAME = "WorkBuddyCheckin"
 
-# v1.0 的 bat 方案（setup_task.bat → run_checkin.bat）注册的遗留任务名。
-# 那两个脚本已经移除，但装过旧版的机器上任务可能还留着，而它们指向的 bat
-# 已经不存在了，留着只会每天失败一次。所以在这里兜底清理，保持幂等。
-LEGACY_TASKS = ("WorkBuddyCheckin_0900", "WorkBuddyCheckin_2100")
-
 # 计划任务执行 exe 时传的参数（见 checkin_gui.main 的无界面分流）
 RUN_ARG = "--run"
 
@@ -390,30 +385,6 @@ def remove(task_name: str = TASK_NAME) -> Tuple[bool, str]:
     if data.get("removed"):
         return True, "已取消计划任务"
     return True, "计划任务本就不存在"
-
-
-def cleanup_legacy() -> List[str]:
-    """清理 v1.0 bat 方案遗留的任务，返回**确实被删除**的任务名列表。
-
-    注意：任务本来就不存在时**不计入**返回值。旧实现是先 remove 再判断，
-    而 remove 是幂等的（不存在也返回成功），于是界面每次应用定时都会
-    误报一句「已清理旧的计划任务：_0900、_2100」，其实什么都没清。
-
-    存在性判断走 query_fast（读 XML）：遗留任务在绝大多数机器上根本不存在，
-    用 query() 会白等两次 PowerShell 启动（本机实测各 5 秒），「应用定时」
-    因此要卡 10 秒以上。
-    """
-    gone: List[str] = []
-    for name in LEGACY_TASKS:
-        try:
-            if not query_fast(name).get("exists"):
-                continue        # 本来就没有，别去动它，也别在界面上瞎报
-            ok, _msg = remove(name)
-            if ok and not query_fast(name).get("exists"):
-                gone.append(name)
-        except Exception:
-            pass
-    return gone
 
 
 # ---------------- 本程序的启动命令 ----------------

@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""WorkBuddy 账号直连通道（OAuth 设备授权），零依赖。
+"""WorkBuddy 账号直连通道（OAuth 设备授权），零依赖、跨平台。
 
-为什么需要这个模块
-------------------
-客户端从 5.6.2 起把本地登录态改成字段级 AES-GCM 加密（at-rest，
-`$wbEncrypted` + envelope），「读 token 直接调接口」的老脚本全部失效；
-而 WBIPC 模式又要求客户端进程在跑。
+它是本项目**唯一**的登录通道（v2.0 起）：**用 CodeBuddy CLI 的设备授权
+流程重新登录一次**，拿一份明文令牌，之后纯 HTTP 签到。全程不依赖
+WorkBuddy 客户端进程，也不解密客户端的本地登录态。
 
-这里是第三条路：**用 CodeBuddy CLI 的设备授权流程重新登录一次**，
-拿一份全新的明文令牌，之后纯 HTTP 签到。全程不碰客户端、不解密任何东西，
-所以也不受 at-rest 加密影响。
+设备授权的两个端点都是公共 HTTP 接口，`state` 只是一段服务端会话 id，
+所以「在 A 机器生成链接、在 B 机器轮询拿令牌」在协议上是成立的——
+服务端脚本（wb_auth_server.py）就是靠这一点工作的，见文件末尾的
+「导入码」一节。
 
 授权流程
 --------
@@ -28,9 +27,9 @@ refresh 也过期（服务端返回 12153）时，只能重新授权。
 
 风险提示（不写在界面上，但文档必须保留）
 --------------------------------------
-官方对「脚本自动签到」持否定态度，检测到可能回收超额积分、严重时限制账号功能。
-本模式把调用身份从桌面端换成 CLI、把令牌明文落在本机，安全性弱于 WBIPC 模式。
-因此默认仍走 WBIPC，只有在配置里显式设置 auth_mode="oauth" 才启用。
+官方对「脚本自动签到」持否定态度，检测到可能回收超额积分、严重时限制账号功能；
+调用身份是 CLI 而非桌面端，服务端看到的风控特征不同。
+使用与否请自行判断，风险自负。
 """
 from __future__ import annotations
 
@@ -41,6 +40,8 @@ import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, Optional, Tuple
+
+import wb_config
 
 # ---- 端点 ----------------------------------------------------------------
 # 授权服务是公共的（CN 区），与账号 domain 无关；billing 才按 domain 路由。
@@ -174,7 +175,7 @@ def token_path(cfg: Optional[Dict[str, Any]] = None,
     custom = str((cfg or {}).get("oauth_token_file") or "").strip()
     if custom:
         return os.path.abspath(os.path.expandvars(custom))
-    return os.path.join(base_dir or os.getcwd(), TOKEN_FILE_NAME)
+    return os.path.join(base_dir or str(wb_config.SCRIPT_DIR), TOKEN_FILE_NAME)
 
 
 def build_record(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -280,6 +281,59 @@ def summary(path: str) -> Dict[str, Any]:
         "disabled": bool(data.get("disabled")),
     })
     return out
+
+
+# ---- 导入码（服务端授权 -> 本机导入） -------------------------------------
+#
+# 服务端脚本拿到令牌后，用一段「导入码」把它交给 Windows 端：
+#
+#     WBAT1.<base64url(令牌 JSON)>
+#
+# 为什么是这种土办法：令牌是一次性凭证，必须**只落在真正执行签到的那台
+# 机器上**。refreshToken 每次刷新都会轮换，两台机器各持一份就会互相踢掉
+# （服务端返回 12153）。所以服务端拿完令牌**不落盘**，只把这串码交给运维，
+# 由 Windows 端导入后独占。
+#
+# ⚠️ 导入码等同于令牌本身（只是 base64，不是加密）。别贴到群里、别进日志。
+
+IMPORT_PREFIX = "WBAT1."
+
+
+def export_code(record: Dict[str, Any]) -> str:
+    """把令牌记录压成一行可粘贴的导入码。"""
+    payload = json.dumps(record, ensure_ascii=False,
+                         separators=(",", ":")).encode("utf-8")
+    return IMPORT_PREFIX + base64.urlsafe_b64encode(
+        payload).decode("ascii").rstrip("=")
+
+
+def decode_code(code: str) -> Dict[str, Any]:
+    """解析导入码；格式不对或没有 accessToken 时抛 OAUTH_IMPORT_BAD。"""
+    s = str(code or "").strip()
+    if s.startswith(IMPORT_PREFIX):
+        s = s[len(IMPORT_PREFIX):]
+    s = "".join(s.split())          # 容忍换行/空格（从聊天窗口复制常带）
+    if not s:
+        raise OAuthError("OAUTH_IMPORT_BAD", "导入码为空。", 2)
+    pad = "=" * (-len(s) % 4)
+    try:
+        data = json.loads(base64.urlsafe_b64decode(s + pad).decode("utf-8"))
+    except Exception:
+        raise OAuthError("OAUTH_IMPORT_BAD",
+                         "导入码无法解析，可能被截断或复制不全。", 2)
+    if not isinstance(data, dict) or not str(
+            _pick(data.get("auth") or {}, "accessToken") or ""):
+        raise OAuthError("OAUTH_IMPORT_BAD", "导入码里没有有效的令牌。", 2)
+    return data
+
+
+def save_code(code: str, path: str) -> Dict[str, Any]:
+    """解析导入码并落盘（覆盖本机原令牌）。"""
+    record = decode_code(code)
+    record["disabled"] = False
+    record.pop("note", None)
+    save(record, path)
+    return record
 
 
 # ---- 授权流程 -------------------------------------------------------------

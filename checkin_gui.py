@@ -1,21 +1,15 @@
 # -*- coding: utf-8 -*-
-"""WorkBuddy 每日签到 —— 图形界面版（tkinter，零第三方依赖）。
+"""WorkBuddy 每日签到 —— 图形界面（tkinter，零第三方依赖）。
 
-设计要点：
-  * 只做界面与编排，所有业务逻辑复用 workbuddy_checkin.py，不重复实现
-  * 启动即自检：装没装、在不在跑、登录没登录，不满足就在顶部挂醒目横幅
-  * 所有可调项都在界面里改（设置窗口），不用手工编辑 config.json
-  * 后台线程干活，主线程只刷界面（tkinter 不允许跨线程碰控件）
-  * 想直接双击就用 → 见 README，或用 PyInstaller 打成单文件 exe
+界面只做三件事，对应三块区域：
+    ① 账号授权   一次性登录，令牌自动续期
+    ② 每日定时   写进 Windows 计划任务，程序不用常驻
+    ③ 消息推送   企业微信 / 钉钉，只填 key
 
-高 DPI 说明（重要）：
-  Windows 缩放到 125%/150%/250% 时，进程必须在**创建 Tk 之前**声明 DPI
-  感知，否则 Tk 会按 96DPI 换算字体，界面看起来"字特别小"。声明之后还要
-  用实际 DPI 校准 tk scaling（字体）与 PX 系数（边距/尺寸），
-  这样字号和间距才都跟系统一致。
+其它（启动客户端、隐藏窗口、超时、界面缩放）在 v2.0 全部删掉了——
+账号直连不需要客户端，那些配置没有存在意义。
 
-打包：
-  python -m PyInstaller --noconfirm --onefile --windowed --name WorkBuddyCheckin checkin_gui.py
+高 DPI：必须在创建 Tk **之前**声明 DPI 感知，否则 250% 缩放下字会小一半。
 """
 from __future__ import annotations
 
@@ -26,30 +20,28 @@ import sys
 import threading
 import time
 import traceback
-from pathlib import Path
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-import workbuddy_checkin as core
+import wb_config
+import wb_notify
 import wb_oauth
 import wb_task
+import workbuddy_checkin as core
 
-APP_TITLE = "WorkBuddy 每日签到"
-VERSION = "1.7"
+APP_TITLE = wb_config.APP_TITLE
+VERSION = wb_config.VERSION
 
-# 界面缩放系数：物理像素 = 逻辑像素 × PX。由 apply_tk_scaling() 按 DPI 设置。
-# tkinter 的 padding/width 等参数都是物理像素，不跟着 tk scaling 走，
-# 所以必须自己乘一遍，否则 250% 缩放下界面会"挤成一团"。
+# 界面缩放系数：物理像素 = 逻辑像素 × PX（由 apply_tk_scaling 按 DPI 设置）。
+# tkinter 的 padding/width 是物理像素，不跟 tk scaling 走，必须自己乘。
 PX = 1.0
 
 
 def P(v: float) -> int:
-    """逻辑像素 → 物理像素。"""
     return max(1, int(round(v * PX)))
 
 
-# 字号一律用「点」（正数），tk scaling 会按 DPI 自动换算成像素。
 UI_FONT = ("Microsoft YaHei UI", 10)
 UI_FONT_SM = ("Microsoft YaHei UI", 9)
 UI_FONT_BOLD = ("Microsoft YaHei UI", 10, "bold")
@@ -57,7 +49,6 @@ TITLE_FONT = ("Microsoft YaHei UI", 14, "bold")
 BIG_FONT = ("Microsoft YaHei UI", 13, "bold")
 MONO_FONT = ("Consolas", 9)
 
-# 配色（浅色主题，窗口独立于 IDE）
 C_BG = "#F5F6F8"
 C_CARD = "#FFFFFF"
 C_BORDER = "#E3E6EB"
@@ -71,19 +62,11 @@ C_BAD = "#C0342B"
 C_WARN = "#B26A00"
 
 BANNER = {
-    "checking": ("#EEF1F5", "#5A6472", "正在检测环境…"),
-    "ok":       ("#E8F6EE", "#1E7A46", "环境正常"),
-    "warn":     ("#FFF6E5", "#9A6400", "需要处理"),
-    "error":    ("#FDECEC", "#C0342B", "无法签到"),
+    "checking": ("#EEF1F5", "#5A6472"),
+    "ok":       ("#E8F6EE", "#1E7A46"),
+    "warn":     ("#FFF6E5", "#9A6400"),
+    "error":    ("#FDECEC", "#C0342B"),
 }
-
-# 界面缩放选项：0 = 跟随系统 DPI
-SCALE_CHOICES = [
-    ("跟随系统 DPI（推荐）", 0),
-    ("放大 10%", 110),
-    ("放大 25%", 125),
-    ("放大 50%", 150),
-]
 
 
 # ---------------- DPI（必须在 Tk 之前调用） ----------------
@@ -91,10 +74,8 @@ SCALE_CHOICES = [
 def enable_dpi_awareness() -> None:
     """声明进程 DPI 感知。
 
-    必须在 tk.Tk() 之前调用：Tk 初始化时会读屏幕 DPI 来换算字体，如果那时
-    进程还是"DIP 不感知"，Windows 会虚拟化成 96DPI；等 Tk 建完再声明感知
-    就晚了——窗口不再被位图放大，字体却仍按 96DPI 计算，结果就是高缩放屏上
-    "字特别小"（250% 缩放下会小 2.5 倍）。
+    必须在 tk.Tk() 之前调用：Tk 初始化时按屏幕 DPI 换算字体，若那一刻进程
+    还是"DIP 不感知"，Windows 会虚拟化成 96DPI，高缩放屏上字就特别小。
     """
     if sys.platform != "win32":
         return
@@ -103,7 +84,6 @@ def enable_dpi_awareness() -> None:
     except Exception:
         return
     try:
-        # 1 = system DPI aware：单屏/主屏下最稳，Tk 不必做跨屏 DPI 重排
         windll.shcore.SetProcessDpiAwareness(1)
         return
     except Exception:
@@ -115,7 +95,6 @@ def enable_dpi_awareness() -> None:
 
 
 def system_dpi() -> int:
-    """当前系统 DPI（拿不到返回 0）。"""
     if sys.platform != "win32":
         return 0
     try:
@@ -135,79 +114,34 @@ def system_dpi() -> int:
         return 0
 
 
-def apply_tk_scaling(root: tk.Tk, ui_scale: int = 0) -> float:
+def apply_tk_scaling(root: tk.Tk) -> float:
     """按实际 DPI 校准 tk scaling 与 PX 系数，返回缩放倍数（相对 96DPI）。"""
     global PX
     dpi = system_dpi() or 96
-    user = (ui_scale / 100.0) if ui_scale and ui_scale > 0 else 1.0
-    factor = (dpi / 96.0) * user
+    factor = dpi / 96.0
     try:
-        # tk scaling 的单位是「每 point 多少像素」，96DPI 下为 96/72
-        root.tk.call("tk", "scaling", (dpi / 72.0) * user)
+        root.tk.call("tk", "scaling", dpi / 72.0)
     except Exception:
         pass
     PX = factor
     return factor
 
 
-# ---------------- 配置读写 ----------------
+# ---------------- 通用小部件 ----------------
 
-def ensure_config() -> Path:
-    """确保配置文件存在（缺失就按默认写一份出来）。"""
-    path = core.CONFIG_PATH
-    if not path.exists():
-        try:
-            path.write_text(
-                json.dumps(core.DEFAULT_CONFIG, ensure_ascii=False, indent=2),
-                encoding="utf-8")
-        except OSError:
-            pass
-    return path
-
-
-def save_config_patch(patch: dict) -> None:
-    """把若干配置项写回 config.json（保留用户已有的其它项）。"""
-    path = ensure_config()
-    try:
-        cur = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(cur, dict):
-            cur = {}
-    except (OSError, ValueError):
-        cur = {}
-    cur.update(patch)
-    path.write_text(json.dumps(cur, ensure_ascii=False, indent=2),
-                    encoding="utf-8")
-
-
-def schedule_times_of(cfg: dict) -> list:
-    """规范化触发时间列表（兼容 "[\\'09:00\\']" 列表与 "09:00, 21:00" 字符串两种写法）。"""
-    raw = cfg.get("schedule_times") or []
-    if isinstance(raw, str):
-        raw = raw.replace("，", ",").split(",")
-    out = []
-    for t in raw:
-        t = str(t).strip()
-        if t:
-            out.append(t)
-    return out
-
-
-def add_checkbox(parent, text: str, var: tk.BooleanVar, pady=None):
+def add_checkbox(parent, text: str, var: tk.BooleanVar, bg: str = C_BG,
+                 pady=None):
     """自绘勾选开关（方框 + ✓）。
 
-    为什么不用现成的 Checkbutton：
-      * tk 原生 Checkbutton 的指示器是固定尺寸位图，高 DPI 下缩成小方块
-      * ttk(clam) 的指示器在本机 250% 缩放下干脆画不出勾选状态
-    自绘的话尺寸随字体走，勾没勾一眼可见。
+    不用原生 Checkbutton：它的指示器是固定尺寸位图，高 DPI 下会缩成小方块。
     """
-    row = tk.Frame(parent, bg=C_BG)
-    row.pack(fill="x", padx=P(18),
-             pady=(P(3) if pady is None else pady))
+    row = tk.Frame(parent, bg=bg)
+    row.pack(fill="x", padx=P(16), pady=(P(3) if pady is None else pady))
     box = tk.Label(row, font=UI_FONT_SM, bg=C_INPUT_BG, fg=C_PRIMARY,
                    width=2, anchor="center", cursor="hand2",
                    relief="solid", bd=1)
     box.pack(side="left", ipady=P(1))
-    lab = tk.Label(row, text=text, font=UI_FONT_SM, bg=C_BG, fg=C_TEXT,
+    lab = tk.Label(row, text=text, font=UI_FONT_SM, bg=bg, fg=C_TEXT,
                    anchor="w", justify="left", cursor="hand2")
     lab.pack(side="left", padx=(P(8), 0))
 
@@ -227,7 +161,23 @@ def add_checkbox(parent, text: str, var: tk.BooleanVar, pady=None):
     return row
 
 
-def short_time(iso: str) -> str:
+def flat_button(parent, text, cmd, primary=False, small=True):
+    b = tk.Button(
+        parent, text=text, command=cmd,
+        font=UI_FONT_SM if small else UI_FONT,
+        bg=C_PRIMARY if primary else C_CARD,
+        fg="#FFFFFF" if primary else C_TEXT,
+        activebackground=C_PRIMARY_DK if primary else "#EDEFF3",
+        activeforeground="#FFFFFF" if primary else C_TEXT,
+        relief="flat", bd=0,
+        padx=P(14) if primary else P(12),
+        pady=P(6) if primary else P(5),
+        cursor="hand2", highlightbackground=C_BORDER,
+        highlightthickness=1)
+    return b
+
+
+def short_time(iso) -> str:
     """2026-10-12T09:11:21 -> 10/12 09:11。"""
     try:
         day, tm = str(iso).split("T")
@@ -236,25 +186,53 @@ def short_time(iso: str) -> str:
         return str(iso)[:16]
 
 
-# ---------------- 设置窗口 ----------------
+def apply_dialog_theme(top: tk.Toplevel) -> ttk.Style:
+    style = ttk.Style(top)
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    style.configure("Wb.TEntry", fieldbackground=C_INPUT_BG, foreground=C_TEXT,
+                    font=UI_FONT_SM, padding=P(3))
+    return style
 
-class OAuthLoginDialog:
-    """账号直连授权：给出链接、轮询等待、成功后就地更新状态。
 
-    为什么要单独一个窗口而不是弹个浏览器就完事：
-    浏览器登录完成后用户会回到这里，需要看到"到底成功了没有"，
-    否则只能凭感觉再点一次签到去试——失败了也说不清是授权没完成还是别的问题。
+def center_over(parent: tk.Misc, top: tk.Toplevel, frac: int = 3) -> None:
+    """把对话框居中到父窗口（并夹在屏幕内）。
 
-    线程模型：网络轮询在后台线程，结果通过队列回到主线程刷控件
-    （tkinter 不允许跨线程碰控件）。
+    显式连尺寸一起给：只给位置的话 Tk 不再按内容自动调整大小，宽输入框会被切掉。
+    """
+    try:
+        top.update_idletasks()
+        w, h = top.winfo_reqwidth(), top.winfo_reqheight()
+        sw, sh = top.winfo_screenwidth(), top.winfo_screenheight()
+        px_, py_ = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        x = max(0, min(px_ + (pw - w) // 2, sw - w))
+        y = max(0, min(py_ + (ph - h) // frac, sh - h))
+        top.geometry("{}x{}+{}+{}".format(w, h, x, y))
+    except Exception:
+        pass
+
+
+# ---------------- 授权窗口 ----------------
+
+class AuthDialog:
+    """账号授权：本机浏览器 / 推送到手机 两种发起方式。
+
+    为什么单独一个窗口：浏览器（或手机）那头登录完，用户需要看到"到底成没成"，
+    否则只能靠再点一次签到去试，失败了也说不清是授权没完成还是别的问题。
+
+    线程模型：网络轮询在后台线程，结果通过队列回主线程刷控件。
     """
 
-    def __init__(self, app: "App", cfg: dict, on_done=None):
+    def __init__(self, app: "App", push: bool = False, on_done=None):
         self.app = app
-        self.cfg = dict(cfg or {})
+        self.cfg = dict(app.cfg)
+        self.push = push
         self.on_done = on_done
         self.stop = False
-        self.q = queue.Queue()
+        self.q: "queue.Queue[tuple]" = queue.Queue()
         self.url = ""
         self.done = False
         self.started = time.time()
@@ -266,60 +244,46 @@ class OAuthLoginDialog:
         top.resizable(False, False)
         top.transient(app.root)
         top.protocol("WM_DELETE_WINDOW", self._cancel)
+        apply_dialog_theme(top)
 
         body = tk.Frame(top, bg=C_BG)
-        body.pack(fill="both", expand=True, padx=P(20), pady=P(16))
+        body.pack(fill="both", expand=True, padx=P(20), pady=(P(16), 0))
 
-        tk.Label(body, text="在浏览器里完成一次登录", font=UI_FONT_BOLD,
-                 bg=C_BG, fg=C_TEXT, anchor="w").pack(fill="x")
-        self.lbl_desc = tk.Label(
-            body, text="正在申请授权链接…", font=UI_FONT_SM, bg=C_BG,
-            fg=C_MUTED, anchor="w", justify="left", wraplength=P(460))
+        title = "在手机上完成授权" if push else "在本机浏览器完成登录"
+        tk.Label(body, text=title, font=UI_FONT_BOLD, bg=C_BG,
+                 fg=C_TEXT, anchor="w").pack(fill="x")
+        desc = ("正在生成授权链接并推送到手机…" if push
+                else "正在申请授权链接…")
+        self.lbl_desc = tk.Label(body, text=desc, font=UI_FONT_SM, bg=C_BG,
+                                 fg=C_MUTED, anchor="w", justify="left",
+                                 wraplength=P(480))
         self.lbl_desc.pack(fill="x", pady=(P(6), P(10)))
 
         self.var_url = tk.StringVar(value="")
-        ttk.Style(top).configure("Wb.TEntry", fieldbackground=C_INPUT_BG,
-                                 foreground=C_TEXT, font=UI_FONT_SM,
-                                 padding=P(3))
         ttk.Entry(body, textvariable=self.var_url, style="Wb.TEntry",
-                  width=54, state="readonly").pack(fill="x", ipady=P(3))
+                  width=56, state="readonly").pack(fill="x", ipady=P(3))
 
         row = tk.Frame(body, bg=C_BG)
-        row.pack(fill="x", pady=(P(8), 0))
-        self.btn_copy = self._btn(row, "复制链接", self._copy)
-        self.btn_open = self._btn(row, "重新打开浏览器", self._open)
-        self.btn_close = self._btn(row, "取消", self._cancel)
+        row.pack(fill="x", pady=(P(10), 0))
+        self.btn_copy = flat_button(row, "复制链接", self._copy)
+        self.btn_copy.pack(side="left", padx=(0, P(8)))
+        self.btn_open = flat_button(row, "打开浏览器", self._open)
+        self.btn_open.pack(side="left", padx=(0, P(8)))
+        if push:
+            self.btn_open.pack_forget()
+        self.btn_close = flat_button(row, "取消", self._cancel)
+        self.btn_close.pack(side="left")
 
         self.lbl_status = tk.Label(body, text="等待授权…", font=UI_FONT_SM,
                                    bg=C_BG, fg=C_WARN, anchor="w",
-                                   justify="left", wraplength=P(460))
-        self.lbl_status.pack(fill="x", pady=(P(10), 0))
+                                   justify="left", wraplength=P(480))
+        self.lbl_status.pack(fill="x", pady=(P(12), P(16)))
 
-        top.update_idletasks()
-        try:
-            w, h = top.winfo_reqwidth(), top.winfo_reqheight()
-            x = app.root.winfo_rootx() + max(0, (app.root.winfo_width() - w) // 2)
-            y = app.root.winfo_rooty() + max(0, (app.root.winfo_height() - h) // 3)
-            x = max(0, min(x, top.winfo_screenwidth() - w))
-            y = max(0, min(y, top.winfo_screenheight() - h))
-            top.geometry("{}x{}+{}+{}".format(w, h, x, y))
-        except Exception:
-            pass
+        center_over(app.root, top)
         top.grab_set()
 
         threading.Thread(target=self._work, daemon=True).start()
         top.after(200, self._drain)
-
-    # ----- 小工具 -----
-
-    def _btn(self, parent, text, cmd):
-        b = tk.Button(parent, text=text, command=cmd, font=UI_FONT_SM,
-                      bg=C_CARD, fg=C_TEXT, activebackground="#EDEFF3",
-                      relief="flat", bd=0, padx=P(12), pady=P(5),
-                      cursor="hand2", highlightbackground=C_BORDER,
-                      highlightthickness=1)
-        b.pack(side="left", padx=(0, P(8)))
-        return b
 
     def _status(self, text, level="info"):
         color = {"ok": C_OK, "bad": C_BAD, "warn": C_WARN}.get(level, C_MUTED)
@@ -328,20 +292,19 @@ class OAuthLoginDialog:
     # ----- 后台任务 -----
 
     def _work(self):
-        path = core.oauth_token_path(self.cfg)
         try:
-            rec = wb_oauth.login(
-                path,
-                emit=lambda m: self.q.put(("msg", m)),
-                open_browser=True,
+            rec = core.login_oauth(
+                self.cfg,
+                progress=lambda m: self.q.put(("msg", m)),
+                push=self.push,
                 timeout=self.timeout,
-                should_stop=lambda: self.stop,
-                on_tick=lambda e, r: self.q.put(("tick", (e, r))),
-                on_url=lambda u: self.q.put(("url", u)))
-            self.q.put(("done", rec))
-        except wb_oauth.OAuthError as e:
-            self.q.put(("error", (e.result, str(e))))
-        except Exception as e:                       # 兜底，不让线程静默死掉
+                on_url=lambda u: self.q.put(("url", u)),
+                should_stop=lambda: self.stop)
+            if rec.get("result") == "AUTHORIZED":
+                self.q.put(("done", rec))
+            else:
+                self.q.put(("error", (rec.get("result"), rec.get("message"))))
+        except Exception as e:                   # 兜底，不让线程静默死掉
             self.q.put(("error", ("UNEXPECTED", str(e))))
 
     def _drain(self):
@@ -349,15 +312,13 @@ class OAuthLoginDialog:
             while True:
                 kind, payload = self.q.get_nowait()
                 if kind == "url":
-                    self.url = payload
-                    self.var_url.set(payload)
+                    self.url = str(payload)
+                    self.var_url.set(self.url)
                     self.lbl_desc.configure(
-                        text="浏览器已打开授权页；若没反应，点「重新打开浏览器」"
-                             "或复制下方链接手动访问。登录完成后本窗口会自动关闭。")
-                elif kind == "tick":
-                    elapsed, remain = payload
-                    self._status("等待浏览器登录… {}s（剩余约 {}s）".format(
-                        elapsed, max(0, remain)), "warn")
+                        text=("授权链接已发送，请在手机上点开并登录。"
+                              "本窗口会一直等到授权完成。") if self.push else
+                             ("浏览器已打开授权页；若没反应，点「打开浏览器」"
+                              "或复制下方链接手动访问。"))
                 elif kind == "msg":
                     self._status(str(payload), "info")
                 elif kind == "done":
@@ -369,28 +330,37 @@ class OAuthLoginDialog:
         except queue.Empty:
             pass
         if not self.done:
-            self.top.after(200, self._drain)
+            elapsed = int(time.time() - self.started)
+            if self.url:
+                self._status("等待完成授权… 已等 {} 秒（最多 {} 秒）".format(
+                    elapsed, self.timeout), "warn")
+            self.top.after(300, self._drain)
 
     def _finish(self, ok, payload):
         self.done = True
         if ok:
-            acct = (payload or {}).get("account") or {}
-            who = acct.get("nickname") or "账号"
+            who = (payload or {}).get("nickname") or "账号"
             self._status("✅ 授权成功：{}。可以关闭本窗口了。".format(who), "ok")
             self.btn_close.configure(text="完成")
             try:
-                self.top.after(1200, self._close)
+                self.top.after(1500, self._close)
             except Exception:
                 pass
+            self.app.log("授权成功：{}{}".format(
+                who, "（uid {}）".format(payload.get("uid"))
+                if payload and payload.get("uid") else ""))
         else:
             code, msg = payload
             hint = {
-                "OAUTH_TIMEOUT": "超时了，重新点「立即授权」再试一次。",
-                "OAUTH_STATE_EXPIRED": "授权会话过期，请重新发起授权。",
+                "OAUTH_TIMEOUT": "超时了，重新发起一次授权。",
+                "OAUTH_STATE_EXPIRED": "授权会话过期，请重新发起。",
                 "OAUTH_NETWORK": "网络不通，检查代理/防火墙后重试。",
-            }.get(code, "可重试；反复失败请改用客户端通道。")
+                "PUSH_NOT_CONFIGURED": "先在「推送」里选好渠道并填 key。",
+                "PUSH_FAILED": "推送失败，检查机器人 key 是否有效。",
+            }.get(code, "可重试；反复失败请把日志发出来看。")
             self._status("❌ {}　{}".format(msg, hint), "bad")
             self.btn_close.configure(text="关闭")
+            self.app.log("授权失败：{} {}".format(code, msg))
         try:
             self.top.grab_release()
         except Exception:
@@ -429,415 +399,94 @@ class OAuthLoginDialog:
             pass
 
 
-class SettingsDialog:
-    """把 config.json 里的可调项全部搬到界面上。"""
+class ImportDialog:
+    """导入服务端授权结果：粘贴 WBAT1.xxx 导入码，或选一个令牌文件。"""
 
-    def __init__(self, app: "App"):
+    def __init__(self, app: "App", on_done=None):
         self.app = app
-        self.cfg = dict(app.cfg)
-        self.saved = False
+        self.on_done = on_done
 
         top = self.top = tk.Toplevel(app.root)
-        top.title("设置")
+        top.title("导入授权")
         top.configure(bg=C_BG)
         top.resizable(False, False)
         top.transient(app.root)
-
-        # 高 DPI 下 tk 原生的 Checkbutton 指示器是一张固定尺寸的位图，会缩成
-        # 一个小方块；Entry 的边框也不跟随缩放。统一换成 ttk 并指定 clam
-        # 主题——它由 Tk 自己绘制，尺寸按字体度量算，能跟着 DPI 走。
-        style = ttk.Style(top)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-        style.configure("Wb.TCheckbutton", background=C_BG, foreground=C_TEXT,
-                        font=UI_FONT_SM, focuscolor=C_BG)
-        style.map("Wb.TCheckbutton",
-                  background=[("active", C_BG)],
-                  foreground=[("disabled", C_MUTED)])
-        style.configure("Wb.TRadiobutton", background=C_BG, foreground=C_TEXT,
-                        font=UI_FONT_SM, focuscolor=C_BG)
-        style.map("Wb.TRadiobutton",
-                  background=[("active", C_BG)],
-                  foreground=[("disabled", C_MUTED)])
-        style.configure("Wb.TEntry", fieldbackground=C_INPUT_BG,
-                        foreground=C_TEXT, font=UI_FONT_SM, padding=P(3))
-        style.configure("Wb.TCombobox", fieldbackground=C_INPUT_BG,
-                        background=C_CARD, foreground=C_TEXT,
-                        font=UI_FONT_SM, padding=P(2))
+        apply_dialog_theme(top)
 
         body = tk.Frame(top, bg=C_BG)
-        body.pack(fill="both", expand=True, padx=P(18), pady=(P(14), 0))
+        body.pack(fill="both", expand=True, padx=P(20), pady=(P(16), 0))
 
-        # --- 消息推送（只填 key，地址由程序自动拼） ---
-        self._section(body, "消息推送（只填 key，地址自动拼）")
-        self.var_wecom = tk.StringVar(value=core.wecom_key_of(self.cfg))
-        self._entry_row(body, "企业微信 Key", self.var_wecom, width=46)
-        self._hint(body, "企业微信机器人：webhook 链接里 key= 后面那段。留空则不推送。")
+        tk.Label(body, text="粘贴服务端给出的导入码", font=UI_FONT_BOLD,
+                 bg=C_BG, fg=C_TEXT, anchor="w").pack(fill="x")
+        tk.Label(body, text="服务端脚本跑完后会输出一串 WBAT1. 开头的导入码，"
+                            "整段粘到下面即可。导入码等同于令牌本身，别外传。",
+                 font=UI_FONT_SM, bg=C_BG, fg=C_MUTED, anchor="w",
+                 justify="left", wraplength=P(470)).pack(
+            fill="x", pady=(P(6), P(8)))
 
-        self.var_dingtalk = tk.StringVar(value=core.dingtalk_key_of(self.cfg))
-        self._entry_row(body, "钉钉 Token", self.var_dingtalk, width=46)
-        self._hint(body, "钉钉机器人：链接里 access_token= 后面那段"
-                         "（机器人安全设置用「自定义关键词」时需含「签到」二字）。"
-                         "留空则不推送。")
+        self.txt = tk.Text(body, height=5, width=56, font=MONO_FONT,
+                           bg=C_INPUT_BG, fg=C_TEXT, relief="flat",
+                           wrap="char", padx=P(8), pady=P(6),
+                           highlightbackground=C_BORDER, highlightthickness=1)
+        self.txt.pack(fill="x")
 
-        # --- 登录方式 ---
-        # 放在客户端路径之前：它决定了下面这些客户端设置还有没有必要看。
-        # 两个选项并排、说明随选择变化——竖排时"哪行说明属于哪个选项"
-        # 在视觉上分不清，实测很容易看错。
-        self._section(body, "登录方式")
-        self.var_mode = tk.StringVar(
-            value="oauth" if core.auth_mode_of(self.cfg) == "oauth" else "wbipc")
-        mrow = tk.Frame(body, bg=C_BG)
-        mrow.pack(fill="x", padx=P(18), pady=(P(4), 0))
-        ttk.Radiobutton(mrow, text="客户端通道（推荐）", value="wbipc",
-                        variable=self.var_mode,
-                        style="Wb.TRadiobutton",
-                        command=self._refresh_mode_state).pack(side="left")
-        ttk.Radiobutton(mrow, text="账号直连", value="oauth",
-                        variable=self.var_mode,
-                        style="Wb.TRadiobutton",
-                        command=self._refresh_mode_state).pack(side="left",
-                                                              padx=(P(20), 0))
-        self.lbl_mode_hint = tk.Label(
-            body, text="", font=UI_FONT_SM, bg=C_BG, fg=C_MUTED, anchor="w",
-            justify="left", wraplength=P(520))
-        self.lbl_mode_hint.pack(fill="x", padx=P(18), pady=(P(3), 0))
+        self.lbl_status = tk.Label(body, text="", font=UI_FONT_SM, bg=C_BG,
+                                   fg=C_MUTED, anchor="w", justify="left",
+                                   wraplength=P(470))
+        self.lbl_status.pack(fill="x", pady=(P(8), P(4)))
 
-        arow = tk.Frame(body, bg=C_BG)
-        arow.pack(fill="x", padx=P(18), pady=(P(5), 0))
-        self.arow = arow
-        self.btn_auth = self._btn(arow, "立即授权", self._start_oauth)
-        self.lbl_oauth = tk.Label(arow, text="", font=UI_FONT_SM, bg=C_BG,
-                                  fg=C_MUTED, anchor="w")
-        self.lbl_oauth.pack(side="left", padx=(P(10), 0))
-        self._refresh_oauth_state()
-
-        # --- 客户端路径 ---
-        self._section(body, "WorkBuddy 客户端")
-        row = tk.Frame(body, bg=C_BG)
-        row.pack(fill="x", padx=P(18), pady=(P(4), 0))
-        self.var_exe = tk.StringVar(
-            value=str(self.cfg.get("workbuddy_exe") or ""))
-        self.ent_exe = ttk.Entry(row, textvariable=self.var_exe,
-                                 style="Wb.TEntry", width=38)
-        self.ent_exe.pack(side="left", ipady=P(3))
-        self.btn_detect = self._btn(row, "自动检测", self._detect_exe)
-        self.btn_browse = self._btn(row, "浏览…", self._browse_exe)
-
-        self.lbl_exe_state = tk.Label(
-            body, text="", font=UI_FONT_SM, bg=C_BG, fg=C_MUTED,
-            anchor="w", justify="left", wraplength=P(520))
-        self.lbl_exe_state.pack(fill="x", padx=P(18), pady=(P(4), 0))
-        self._refresh_exe_state()
-        self._refresh_mode_state()
-
-        # 内置模块目录不出现在界面上：它是"自动探测失败时的最后一根救命
-        # 稻草"，正常安装根本用不到，摆出来只会让使用者以为必须填。
-        # 配置项 ipc_dir 仍然有效（手工改 config.json 可用），这里只做保留。
-
-        # --- 行为 ---
-        self._section(body, "运行行为")
-        self.var_auto_env = tk.BooleanVar(
-            value=bool(self.cfg.get("auto_env_check", True)))
-        self.var_launch = tk.BooleanVar(
-            value=bool(self.cfg.get("launch_workbuddy", True)))
-        self.var_hide = tk.BooleanVar(
-            value=bool(self.cfg.get("hide_window", True)))
-        self.var_close = tk.BooleanVar(
-            value=bool(self.cfg.get("close_after_checkin", True)))
-        self._check(body, "启动时自动做一次环境自检", self.var_auto_env)
-        self._check(body, "客户端未运行时自动拉起", self.var_launch)
-        self._check(body, "拉起后隐藏客户端窗口（后台运行，不打断当前工作）",
-                    self.var_hide)
-        self._check(body, "签到完成后关闭「由本程序拉起」的客户端", self.var_close)
-
-        # --- 超时 ---
-        self._section(body, "超时设置（秒）")
-        trow = tk.Frame(body, bg=C_BG)
-        trow.pack(fill="x", padx=P(18), pady=(P(4), 0))
-        self.var_t_launch = tk.StringVar(
-            value=str(self.cfg.get("launch_timeout", 120)))
-        self.var_t_hide = tk.StringVar(
-            value=str(self.cfg.get("hide_window_timeout", 25)))
-        self.var_t_close = tk.StringVar(
-            value=str(self.cfg.get("close_timeout", 30)))
-        for label, var in (("拉起等待", self.var_t_launch),
-                           ("隐藏等待", self.var_t_hide),
-                           ("关闭等待", self.var_t_close)):
-            cell = tk.Frame(trow, bg=C_BG)
-            cell.pack(side="left", padx=(0, P(18)))
-            tk.Label(cell, text=label, font=UI_FONT_SM, bg=C_BG,
-                     fg=C_MUTED).pack(anchor="w")
-            ttk.Entry(cell, textvariable=var, style="Wb.TEntry",
-                      width=6).pack(ipady=P(2))
-
-        # --- 界面 ---
-        self._section(body, "界面")
-        srow = tk.Frame(body, bg=C_BG)
-        srow.pack(fill="x", padx=P(18), pady=(P(4), 0))
-        tk.Label(srow, text="显示缩放", font=UI_FONT_SM, bg=C_BG,
-                 fg=C_MUTED).pack(side="left", padx=(0, P(8)))
-        cur = int(self.cfg.get("ui_scale", 0) or 0)
-        self.var_scale = tk.StringVar(
-            value=next((t for t, v in SCALE_CHOICES if v == cur),
-                       SCALE_CHOICES[0][0]))
-        ttk.Combobox(srow, textvariable=self.var_scale, state="readonly",
-                     style="Wb.TCombobox", width=20,
-                     values=[t for t, _ in SCALE_CHOICES]).pack(side="left")
-        tk.Label(srow, text="（改完重启程序生效）", font=UI_FONT_SM, bg=C_BG,
-                 fg=C_MUTED).pack(side="left", padx=(P(8), 0))
-
-        # --- 底部按钮 ---
         bar = tk.Frame(top, bg=C_BG)
-        bar.pack(fill="x", padx=P(18), pady=P(14))
-        self._btn(bar, "恢复默认", self._restore_defaults)
-        self._btn(bar, "取消", self._cancel)
-        tk.Button(bar, text="保存", command=self._save, font=UI_FONT,
-                  bg=C_PRIMARY, fg="#FFFFFF", activebackground=C_PRIMARY_DK,
-                  activeforeground="#FFFFFF", relief="flat", bd=0,
-                  padx=P(20), pady=P(6), cursor="hand2").pack(side="right")
+        bar.pack(fill="x", padx=P(20), pady=P(14))
+        flat_button(bar, "从文件导入…", self._from_file).pack(
+            side="left", padx=(0, P(8)))
+        flat_button(bar, "取消", self.top.destroy).pack(side="right")
+        flat_button(bar, "导入", self._do_import, primary=True).pack(
+            side="right", padx=(0, P(8)))
 
-        # 显式连尺寸一起给：wm geometry 一旦只给位置，Tk 就不再自动按内容
-        # 调整窗口大小，宽输入框会被切掉。
-        top.update_idletasks()
-        try:
-            w = top.winfo_reqwidth()
-            h = top.winfo_reqheight()
-            px_ = app.root.winfo_rootx()
-            py_ = app.root.winfo_rooty()
-            pw = app.root.winfo_width()
-            ph = app.root.winfo_height()
-            sw = top.winfo_screenwidth()
-            sh = top.winfo_screenheight()
-            x = px_ + max(0, (pw - w) // 2)
-            y = py_ + max(0, (ph - h) // 3)
-            x = max(0, min(x, sw - w))
-            y = max(0, min(y, sh - h))
-            top.geometry("{}x{}+{}+{}".format(w, h, x, y))
-        except Exception:
-            pass
-        top.bind("<Escape>", lambda _e: self._cancel())
+        center_over(app.root, top)
+        top.bind("<Escape>", lambda _e: self.top.destroy())
         top.grab_set()
         top.focus_set()
 
-    # ----- 小部件工厂 -----
-
-    def _section(self, parent, text):
-        f = tk.Frame(parent, bg=C_BG)
-        f.pack(fill="x", padx=P(18), pady=(P(14), P(2)))
-        tk.Label(f, text=text, font=UI_FONT_BOLD, bg=C_BG,
-                 fg=C_TEXT).pack(side="left")
-        tk.Frame(f, bg=C_BORDER, height=P(1)).pack(
-            side="left", fill="x", expand=True, padx=(P(10), 0), pady=(P(8), 0))
-
-    def _hint(self, parent, text):
-        tk.Label(parent, text=text, font=UI_FONT_SM, bg=C_BG, fg=C_MUTED,
-                 anchor="w", justify="left", wraplength=P(520)).pack(
-            fill="x", padx=P(18), pady=(P(3), 0))
-
-    def _entry_row(self, parent, label, var, width=40):
-        row = tk.Frame(parent, bg=C_BG)
-        row.pack(fill="x", padx=P(18), pady=(P(4), 0))
-        tk.Label(row, text=label, font=UI_FONT_SM, bg=C_BG, fg=C_MUTED,
-                 width=14, anchor="w").pack(side="left")
-        ttk.Entry(row, textvariable=var, style="Wb.TEntry",
-                  width=width).pack(side="left", ipady=P(3))
-
-    def _check(self, parent, text, var):
-        add_checkbox(parent, text, var)
-
-    def _btn(self, parent, text, cmd):
-        b = tk.Button(parent, text=text, command=cmd, font=UI_FONT_SM,
-                      bg=C_CARD, fg=C_TEXT, activebackground="#EDEFF3",
-                      relief="flat", bd=0, padx=P(10), pady=P(5),
-                      cursor="hand2", highlightbackground=C_BORDER,
-                      highlightthickness=1)
-        b.pack(side="left", padx=(P(8), 0))
-        return b
-
-    # ----- 动作 -----
-
-    def _detect_exe(self):
-        found = core.find_workbuddy_exe()
-        if found:
-            self.var_exe.set(found)
-            self.app.log("自动检测到客户端：{}".format(found))
-        else:
-            self.app.log("自动检测未找到 WorkBuddy.exe，请手动浏览指定。")
-        self._refresh_exe_state()
-
-    def _browse_exe(self):
-        init = self.var_exe.get().strip() or "C:/Program Files/WorkBuddy"
+    def _from_file(self):
         path = filedialog.askopenfilename(
-            parent=self.top, title="选择 WorkBuddy.exe",
-            initialdir=os.path.dirname(init) or "C:/",
-            filetypes=[("可执行文件", "*.exe"), ("全部文件", "*.*")])
+            parent=self.top, title="选择令牌文件",
+            filetypes=[("令牌文件", "auth_oauth.json"), ("JSON", "*.json"),
+                       ("全部文件", "*.*")])
         if path:
-            self.var_exe.set(os.path.normpath(path))
-            self._refresh_exe_state()
+            self._apply(path)
 
-    def _refresh_exe_state(self):
-        raw = self.var_exe.get().strip()
-        if raw and os.path.isfile(raw):
-            ok, txt = True, "✅ 已找到：{}".format(raw)
-        else:
-            found = core.find_workbuddy_exe()
-            if found:
-                ok, txt = True, ("ℹ 当前填写无效，但已自动检测到：{}"
-                                 "（点「自动检测」填入）".format(found))
-            else:
-                ok, txt = False, "❌ 未找到 WorkBuddy.exe，请确认客户端已安装"
-        self.lbl_exe_state.configure(text=txt, fg=C_OK if ok else C_BAD)
+    def _do_import(self):
+        raw = self.txt.get("1.0", "end").strip()
+        if not raw:
+            self.lbl_status.configure(text="请先粘贴导入码。", fg=C_BAD)
+            return
+        self._apply(raw)
 
-    def _refresh_mode_state(self):
-        """账号直连模式下，客户端路径这些设置用不上，置灰避免误导。"""
-        oauth = self.var_mode.get() == "oauth"
-        state = "disabled" if oauth else "normal"
+    def _apply(self, raw):
         try:
-            self.ent_exe.configure(state=state)
-            self.btn_detect.configure(state=state)
-            self.btn_browse.configure(state=state)
-        except Exception:
-            pass
-        self.lbl_mode_hint.configure(
-            text="脚本不接触令牌，直接借客户端注入的鉴权；客户端没在运行时"
-                 "自动拉起。最安全，但要求本机装有客户端。"
-                 if not oauth else
-                 "不启动客户端：用一次浏览器授权换取登录态，之后纯网络请求"
-                 "完成签到。适合不想让客户端常驻的机器。")
-        if oauth:
-            self.lbl_exe_state.configure(
-                text="账号直连模式不使用客户端，此处路径可忽略。", fg=C_MUTED)
-            # 授权行只在直连模式下有意义，客户端模式下整行收起，
-            # 免得让人以为"不授权就不让签到"
+            res = core.import_token(raw, self.app.cfg)
+        except Exception as e:
+            self.lbl_status.configure(text="❌ {}".format(e), fg=C_BAD)
+            return
+        who = res.get("nickname") or "账号"
+        self.app.log("授权已导入：{}".format(who))
+        self.lbl_status.configure(text="✅ 导入成功：{}".format(who), fg=C_OK)
+        if self.on_done:
             try:
-                if not self.arow.winfo_manager():
-                    self.arow.pack(fill="x", padx=P(18), pady=(P(5), 0),
-                                   after=self.lbl_mode_hint)
+                self.on_done()
             except Exception:
                 pass
-        else:
-            try:
-                self.arow.pack_forget()
-            except Exception:
-                pass
-            self._refresh_exe_state()
+        self.top.after(800, self.top.destroy)
 
-    def _refresh_oauth_state(self):
-        """刷新授权状态文案（只显示账号与剩余天数，不显示令牌）。"""
-        info = wb_oauth.summary(core.oauth_token_path(self.cfg))
-        if not info.get("present"):
-            txt, color = "未授权", C_MUTED
-        elif info.get("error"):
-            txt, color = "令牌异常：{}".format(info["error"]), C_BAD
-        elif info.get("disabled"):
-            txt, color = "会话已失效，需重新授权", C_BAD
-        elif info.get("expired"):
-            txt, color = "令牌已过期，需重新授权", C_BAD
-        else:
-            days = info.get("days_left")
-            who = info.get("nickname") or "已授权账号"
-            txt = "已授权：{}{}".format(
-                who, "（剩 {} 天）".format(days) if days is not None else "")
-            color = C_OK if (days is None or days > 3) else C_BAD
-        try:
-            self.lbl_oauth.configure(text=txt, fg=color)
-        except Exception:
-            pass
 
-    def _start_oauth(self):
-        OAuthLoginDialog(self.app, cfg=self.cfg, on_done=self._refresh_oauth_state)
-
-    def _restore_defaults(self):
-        if not messagebox.askyesno("恢复默认", "把所有设置恢复为默认值？",
-                                   parent=self.top):
-            return
-        d = core.DEFAULT_CONFIG
-        self.var_wecom.set(d.get("wecom_key", ""))
-        self.var_dingtalk.set(d.get("dingtalk_key", ""))
-        self.var_exe.set(d.get("workbuddy_exe", ""))
-        self.var_mode.set("wbipc")
-        self.var_auto_env.set(bool(d.get("auto_env_check", True)))
-        self.var_launch.set(bool(d.get("launch_workbuddy", True)))
-        self.var_hide.set(bool(d.get("hide_window", True)))
-        self.var_close.set(bool(d.get("close_after_checkin", True)))
-        self.var_t_launch.set(str(d.get("launch_timeout", 120)))
-        self.var_t_hide.set(str(d.get("hide_window_timeout", 25)))
-        self.var_t_close.set(str(d.get("close_timeout", 30)))
-        self.var_scale.set(SCALE_CHOICES[0][0])
-        self._refresh_mode_state()
-
-    def _collect(self) -> dict:
-        def num(var, name, lo=1, hi=3600):
-            raw = var.get().strip()
-            try:
-                v = int(float(raw))
-            except ValueError:
-                raise ValueError("「{}」必须是数字".format(name))
-            if not (lo <= v <= hi):
-                raise ValueError("「{}」需在 {}~{} 之间".format(name, lo, hi))
-            return v
-
-        exe = self.var_exe.get().strip()
-        if exe and not os.path.isfile(exe):
-            raise ValueError("客户端路径不存在：{}".format(exe))
-        scale = next((v for t, v in SCALE_CHOICES
-                      if t == self.var_scale.get()), 0)
-        return {
-            "auth_mode": "oauth" if self.var_mode.get() == "oauth" else "wbipc",
-            "wecom_key": self.var_wecom.get().strip(),
-            "dingtalk_key": self.var_dingtalk.get().strip(),
-            # 迁移：统一改用 key 字段，清掉可能残留的完整链接，避免两处配置打架
-            "wecom_webhook": "",
-            "dingtalk_webhook": "",
-            "workbuddy_exe": exe,
-            # 界面上已不再暴露该入口（用户不关心）；这里原样保留手工改过的值，
-            # 避免"打开设置再保存"就把兜底路径清空
-            "ipc_dir": str(self.cfg.get("ipc_dir") or ""),
-            "auto_env_check": bool(self.var_auto_env.get()),
-            "launch_workbuddy": bool(self.var_launch.get()),
-            "hide_window": bool(self.var_hide.get()),
-            "close_after_checkin": bool(self.var_close.get()),
-            "launch_timeout": num(self.var_t_launch, "拉起等待"),
-            "hide_window_timeout": num(self.var_t_hide, "隐藏等待"),
-            "close_timeout": num(self.var_t_close, "关闭等待"),
-            "ui_scale": scale,
-        }
-
-    def _save(self):
-        try:
-            patch = self._collect()
-        except ValueError as e:
-            messagebox.showerror("设置有问题", str(e), parent=self.top)
-            return
-        try:
-            save_config_patch(patch)
-        except OSError as e:
-            messagebox.showerror("保存失败", str(e), parent=self.top)
-            return
-        old_scale = int(self.cfg.get("ui_scale", 0) or 0)
-        self.cfg.update(patch)
-        self.app.apply_config(self.cfg)
-        self.app.log("设置已保存到 {}".format(core.CONFIG_PATH))
-        self.saved = True
-        if patch.get("ui_scale") != old_scale:
-            messagebox.showinfo("已保存", "显示缩放将在重启程序后生效。",
-                                parent=self.top)
-        self.top.destroy()
-
-    def _cancel(self):
-        self.top.destroy()
-
+# ---------------- 定时窗口 ----------------
 
 class ScheduleDialog:
-    """定时签到设置：把定时写进 Windows 计划任务，本程序不需要常驻。
+    """每日定时：写进 Windows 计划任务，程序本身不用常驻。
 
-    设计取舍：
-      * 界面上「启用定时」= 在系统里注册一个计划任务；「取消定时」= 删除它
-      * 到点由系统启动 exe 的无界面入口（--run）执行签到，跑完自动退出
-      * 注册走 PowerShell 的 ScheduledTasks 模块，普通权限即可，不弹 UAC
+      * 「应用到系统」= 注册/覆盖计划任务；「取消定时」= 删掉它
+      * 到点由系统启动 exe 的无界面入口（--run）签到，跑完退出
       * 随机抖动用计划任务原生的 RandomDelay，不靠脚本 sleep
     """
 
@@ -847,46 +496,43 @@ class ScheduleDialog:
         self.busy = False
 
         top = self.top = tk.Toplevel(app.root)
-        top.title("定时签到")
+        top.title("每日定时")
         top.configure(bg=C_BG)
         top.resizable(False, False)
         top.transient(app.root)
-
-        style = ttk.Style(top)
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
+        style = apply_dialog_theme(top)
         style.configure("Wb.TCheckbutton", background=C_BG, foreground=C_TEXT,
                         font=UI_FONT_SM, focuscolor=C_BG)
-        style.map("Wb.TCheckbutton", background=[("active", C_BG)])
-        style.configure("Wb.TEntry", fieldbackground=C_INPUT_BG,
-                        foreground=C_TEXT, font=UI_FONT_SM, padding=P(3))
 
         body = tk.Frame(top, bg=C_BG)
         body.pack(fill="both", expand=True, padx=P(18), pady=(P(14), 0))
 
-        self._hint(body, "定时由 Windows 计划任务负责，本程序不用一直开着 ——"
-                         "到点由系统自动启动签到，跑完自动退出。")
+        tk.Label(body, text="定时由 Windows 计划任务负责，本程序不用一直开着 —— "
+                            "到点由系统启动签到，跑完自动退出。",
+                 font=UI_FONT_SM, bg=C_BG, fg=C_MUTED, anchor="w",
+                 justify="left", wraplength=P(540)).pack(
+            fill="x", padx=P(16), pady=(0, P(6)))
 
         self._section(body, "计划")
-        self.var_on = tk.BooleanVar(
-            value=bool(self.cfg.get("schedule_enabled")))
+        self.var_on = tk.BooleanVar(value=bool(self.cfg.get("schedule_enabled")))
         add_checkbox(body, "启用每日自动签到", self.var_on)
+        self.lbl_on_hint = tk.Label(
+            body, text="", font=UI_FONT_SM, bg=C_BG, fg=C_MUTED, anchor="w")
+        self.lbl_on_hint.pack(fill="x", padx=P(16), pady=(P(2), 0))
 
         row = tk.Frame(body, bg=C_BG)
-        row.pack(fill="x", padx=P(18), pady=(P(8), 0))
+        row.pack(fill="x", padx=P(16), pady=(P(8), 0))
         tk.Label(row, text="触发时间", font=UI_FONT_SM, bg=C_BG, fg=C_MUTED,
                  width=10, anchor="w").pack(side="left")
         self.var_times = tk.StringVar(
-            value=", ".join(schedule_times_of(self.cfg) or ["09:00"]))
+            value=", ".join(self.cfg.get("schedule_times") or ["09:00"]))
         ttk.Entry(row, textvariable=self.var_times, style="Wb.TEntry",
                   width=20).pack(side="left", ipady=P(3))
         tk.Label(row, text="24 小时制，多个时间用逗号分隔", font=UI_FONT_SM,
                  bg=C_BG, fg=C_MUTED).pack(side="left", padx=(P(8), 0))
 
         row2 = tk.Frame(body, bg=C_BG)
-        row2.pack(fill="x", padx=P(18), pady=(P(8), 0))
+        row2.pack(fill="x", padx=P(16), pady=(P(8), 0))
         tk.Label(row2, text="随机抖动", font=UI_FONT_SM, bg=C_BG, fg=C_MUTED,
                  width=10, anchor="w").pack(side="left")
         self.var_jitter = tk.StringVar(
@@ -900,71 +546,37 @@ class ScheduleDialog:
         self.var_exit = tk.BooleanVar(
             value=bool(self.cfg.get("exit_after_apply", True)))
         add_checkbox(body, "应用后自动关闭本程序（不常驻内存）",
-                     self.var_exit, pady=P(8))
+                     self.var_exit, pady=P(10))
 
         self._section(body, "系统状态")
         self.lbl_state = tk.Label(
-            body, text="", font=UI_FONT_SM, bg=C_BG, fg=C_MUTED,
-            anchor="w", justify="left", wraplength=P(560))
-        self.lbl_state.pack(fill="x", padx=P(18), pady=(P(2), 0))
+            body, text="正在读取系统计划任务状态…", font=UI_FONT_SM, bg=C_BG,
+            fg=C_MUTED, anchor="w", justify="left", wraplength=P(540))
+        self.lbl_state.pack(fill="x", padx=P(16), pady=(P(2), 0))
 
         bar = tk.Frame(top, bg=C_BG)
         bar.pack(fill="x", padx=P(18), pady=P(14))
-        self.btn_apply = tk.Button(
-            bar, text="应用到系统", command=self._apply, font=UI_FONT,
-            bg=C_PRIMARY, fg="#FFFFFF", activebackground=C_PRIMARY_DK,
-            activeforeground="#FFFFFF", relief="flat", bd=0, padx=P(18),
-            pady=P(6), cursor="hand2")
+        self.btn_apply = flat_button(bar, "应用到系统", self._apply,
+                                     primary=True, small=False)
         self.btn_apply.pack(side="left")
-        self.btn_remove = tk.Button(
-            bar, text="取消定时", command=self._remove, font=UI_FONT_SM,
-            bg=C_CARD, fg=C_TEXT, activebackground="#EDEFF3", relief="flat",
-            bd=0, padx=P(14), pady=P(6), cursor="hand2",
-            highlightbackground=C_BORDER, highlightthickness=1)
+        self.btn_remove = flat_button(bar, "取消定时", self._remove)
         self.btn_remove.pack(side="left", padx=(P(8), 0))
-        tk.Button(bar, text="关闭", command=self.top.destroy, font=UI_FONT_SM,
-                  bg=C_CARD, fg=C_TEXT, activebackground="#EDEFF3",
-                  relief="flat", bd=0, padx=P(14), pady=P(6), cursor="hand2",
-                  highlightbackground=C_BORDER,
-                  highlightthickness=1).pack(side="right")
+        flat_button(bar, "关闭", self.top.destroy).pack(side="right")
 
-        # 先显示"读取中"，再后台查 —— PowerShell 启动有 1~2 秒开销，别卡住开窗
-        self.lbl_state.configure(text="正在读取系统计划任务状态…")
         threading.Thread(target=self._probe, daemon=True).start()
-
-        top.update_idletasks()
-        self._center()
+        center_over(app.root, top)
         top.bind("<Escape>", lambda _e: self.top.destroy())
         top.grab_set()
         top.focus_set()
 
-    # ----- 界面小工具 -----
-
     def _section(self, parent, text):
         f = tk.Frame(parent, bg=C_BG)
-        f.pack(fill="x", padx=P(18), pady=(P(14), P(2)))
+        f.pack(fill="x", padx=P(16), pady=(P(14), P(2)))
         tk.Label(f, text=text, font=UI_FONT_BOLD, bg=C_BG,
                  fg=C_TEXT).pack(side="left")
         tk.Frame(f, bg=C_BORDER, height=P(1)).pack(
             side="left", fill="x", expand=True, padx=(P(10), 0),
             pady=(P(8), 0))
-
-    def _hint(self, parent, text):
-        tk.Label(parent, text=text, font=UI_FONT_SM, bg=C_BG, fg=C_MUTED,
-                 anchor="w", justify="left", wraplength=P(560)).pack(
-            fill="x", padx=P(18), pady=(P(4), 0))
-
-    def _center(self):
-        try:
-            w, h = self.top.winfo_reqwidth(), self.top.winfo_reqheight()
-            px_, py_ = self.app.root.winfo_rootx(), self.app.root.winfo_rooty()
-            pw, ph = self.app.root.winfo_width(), self.app.root.winfo_height()
-            sw, sh = self.top.winfo_screenwidth(), self.top.winfo_screenheight()
-            x = max(0, min(px_ + (pw - w) // 2, sw - w))
-            y = max(0, min(py_ + (ph - h) // 3, sh - h))
-            self.top.geometry("{}x{}+{}+{}".format(w, h, x, y))
-        except Exception:
-            pass
 
     def _set_busy(self, busy):
         self.busy = busy
@@ -975,31 +587,27 @@ class ScheduleDialog:
     # ----- 后台动作 -----
 
     def _probe(self):
-        """读系统任务状态（跑在后台线程）。
-
-        两段式：先用 query_fast 把"在不在、几点跑、指向的程序对不对"
-        秒显出来（读 XML，约 0.5 毫秒），再用 query() 补上运行记录。
-        窗口一打开就有内容，不必干等 PowerShell 冷启动的 5 秒。
-        """
+        """两段式读状态：先读 XML（0.5ms），再补运行记录（PowerShell 约 5s）。"""
         fast = wb_task.query_fast()
         fast["stale"] = self._is_stale(fast)
         self.app.post("call", lambda: self._show(fast))
 
-        info = wb_task.query()                    # 完整版：含运行记录
+        info = wb_task.query()
         if info.get("partial") or (info.get("error") and fast.get("exists")):
-            return        # 拿不到更全的信息，保留已经显示出来的那份
+            return
         info["stale"] = self._is_stale(info)
         self.app.post("call", lambda: self._show(info))
 
     @staticmethod
     def _is_stale(info: dict) -> bool:
-        """系统任务指向的程序，是不是当前这个程序。"""
         prog, _args = wb_task.launcher()
         return bool(info.get("exists")
                     and os.path.normcase(str(info.get("command") or ""))
                     != os.path.normcase(prog))
 
     def _show(self, info):
+        self.lbl_on_hint.configure(
+            text="应用后由系统接管，本程序可以退出。")
         if info.get("error"):
             self.lbl_state.configure(
                 text="⚠ 读取计划任务失败：{}".format(info["error"]), fg=C_WARN)
@@ -1012,6 +620,8 @@ class ScheduleDialog:
         times = info.get("times") or []
         if times:
             bits.append("每天 {}".format("、".join(times)))
+        if info.get("jitter_minutes"):
+            bits.append("±{} 分".format(info["jitter_minutes"]))
         if info.get("next_run"):
             bits.append("下次 {}".format(short_time(str(info["next_run"]))))
         ok = True
@@ -1061,6 +671,11 @@ class ScheduleDialog:
     def _apply(self):
         if self.busy:
             return
+        if not self.var_on.get():
+            messagebox.showinfo("未启用",
+                                "勾选「启用每日自动签到」后再应用。",
+                                parent=self.top)
+            return
         try:
             times, jitter = self._parse()
         except ValueError as e:
@@ -1068,12 +683,11 @@ class ScheduleDialog:
             return
         prog, args = wb_task.launcher()
         if not os.path.isfile(prog):
-            messagebox.showerror(
-                "无法应用", "找不到要执行的程序：\n{}".format(prog),
-                parent=self.top)
+            messagebox.showerror("无法应用", "找不到要执行的程序：\n{}".format(prog),
+                                 parent=self.top)
             return
         if not getattr(sys, "frozen", False):
-            self.app.log("注意：当前是源码运行，定时任务会依赖本机 Python；"
+            self.app.log("注意：当前是源码运行，定时任务依赖本机 Python；"
                          "正式使用请用打包后的 exe。")
 
         self._set_busy(True)
@@ -1081,12 +695,10 @@ class ScheduleDialog:
 
         def work():
             ok, msg = wb_task.apply(prog, args, times, jitter)
-            gone = wb_task.cleanup_legacy() if ok else []
-            self.app.post(
-                "call", lambda: self._after_apply(ok, msg, times, jitter, gone))
+            self.app.post("call", lambda: self._after_apply(ok, msg, times, jitter))
         threading.Thread(target=work, daemon=True).start()
 
-    def _after_apply(self, ok, msg, times, jitter, gone):
+    def _after_apply(self, ok, msg, times, jitter):
         self._set_busy(False)
         if not ok:
             self.lbl_state.configure(text="⚠ 应用失败：{}".format(msg), fg=C_BAD)
@@ -1102,7 +714,7 @@ class ScheduleDialog:
             "exit_after_apply": bool(self.var_exit.get()),
         }
         try:
-            save_config_patch(patch)
+            wb_config.save_patch(patch)
         except OSError as e:
             messagebox.showerror("保存配置失败", str(e), parent=self.top)
             return
@@ -1111,8 +723,6 @@ class ScheduleDialog:
         self.app.cfg.update(patch)
         self.app.log("定时签到已应用：每天 {}（抖动 ±{} 分钟）".format(
             "、".join(times), jitter))
-        if gone:
-            self.app.log("已清理旧的计划任务：{}".format("、".join(gone)))
         self.app.refresh_schedule_state()
 
         if bool(self.var_exit.get()):
@@ -1126,8 +736,8 @@ class ScheduleDialog:
         if self.busy:
             return
         if not messagebox.askyesno(
-                "取消定时", "从系统里删除定时签到计划任务？\n"
-                            "（不影响手动签到）", parent=self.top):
+                "取消定时", "从系统里删除定时签到计划任务？\n（不影响手动签到）",
+                parent=self.top):
             return
         self._set_busy(True)
         self.lbl_state.configure(text="正在删除系统计划任务…", fg=C_MUTED)
@@ -1143,16 +753,198 @@ class ScheduleDialog:
             messagebox.showerror("取消失败", msg, parent=self.top)
             return
         try:
-            save_config_patch({"schedule_enabled": False})
+            wb_config.save_patch({"schedule_enabled": False})
         except OSError as e:
             messagebox.showerror("保存配置失败", str(e), parent=self.top)
             return
         self.cfg["schedule_enabled"] = False
         self.app.cfg["schedule_enabled"] = False
+        self.var_on.set(False)
         self.app.sched_state = None
         self.app.log("已取消定时签到")
-        self.app.report_config()
+        self.app.refresh_schedule_state()
         self._probe()
+
+
+# ---------------- 推送窗口 ----------------
+
+class NotifyDialog:
+    """推送类型与配置：勾选渠道 + 填 key + 发测试。"""
+
+    def __init__(self, app: "App"):
+        self.app = app
+        self.cfg = dict(app.cfg)
+
+        top = self.top = tk.Toplevel(app.root)
+        top.title("消息推送")
+        top.configure(bg=C_BG)
+        top.resizable(False, False)
+        top.transient(app.root)
+        apply_dialog_theme(top)
+
+        body = tk.Frame(top, bg=C_BG)
+        body.pack(fill="both", expand=True, padx=P(18), pady=(P(14), 0))
+
+        tk.Label(body, text="签到结果会推到勾选的渠道。两个都不勾 = 不推送。",
+                 font=UI_FONT_SM, bg=C_BG, fg=C_MUTED, anchor="w",
+                 justify="left", wraplength=P(500)).pack(
+            fill="x", padx=P(16), pady=(0, P(4)))
+
+        picked = set(self.cfg.get("push_channels") or [])
+        self._section(body, "推送类型")
+        self.var_wecom = tk.BooleanVar(value="wecom" in picked)
+        self.var_dingtalk = tk.BooleanVar(value="dingtalk" in picked)
+        add_checkbox(body, "企业微信群机器人", self.var_wecom)
+        add_checkbox(body, "钉钉群机器人", self.var_dingtalk)
+
+        self._section(body, "推送配置")
+        self.var_wecom_key = tk.StringVar(
+            value=str(self.cfg.get("wecom_key") or ""))
+        self.var_ding_key = tk.StringVar(
+            value=str(self.cfg.get("dingtalk_key") or ""))
+
+        self._entry(body, "企业微信 Key", self.var_wecom_key)
+        self._hint(body, "webhook 链接里 key= 后面那段。只填 key，地址程序自动拼。")
+        self._entry(body, "钉钉 Token", self.var_ding_key)
+        self._hint(body, "链接里 access_token= 后面那段；"
+                         "机器人安全设置用「自定义关键词」时需含「签到」二字。")
+
+        self.lbl_result = tk.Label(body, text="", font=UI_FONT_SM, bg=C_BG,
+                                   fg=C_MUTED, anchor="w", justify="left",
+                                   wraplength=P(500))
+        self.lbl_result.pack(fill="x", padx=P(16), pady=(P(10), 0))
+
+        bar = tk.Frame(top, bg=C_BG)
+        bar.pack(fill="x", padx=P(18), pady=P(14))
+        flat_button(bar, "发送测试", self._test).pack(side="left")
+        flat_button(bar, "取消", self.top.destroy).pack(side="right")
+        flat_button(bar, "保存", self._save, primary=True).pack(
+            side="right", padx=(0, P(8)))
+
+        center_over(app.root, top)
+        top.bind("<Escape>", lambda _e: self.top.destroy())
+        top.grab_set()
+        top.focus_set()
+
+    def _section(self, parent, text):
+        f = tk.Frame(parent, bg=C_BG)
+        f.pack(fill="x", padx=P(16), pady=(P(14), P(2)))
+        tk.Label(f, text=text, font=UI_FONT_BOLD, bg=C_BG,
+                 fg=C_TEXT).pack(side="left")
+        tk.Frame(f, bg=C_BORDER, height=P(1)).pack(
+            side="left", fill="x", expand=True, padx=(P(10), 0),
+            pady=(P(8), 0))
+
+    def _entry(self, parent, label, var):
+        row = tk.Frame(parent, bg=C_BG)
+        row.pack(fill="x", padx=P(16), pady=(P(4), 0))
+        tk.Label(row, text=label, font=UI_FONT_SM, bg=C_BG, fg=C_MUTED,
+                 width=12, anchor="w").pack(side="left")
+        ttk.Entry(row, textvariable=var, style="Wb.TEntry",
+                  width=44).pack(side="left", ipady=P(3))
+
+    def _hint(self, parent, text):
+        tk.Label(parent, text=text, font=UI_FONT_SM, bg=C_BG, fg=C_MUTED,
+                 anchor="w", justify="left", wraplength=P(500)).pack(
+            fill="x", padx=(P(16), P(16)), pady=(P(2), 0))
+
+    def _collect(self) -> dict:
+        channels = []
+        if self.var_wecom.get():
+            channels.append("wecom")
+        if self.var_dingtalk.get():
+            channels.append("dingtalk")
+        wecom = self.var_wecom_key.get().strip()
+        ding = self.var_ding_key.get().strip()
+        for name, on, key in (("企业微信", self.var_wecom.get(), wecom),
+                              ("钉钉", self.var_dingtalk.get(), ding)):
+            if on and not key:
+                raise ValueError("勾选了{}，但没有填 key。".format(name))
+        return {"push_channels": channels, "wecom_key": wecom,
+                "dingtalk_key": ding}
+
+    def _test(self):
+        try:
+            patch = self._collect()
+        except ValueError as e:
+            self.lbl_result.configure(text="⚠ {}".format(e), fg=C_BAD)
+            return
+        tmp = dict(self.cfg)
+        tmp.update(patch)
+        chans = wb_notify.selected_channels(tmp)
+        if not chans:
+            self.lbl_result.configure(
+                text="⚠ 没有可推送的渠道：勾选渠道并填 key。", fg=C_BAD)
+            return
+        self.lbl_result.configure(text="正在发送测试消息…", fg=C_MUTED)
+
+        def work():
+            pushed = wb_notify.push(
+                tmp, "【WorkBuddy 签到】🔧 测试消息：推送配置正确，链路正常。")
+            self.app.post("call", lambda: self._after_test(pushed))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_test(self, pushed):
+        text = "；".join("{}：{}".format(n, d) for n, _ok, d in pushed)
+        ok = all(o for _n, o, _d in pushed)
+        self.lbl_result.configure(text=("✅ " if ok else "❌ ") + text,
+                                  fg=C_OK if ok else C_BAD)
+        for n, _o, d in pushed:
+            self.app.log("测试推送 - {}：{}".format(n, d))
+
+    def _save(self):
+        try:
+            patch = self._collect()
+        except ValueError as e:
+            messagebox.showerror("推送设置有误", str(e), parent=self.top)
+            return
+        try:
+            wb_config.save_patch(patch)
+        except OSError as e:
+            messagebox.showerror("保存失败", str(e), parent=self.top)
+            return
+        self.cfg.update(patch)
+        self.app.apply_config(self.cfg)
+        self.app.log("推送设置已保存（{}）".format(
+            "、".join(wb_notify.label(c) for c in patch["push_channels"])
+            or "不推送"))
+        self.top.destroy()
+
+
+# ---------------- 主窗口 ----------------
+
+class Section:
+    """主界面上的一个功能区块：标题 + 状态 + 按钮行。"""
+
+    def __init__(self, app: "App", parent, index: int, title: str):
+        self.app = app
+        wrap = tk.Frame(parent, bg=C_CARD, highlightbackground=C_BORDER,
+                        highlightthickness=1)
+        wrap.pack(fill="x", padx=P(14), pady=(P(10), 0))
+        head = tk.Frame(wrap, bg=C_CARD)
+        head.pack(fill="x", padx=P(14), pady=(P(10), 0))
+        tk.Label(head, text="{}  {}".format(index, title), font=UI_FONT_BOLD,
+                 bg=C_CARD, fg=C_TEXT).pack(side="left")
+        self.lbl_status = tk.Label(head, text="", font=UI_FONT_SM, bg=C_CARD,
+                                   fg=C_MUTED)
+        self.lbl_status.pack(side="right")
+        self.lbl_detail = tk.Label(wrap, text="", font=UI_FONT_SM, bg=C_CARD,
+                                   fg=C_MUTED, anchor="w", justify="left",
+                                   wraplength=P(560))
+        self.lbl_detail.pack(fill="x", padx=P(14), pady=(P(2), 0))
+        self.btn_row = tk.Frame(wrap, bg=C_CARD)
+        self.btn_row.pack(fill="x", padx=P(12), pady=(P(8), P(10)))
+        self.buttons = []
+
+    def add(self, text, cmd, primary=False):
+        b = flat_button(self.btn_row, text, cmd, primary=primary)
+        b.pack(side="left", padx=(P(2), P(6)))
+        self.buttons.append(b)
+        return b
+
+    def set(self, status: str, detail: str = "", color: str = C_OK):
+        self.lbl_status.configure(text=status, fg=color)
+        self.lbl_detail.configure(text=detail)
 
 
 class App:
@@ -1160,150 +952,84 @@ class App:
         self.root = root
         self.q: "queue.Queue[tuple]" = queue.Queue()
         self.busy = False
-        self.last_env: dict = {}
         self.cfg = core.load_config()
-        self._fit_pending = False
+        self.sched_state = None
         self._fit_size = None
 
         root.title(APP_TITLE)
         root.configure(bg=C_BG)
-        root.geometry("{}x{}+{}+{}".format(P(600), P(440), P(120), P(80)))
 
         self._build_header()
         self._build_banner()
         self._build_cards()
         self._build_actions()
-        self._build_configbar()
+        self._build_sections()
         self._build_log()
 
-        self._fit_window()
         self.root.after(120, self._drain)
-        # 首次运行就把 config.json 落到程序旁边，用户才知道该改哪个文件
-        cfg_path = ensure_config()
+        cfg_path = wb_config.ensure_file()
         self.log("{} v{} 已启动".format(APP_TITLE, VERSION))
+        self.log("程序目录：{}".format(wb_config.SCRIPT_DIR))
+        self.log("配置文件：{}".format(cfg_path))
         self.log("系统 DPI {}（缩放 {:.0f}%）".format(
             system_dpi() or 96, PX * 100))
-        self.log("程序目录：{}".format(core.SCRIPT_DIR))
-        self.log("配置文件：{}".format(cfg_path))
-        self.log("客户端路径：{}".format(
-            core.find_workbuddy_exe(self.cfg) or "未找到"))
-        self.sched_state = None
-        self.report_config()
-        if self.cfg.get("auto_env_check", True):
-            self.start_task(self.task_env_check)
 
-    # ---------------- 窗口自适应 ----------------
-
-    def _schedule_fit(self) -> None:
-        if self._fit_pending:
-            return
-        self._fit_pending = True
-        self.root.after_idle(self._fit_window)
-
-    def _fit_window(self) -> None:
-        """按内容自适应窗口尺寸。
-
-        不同 DPI 缩放下字体实际像素宽差异很大，而状态文字是异步刷新的
-        （横幅、卡片值都会变长），写死尺寸必然被切。所以每次内容更新后
-        重新量一次，只放大不缩小，并留出屏幕边界的余量。
-        """
-        self._fit_pending = False
-        try:
-            self.root.update_idletasks()
-            w = max(self.root.winfo_reqwidth() + P(10), P(600))
-            h = max(self.root.winfo_reqheight() + P(10), P(440))
-            sw = self.root.winfo_screenwidth()
-            sh = self.root.winfo_screenheight()
-            w = min(w, int(sw * 0.94))
-            h = min(h, int(sh * 0.90))
-            if self.root.winfo_width() > 1:      # 已显示：只放大，避免抖动
-                w = max(w, self.root.winfo_width())
-                h = max(h, self.root.winfo_height())
-            if self._fit_size == (w, h):
-                # 算出来跟当前一样就别再设一次 geometry：每次设置都会触发
-                # 一次重绘，启动时环境自检会连着刷好几轮内容，白白闪几下。
-                return
-            self._fit_size = (w, h)
-            x = self.root.winfo_x()
-            y = self.root.winfo_y()
-            if x < 1:
-                x = P(120)
-            if y < 1:
-                y = P(80)
-            if x + w > sw:
-                x = max(0, sw - w)
-            if y + h > sh:
-                y = max(0, sh - h)
-            self.root.geometry("{}x{}+{}+{}".format(w, h, x, y))
-            self.root.minsize(min(P(560), sw), min(P(430), sh))
-        except Exception:
-            pass
+        self.refresh_all()
+        self.start_task(self.task_env_check, quiet=True)
 
     # ---------------- 界面搭建 ----------------
 
     def _build_header(self) -> None:
-        bar = tk.Frame(self.root, bg=C_CARD, height=P(58))
+        bar = tk.Frame(self.root, bg=C_CARD, height=P(56))
         bar.pack(fill="x")
         bar.pack_propagate(False)
-        tk.Label(bar, text=APP_TITLE, font=TITLE_FONT,
-                 bg=C_CARD, fg=C_TEXT).pack(side="left", padx=P(18))
-        self.header_right = tk.Label(bar, text="", font=UI_FONT_SM,
-                                     bg=C_CARD, fg=C_MUTED)
+        tk.Label(bar, text=APP_TITLE, font=TITLE_FONT, bg=C_CARD,
+                 fg=C_TEXT).pack(side="left", padx=P(18))
+        self.header_right = tk.Label(bar, text="v{}".format(VERSION),
+                                     font=UI_FONT_SM, bg=C_CARD, fg=C_MUTED)
         self.header_right.pack(side="right", padx=P(18))
         tk.Frame(self.root, bg=C_BORDER, height=P(1)).pack(fill="x")
 
     def _build_banner(self) -> None:
         wrap = tk.Frame(self.root, bg=C_BG)
-        wrap.pack(fill="x", padx=P(14), pady=(P(12), 0))
+        wrap.pack(fill="x", padx=P(14), pady=(P(10), 0))
         self.banner = tk.Frame(wrap, bg=BANNER["checking"][0])
         self.banner.pack(fill="x")
         inner = self.banner_inner = tk.Frame(self.banner,
                                              bg=BANNER["checking"][0])
-        inner.pack(fill="x", padx=P(14), pady=P(10))
-        self.banner_title = tk.Label(
-            inner, text=BANNER["checking"][2],
-            font=("Microsoft YaHei UI", 11, "bold"),
-            bg=BANNER["checking"][0], fg=BANNER["checking"][1], anchor="w",
-            justify="left", wraplength=P(520))
-        self.banner_title.pack(fill="x")
-        self.banner_desc = tk.Label(inner, text="", font=UI_FONT_SM,
-                                    bg=BANNER["checking"][0],
-                                    fg=BANNER["checking"][1], anchor="w",
-                                    justify="left", wraplength=P(520))
-        self.banner_desc.pack(fill="x", pady=(P(2), 0))
-        self.banner_btn = tk.Label(inner, text="", font=UI_FONT_SM,
+        inner.pack(fill="x", padx=P(14), pady=P(8))
+        self.banner_text = tk.Label(
+            inner, text="正在检测环境…", font=UI_FONT_SM,
+            bg=BANNER["checking"][0], fg=BANNER["checking"][1],
+            anchor="w", justify="left", wraplength=P(540))
+        self.banner_text.pack(side="left", fill="x", expand=True)
+        self.banner_btn = tk.Label(inner, text="", font=UI_FONT_BOLD,
                                    bg=BANNER["checking"][0],
                                    fg=BANNER["checking"][1], cursor="hand2")
-        self._banner_inner = inner
+        self._banner_action = None
 
-    def set_banner(self, level: str, title: str, desc: str = "",
+    def set_banner(self, level: str, text: str,
                    action: str = "", action_cmd=None) -> None:
-        bg, fg, _ = BANNER.get(level, BANNER["checking"])
-        for w in (self.banner, self._banner_inner, self.banner_title,
-                  self.banner_desc, self.banner_btn):
+        bg, fg = BANNER.get(level, BANNER["checking"])
+        for w in (self.banner, self.banner_inner, self.banner_text,
+                  self.banner_btn):
             w.configure(bg=bg)
-        self.banner_title.configure(text=title, fg=fg)
-        self.banner_desc.configure(text=desc, fg=fg)
+        self.banner_text.configure(text=text, fg=fg)
         if action:
-            self.banner_btn.configure(text=action, fg=fg, font=UI_FONT_BOLD)
-            self.banner_btn.pack(anchor="w", pady=(P(6), 0))
+            self.banner_btn.configure(text=action, fg=fg)
+            self.banner_btn.pack(side="right", padx=(P(12), 0))
             self.banner_btn.unbind("<Button-1>")
             if action_cmd:
                 self.banner_btn.bind("<Button-1>", lambda _e: action_cmd())
         else:
             self.banner_btn.pack_forget()
-        self._schedule_fit()
 
     def _build_cards(self) -> None:
         wrap = tk.Frame(self.root, bg=C_BG)
         wrap.pack(fill="x", padx=P(14), pady=(P(10), 0))
         self.card_values = {}
-        specs = [
-            ("今日状态", "today", "—"),
-            ("连续签到", "streak", "—"),
-            ("本期累计", "total", "—"),
-            ("活动截止", "end", "—"),
-        ]
+        specs = [("今日状态", "today", "—"), ("连续签到", "streak", "—"),
+                 ("本期累计", "total", "—"), ("活动截止", "end", "—")]
         for i, (label, key, default) in enumerate(specs):
             wrap.columnconfigure(i, weight=1, uniform="c")
             card = tk.Frame(wrap, bg=C_CARD, highlightbackground=C_BORDER,
@@ -1312,122 +1038,45 @@ class App:
                       padx=(0 if i == 0 else P(8), 0))
             tk.Label(card, text=label, font=UI_FONT_SM, bg=C_CARD,
                      fg=C_MUTED, anchor="w").pack(fill="x", padx=P(12),
-                                                  pady=(P(9), 0))
-            v = tk.Label(card, text=default, font=BIG_FONT,
-                         bg=C_CARD, fg=C_TEXT, anchor="w")
-            v.pack(fill="x", padx=P(12), pady=(0, P(10)))
+                                                  pady=(P(8), 0))
+            v = tk.Label(card, text=default, font=BIG_FONT, bg=C_CARD,
+                         fg=C_TEXT, anchor="w")
+            v.pack(fill="x", padx=P(12), pady=(0, P(9)))
             self.card_values[key] = v
 
     def _build_actions(self) -> None:
         wrap = tk.Frame(self.root, bg=C_BG)
         wrap.pack(fill="x", padx=P(14), pady=(P(12), 0))
-        row1 = tk.Frame(wrap, bg=C_BG)
-        row1.pack(fill="x")
-        row2 = tk.Frame(wrap, bg=C_BG)
-        row2.pack(fill="x", pady=(P(8), 0))
-        self.buttons = []
+        self.main_buttons = []
+        b = flat_button(wrap, "立即签到", lambda: self.start_task(self.task_checkin),
+                        primary=True, small=False)
+        b.pack(side="left", padx=(0, P(8)))
+        self.main_buttons.append(b)
+        b = flat_button(wrap, "只查状态", lambda: self.start_task(self.task_status),
+                        small=False)
+        b.pack(side="left")
+        self.main_buttons.append(b)
 
-        def add(parent, text, cmd, primary=False):
-            b = tk.Button(
-                parent, text=text, command=cmd, font=UI_FONT,
-                bg=C_PRIMARY if primary else C_CARD,
-                fg="#FFFFFF" if primary else C_TEXT,
-                activebackground=C_PRIMARY_DK if primary else "#EDEFF3",
-                activeforeground="#FFFFFF" if primary else C_TEXT,
-                relief="flat", bd=0, padx=P(16), pady=P(8), cursor="hand2",
-                highlightbackground=C_BORDER, highlightthickness=0)
-            b.pack(side="left", padx=(0, P(8)))
-            self.buttons.append(b)
-            return b
+    def _build_sections(self) -> None:
+        holder = tk.Frame(self.root, bg=C_BG)
+        holder.pack(fill="x")
 
-        add(row1, "立即签到", lambda: self.start_task(self.task_checkin),
-            primary=True)
-        add(row1, "只查状态", lambda: self.start_task(self.task_status))
-        add(row1, "环境自检", lambda: self.start_task(self.task_env_check))
-        add(row2, "定时签到", self.open_schedule)
-        add(row2, "测试推送", lambda: self.start_task(self.task_test_notify))
-        add(row2, "打开客户端", lambda: self.start_task(self.task_open_client))
-        add(row2, "设置", self.open_settings)
+        self.sec_auth = Section(self, holder, 1, "账号授权")
+        self.sec_auth.add("立即授权", lambda: self.open_auth(push=False),
+                          primary=True)
+        self.sec_auth.add("推到手机授权", lambda: self.open_auth(push=True))
+        self.sec_auth.add("导入授权", self.open_import)
 
-    def _build_configbar(self) -> None:
-        bar = tk.Frame(self.root, bg=C_CARD, highlightbackground=C_BORDER,
-                       highlightthickness=1)
-        bar.pack(fill="x", padx=P(14), pady=(P(10), 0))
-        self.cfg_summary = tk.Label(bar, text="", font=UI_FONT_SM, bg=C_CARD,
-                                    fg=C_MUTED, anchor="w", justify="left",
-                                    wraplength=P(420))
-        self.cfg_summary.pack(side="left", padx=P(12), pady=P(8))
-        link = tk.Label(bar, text="修改设置", font=UI_FONT_SM, bg=C_CARD,
-                        fg=C_PRIMARY, cursor="hand2")
-        link.pack(side="right", padx=P(12))
-        link.bind("<Button-1>", lambda _e: self.open_settings())
+        self.sec_sched = Section(self, holder, 2, "每日定时")
+        self.sec_sched.add("设置定时", self.open_schedule, primary=True)
 
-    def report_config(self) -> None:
-        c = self.cfg
-        chans = core.configured_channels(c)
-        # 账号直连模式下"自动拉起/隐藏窗口/签到后关闭"三项都失效，
-        # 摆出来只会让人以为设置没生效，所以换成直连自己的状态。
-        if core.auth_mode_of(c) == "oauth":
-            tok = wb_oauth.summary(core.oauth_token_path(c))
-            if not tok.get("present"):
-                st = "未授权"
-            elif tok.get("disabled") or tok.get("expired"):
-                st = "授权已失效"
-            else:
-                days = tok.get("days_left")
-                st = "已授权" + ("（剩 {} 天）".format(days)
-                                if days is not None else "")
-            bits = [
-                "登录方式 账号直连（无需客户端）",
-                "账号授权 {}".format(st),
-                "定时 {}".format(self._schedule_summary()),
-                "推送 {}".format("＋".join(chans) if chans else "关"),
-            ]
-        else:
-            bits = [
-                "登录方式 客户端通道",
-                "定时 {}".format(self._schedule_summary()),
-                "自动拉起 {}".format("开" if c.get("launch_workbuddy") else "关"),
-                "隐藏窗口 {}".format("开" if c.get("hide_window") else "关"),
-                "签到后关闭 {}".format("开" if c.get("close_after_checkin") else "关"),
-                "推送 {}".format("＋".join(chans) if chans else "关"),
-            ]
-        self.cfg_summary.configure(text="　·　".join(bits))
-        self._schedule_fit()
-
-    def _schedule_summary(self) -> str:
-        """主界面摘要里的定时状态文案。"""
-        c = self.cfg
-        if not c.get("schedule_enabled"):
-            return "未启用"
-        txt = "、".join(schedule_times_of(c)) or "已启用"
-        jit = int(c.get("schedule_jitter", 0) or 0)
-        if jit:
-            txt += "（±{}分）".format(jit)
-        st = getattr(self, "sched_state", None)
-        if st:
-            if not st.get("exists"):
-                txt += " · 未注册到系统"
-            elif st.get("stale"):
-                txt += " · 任务路径已失效"
-            elif st.get("next_run"):
-                txt += " · 下次 " + short_time(str(st["next_run"]))
-            else:
-                # 快速查询读不到运行记录（下次运行时间在 XML 里没有），
-                # 能确认的只有"系统里确实注册着"
-                txt += " · 已注册"
-        return txt
-
-    def apply_config(self, cfg: dict) -> None:
-        self.cfg = cfg
-        self.report_config()
-        self.last_env = {}
-        if cfg.get("auto_env_check", True):
-            self.start_task(self.task_env_check)
+        self.sec_push = Section(self, holder, 3, "消息推送")
+        self.sec_push.add("设置推送", self.open_notify, primary=True)
+        self.sec_push.add("发送测试", lambda: self.start_task(self.task_test_notify))
 
     def _build_log(self) -> None:
         wrap = tk.Frame(self.root, bg=C_BG)
-        wrap.pack(fill="both", expand=True, padx=P(14), pady=(P(12), P(12)))
+        wrap.pack(fill="both", expand=True, padx=P(14), pady=(P(10), P(12)))
         head = tk.Frame(wrap, bg=C_BG)
         head.pack(fill="x")
         tk.Label(head, text="运行日志", font=UI_FONT_SM, bg=C_BG,
@@ -1438,19 +1087,97 @@ class App:
         link.bind("<Button-1>", lambda _e: self.open_log())
         self.logbox = scrolledtext.ScrolledText(
             wrap, font=MONO_FONT, bg="#FFFFFF", fg="#2A2E35", relief="flat",
-            height=11, wrap="word", padx=P(10), pady=P(8),
+            height=8, wrap="word", padx=P(10), pady=P(8),
             highlightbackground=C_BORDER, highlightthickness=1)
         self.logbox.pack(fill="both", expand=True, pady=(P(6), 0))
         self.logbox.configure(state="disabled")
 
+    # ---------------- 状态刷新 ----------------
+
+    def refresh_all(self) -> None:
+        self.refresh_auth()
+        self.refresh_push()
+        self.refresh_schedule_state()
+
+    def refresh_auth(self) -> None:
+        info = wb_oauth.summary(core.oauth_token_path(self.cfg))
+        if not info.get("present"):
+            self.sec_auth.set("● 未授权", "还没有登录过，先点「立即授权」"
+                                         "（或让服务器发链接到手机）。", C_BAD)
+            return
+        if info.get("error"):
+            self.sec_auth.set("● 令牌异常", str(info["error"]), C_BAD)
+            return
+        if info.get("disabled") or info.get("expired"):
+            self.sec_auth.set("● 已失效", "登录会话过期了，重新授权一次即可。",
+                              C_BAD)
+            return
+        who = info.get("nickname") or "已授权账号"
+        uid = str(info.get("uid") or "")
+        days = info.get("days_left")
+        expire = info.get("expires_text") or ""
+        detail = "{}{}".format(who, "（uid {}…）".format(uid[:8]) if uid else "")
+        if expire:
+            detail += "　令牌有效期至 {}（剩 {} 天，到期前自动续期）".format(
+                expire, days if days is not None else "?")
+        self.sec_auth.set(
+            "● 已授权", detail,
+            C_OK if (days is None or days > 3) else C_WARN)
+
+    def refresh_push(self) -> None:
+        chans = wb_notify.selected_channels(self.cfg)
+        picked = [wb_notify.label(c) for c in (self.cfg.get("push_channels") or [])]
+        if not picked:
+            self.sec_push.set("● 未启用", "不推送签到结果。", C_MUTED)
+            return
+        if not chans:
+            self.sec_push.set(
+                "● 配置不完整",
+                "已勾选 {}，但 key 没填对，实际不会推送。".format(
+                    "、".join(wb_notify.label(c) for c in picked)), C_BAD)
+            return
+        self.sec_push.set("● " + "＋".join(wb_notify.label(c) for c in chans),
+                          "签到结果推送到：{}".format(
+                              "、".join(wb_notify.label(c) for c in chans)))
+
+    def refresh_schedule_state(self) -> None:
+        """读一次系统计划任务状态（用 query_fast，直读 XML，约 0.5 毫秒）。"""
+        if not self.cfg.get("schedule_enabled"):
+            self.sched_state = None
+            self.sec_sched.set("● 未启用", "每天不会自动签到，只能手动点。", C_MUTED)
+            return
+        info = wb_task.query_fast()
+        prog, _args = wb_task.launcher()
+        info["stale"] = bool(
+            info.get("exists")
+            and os.path.normcase(str(info.get("command") or ""))
+            != os.path.normcase(prog))
+        self.sched_state = info
+        times = "、".join(info.get("times") or []) or "?"
+        jit = int(info.get("jitter_minutes") or 0)
+        plan = "每天 {}{}".format(times, "（±{} 分）".format(jit) if jit else "")
+        if not info.get("exists"):
+            self.sec_sched.set("● 未注册", "配置里启用了，但系统里没有这个任务，"
+                                          "点「设置定时」→「应用到系统」。", C_BAD)
+        elif info["stale"]:
+            self.sec_sched.set("● 路径失效", "{}，但任务指向的不是当前程序，"
+                                            "重新应用一次即可。".format(plan), C_WARN)
+        else:
+            self.sec_sched.set("● 已启用", plan + "　由 Windows 计划任务触发，"
+                                                    "本程序不用常驻。")
+
+    def apply_config(self, cfg: dict) -> None:
+        self.cfg = cfg
+        self.refresh_all()
+
     # ---------------- 线程与消息 ----------------
 
-    def start_task(self, fn) -> None:
+    def start_task(self, fn, quiet: bool = False) -> None:
         if self.busy:
             self.log("上一个任务还在跑，稍等一下…")
             return
         self.busy = True
-        self._set_buttons(False)
+        self._set_buttons(False, quiet=quiet)
         threading.Thread(target=self._guard(fn), daemon=True).start()
 
     def _guard(self, fn):
@@ -1463,9 +1190,11 @@ class App:
                 self.q.put(("busy", False))
         return run
 
-    def _set_buttons(self, enabled: bool) -> None:
+    def _set_buttons(self, enabled: bool, quiet: bool = False) -> None:
+        if quiet:
+            return
         state = "normal" if enabled else "disabled"
-        for b in self.buttons:
+        for b in self.main_buttons:
             b.configure(state=state)
 
     def post(self, kind: str, payload=None) -> None:
@@ -1480,17 +1209,16 @@ class App:
                 kind, payload = self.q.get_nowait()
                 if kind == "log":
                     self._append_log(payload)
-                elif kind == "env":
-                    self._apply_env(payload)
                 elif kind == "banner":
                     self.set_banner(*payload)
                 elif kind == "cards":
                     self._apply_cards(payload)
+                elif kind == "refresh":
+                    self.refresh_all()
                 elif kind == "busy":
                     self.busy = payload
                     self._set_buttons(not payload)
                 elif kind == "call":
-                    # 让后台线程能安全地把回调挪回主线程执行
                     try:
                         payload()
                     except Exception:
@@ -1516,8 +1244,7 @@ class App:
         elif "today_checked_in" in res:
             done = bool(res.get("today_checked_in"))
             self.card_values["today"].configure(
-                text="已签到" if done else "未签到",
-                fg=C_OK if done else C_BAD)
+                text="已签到" if done else "未签到", fg=C_OK if done else C_BAD)
         if res.get("streak_days") is not None:
             self.card_values["streak"].configure(
                 text="{} 天".format(res.get("streak_days")))
@@ -1528,146 +1255,59 @@ class App:
             self.card_values["end"].configure(
                 text=self._fmt_end(str(res["end_time"])))
         self.header_right.configure(
-            text="最后更新 {}".format(time.strftime("%H:%M:%S")))
-        self._schedule_fit()
+            text="v{}　最后更新 {}".format(VERSION, time.strftime("%H:%M:%S")))
 
     @staticmethod
     def _fmt_end(raw: str) -> str:
-        """把 '2026-10-15 23:59:59' 压成 '10/15 23:59'，解析不了就原样回显。"""
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
             try:
-                return time.strftime("%m/%d %H:%M",
-                                     time.strptime(raw, fmt))
+                return time.strftime("%m/%d %H:%M", time.strptime(raw, fmt))
             except ValueError:
                 continue
         return raw
 
-    def _apply_env(self, env: dict) -> None:
-        self.last_env = env or {}
-        code = env.get("code")
-        exe = env.get("exe_path") or ""
-        if code == "OK":
-            if env.get("auth_mode") == "oauth":
-                tok = env.get("oauth_token") or {}
-                who = tok.get("nickname") or "已授权账号"
-                days = tok.get("days_left")
-                self.set_banner(
-                    "ok", "环境正常：账号直连（不需要客户端）",
-                    "账号 {}{}　直接调接口签到，与客户端是否运行无关。".format(
-                        who, "　令牌剩 {} 天".format(days)
-                        if days is not None else ""))
-            else:
-                acct = env.get("account") or {}
-                who = acct.get("nickname") or (acct.get("uid", "")[:8] + "…")
-                self.set_banner(
-                    "ok", "环境正常：客户端已运行并已登录",
-                    "账号 {}　宿主通道可用，随时可以签到。".format(who))
-        elif code == "OAUTH_NOT_AUTHORIZED":
-            self.set_banner(
-                "error", "账号直连尚未授权",
-                "这种方式不需要客户端，但要先完成一次浏览器登录换取令牌。"
-                "点下面按钮开始，登录完会自动关闭授权窗口。",
-                action="  立即授权  ", action_cmd=self._oauth_click)
-        elif code in ("OAUTH_SESSION_DEAD", "OAUTH_TOKEN_BAD"):
-            self.set_banner(
-                "error", "授权已失效",
-                "{}　重新授权一次即可恢复。".format(env.get("message", "")),
-                action="  重新授权  ", action_cmd=self._oauth_click)
-        elif code == "OAUTH_NETWORK":
-            self.set_banner(
-                "warn", "网络不通，暂时无法签到",
-                "{}　检查代理或防火墙后点「环境自检」重试。".format(
-                    env.get("message", "")),
-                action="  重新自检  ",
-                action_cmd=lambda: self.start_task(self.task_env_check))
-        elif code == "CLIENT_NOT_RUNNING":
-            self.set_banner(
-                "warn", "客户端已安装，但当前没有运行",
-                "已找到：{}\n签到需要客户端注入鉴权，点下面按钮启动它"
-                "（是否隐藏窗口由设置决定）。".format(exe),
-                action="  打开客户端并签到  ",
-                action_cmd=self._open_client_click)
-        elif code == "NO_CLIENT":
-            self.set_banner(
-                "error", "未找到 WorkBuddy 客户端",
-                "本机没有探测到 WorkBuddy.exe。若已安装但装在特殊位置，"
-                "请在「设置」里手动指定客户端路径。",
-                action="  打开设置  ", action_cmd=self.open_settings)
-        elif code == "NO_ENDPOINT":
-            self.set_banner(
-                "warn", "客户端在运行，但宿主通道还没就绪",
-                "可能仍在启动。等几秒后点「环境自检」重试；"
-                "若长时间不动，可用「打开客户端」重新唤起。",
-                action="  重新自检  ",
-                action_cmd=lambda: self.start_task(self.task_env_check))
-        elif code == "NO_MODULE":
-            self.set_banner(
-                "error", "缺少内置模块，无法连接客户端",
-                "{}这通常不是没装客户端，而是客户端文件不完整或版本过旧。"
-                "重装或升级客户端后，点下面按钮重新自检即可。".format(
-                    env.get("message", "")),
-                action="  重新自检  ",
-                action_cmd=lambda: self.start_task(self.task_env_check))
-        elif code == "NOT_LOGGED_IN":
-            self.set_banner(
-                "error", "客户端未登录",
-                "{}　请在客户端里完成登录后再回来签到。".format(
-                    env.get("message", "")),
-                action="  打开客户端  ", action_cmd=self._open_client_click)
-        else:
-            self.set_banner(
-                "error", "检测异常：{}".format(code),
-                env.get("message", ""),
-                action="  重新自检  ",
-                action_cmd=lambda: self.start_task(self.task_env_check))
-
     # ---------------- 具体任务 ----------------
 
     def task_env_check(self) -> None:
-        self.post("banner", ("checking", "正在检测环境…", "", "", None))
         self.log("开始环境自检…")
         env = core.detect_env(deep=True, cfg=self.cfg)
         for name, val in env.get("steps", []):
             self.log("  {}：{}".format(name, val))
         if env.get("message"):
             self.log("  → {}".format(env["message"]))
-        self.post("env", env)
+        # tkinter 不允许跨线程碰控件，横幅必须挪回主线程刷
+        self.post("call", lambda: self._apply_env(env))
         if env.get("status_data"):
             self.post("cards", {"result": "STATUS", **env["status_data"]})
-        self.refresh_schedule_state(log_it=True)
+        self.post("refresh")
 
-    def refresh_schedule_state(self, log_it: bool = False) -> None:
-        """读一次系统计划任务状态（本方法可能跑在后台线程里）。
-
-        用 query_fast（直读任务定义 XML，约 0.5 毫秒）而不是 query()：
-        后者每次都要拉起 PowerShell 并重新加载 ScheduledTasks 模块，
-        本机实测单次 5 秒——挂在启动自检上，就是"开程序后横幅转半天、
-        按钮一直灰着"的元凶。这里只需要 exists / command，XML 里都有。
-        下次运行时间、上次结果这类运行记录只在「定时签到」对话框里按需查。
-        """
-        if not self.cfg.get("schedule_enabled"):
-            self.sched_state = None
-            self.post("call", self.report_config)
-            return
-        info = wb_task.query_fast()
-        prog, _args = wb_task.launcher()
-        info["stale"] = bool(
-            info.get("exists")
-            and os.path.normcase(str(info.get("command") or ""))
-            != os.path.normcase(prog))
-        self.sched_state = info
-        if log_it:
-            if not info.get("exists"):
-                self.log("定时任务：配置已启用，但系统里尚未注册"
-                         "（点「定时签到」→「应用到系统」）")
-            elif info["stale"]:
-                self.log("定时任务：系统任务的程序路径与当前不一致，需重新应用")
-            else:
-                times = "、".join(info.get("times") or []) or "?"
-                jit = int(info.get("jitter_minutes") or 0)
-                self.log("定时任务：已注册，每天 {}{}".format(
-                    times, "（±{} 分）".format(jit) if jit else ""))
-        self.post("call", self.report_config)
+    def _apply_env(self, env: dict) -> None:
+        code = env.get("code")
+        tok = env.get("oauth_token") or {}
+        if code == "OK":
+            who = tok.get("nickname") or "已授权账号"
+            days = tok.get("days_left")
+            self.set_banner(
+                "ok", "环境正常　账号 {}{}　可以直接签到。".format(
+                    who, "，令牌剩 {} 天".format(days) if days is not None else ""))
+        elif code == "OAUTH_NOT_AUTHORIZED":
+            self.set_banner(
+                "error", "尚未授权　点右边开始登录（只需一次）。",
+                "  立即授权  ", lambda: self.open_auth(push=False))
+        elif code in ("OAUTH_SESSION_DEAD", "OAUTH_TOKEN_BAD"):
+            self.set_banner(
+                "error", "授权已失效　{}　重新授权一次即可恢复。".format(
+                    env.get("message", "")),
+                "  重新授权  ", lambda: self.open_auth(push=False))
+        elif code == "OAUTH_NETWORK":
+            self.set_banner(
+                "warn", "网络不通　{}　检查代理或防火墙后重试。".format(
+                    env.get("message", "")),
+                "  重新自检  ", lambda: self.start_task(self.task_env_check))
+        else:
+            self.set_banner(
+                "error", "检测异常：{}　{}".format(code, env.get("message", "")),
+                "  重新自检  ", lambda: self.start_task(self.task_env_check))
 
     def task_status(self) -> None:
         self.log("查询今日签到状态…")
@@ -1676,16 +1316,15 @@ class App:
         self.log("结果：{}".format(json.dumps(res, ensure_ascii=False)))
         self.post("cards", res)
         if res.get("result") in ("STATUS", "ALREADY_CLAIMED", "INACTIVE"):
-            self.set_banner(
-                "ok", "状态查询完成",
-                "连续 {} 天，本期累计 {} 积分。".format(
-                    res.get("streak_days", "?"),
-                    res.get("total_credits", "?")))
+            self.post("banner", ("ok", "状态查询完成　连续 {} 天，本期累计 {} 积分。"
+                                 .format(res.get("streak_days", "?"),
+                                         res.get("total_credits", "?")), "", None))
+        else:
+            self._report_failure(res)
 
     def task_checkin(self) -> None:
         self.log("开始签到…")
-        self.post("banner", ("checking", "正在签到…",
-                             "如客户端未运行会按设置自动拉起。", "", None))
+        self.post("banner", ("checking", "正在签到…", "", None))
         res = core.run_once(self.cfg, check_only=False, progress=self.log)
         self.log("结果：{}".format(json.dumps(res, ensure_ascii=False)))
         self.post("cards", res)
@@ -1693,93 +1332,66 @@ class App:
         if code == "CLAIMED":
             amount = res.get("credit", res.get("credits",
                            res.get("today_credit", "?")))
-            self.set_banner(
-                "ok", "✅ 签到成功，+{} 积分".format(amount),
-                "连续 {} 天，本期累计 {} 积分。".format(
-                    res.get("streak_days", "?"),
-                    res.get("total_credits", "?")))
+            self.post("banner", ("ok", "✅ 签到成功，+{} 积分　连续 {} 天，"
+                                 "本期累计 {} 积分。".format(
+                                     amount, res.get("streak_days", "?"),
+                                     res.get("total_credits", "?")), "", None))
         elif code == "ALREADY_CLAIMED":
-            self.set_banner(
-                "ok", "今天已经签过了，无需重复领取",
-                "连续 {} 天，本期累计 {} 积分。".format(
-                    res.get("streak_days", "?"),
-                    res.get("total_credits", "?")))
+            self.post("banner", ("ok", "今天已经签过了　连续 {} 天，"
+                                 "本期累计 {} 积分。".format(
+                                     res.get("streak_days", "?"),
+                                     res.get("total_credits", "?")), "", None))
         elif code == "INACTIVE":
-            self.set_banner("warn", "当前没有进行中的签到活动", "")
+            self.post("banner", ("warn", "当前没有进行中的签到活动", "", None))
         else:
-            self.set_banner(
-                "error", "签到失败：{}".format(code),
-                res.get("message", ""),
-                action="  重新自检  ",
-                action_cmd=lambda: self.start_task(self.task_env_check))
+            self._report_failure(res)
+
+    def _report_failure(self, res: dict) -> None:
+        code = res.get("result")
+        auth_like = code in ("OAUTH_NOT_LOGGED_IN", "OAUTH_SESSION_DEAD",
+                             "OAUTH_TOKEN_BAD", "OAUTH_NO_REFRESH")
+        if auth_like:
+            self.post("banner", ("error", "签到失败：授权无效　{}".format(
+                res.get("message", "")), "  重新授权  ",
+                lambda: self.open_auth(push=False)))
+        else:
+            self.post("banner", ("error", "签到失败：{}　{}".format(
+                code, res.get("message", "")), "  重新自检  ",
+                lambda: self.start_task(self.task_env_check)))
 
     def task_test_notify(self) -> None:
-        chans = core.configured_channels(self.cfg)
+        chans = wb_notify.selected_channels(self.cfg)
         if not chans:
-            self.set_banner("warn", "尚未配置推送渠道",
-                            "请在「设置」里填企业微信或钉钉机器人的 key。",
-                            action="  打开设置  ",
-                            action_cmd=self.open_settings)
+            self.post("banner", ("warn", "还没有可用的推送渠道　先在「消息推送」里"
+                                 "选渠道并填 key。", "  设置推送  ", self.open_notify))
             return
-        self.log("发送测试消息到：{}…".format("、".join(chans)))
-        pushed = core.push_all(
+        self.log("发送测试消息到：{}…".format(
+            "、".join(wb_notify.label(c) for c in chans)))
+        pushed = wb_notify.push(
             self.cfg, "【WorkBuddy 签到】🔧 测试消息：推送配置正确，链路正常。")
         for name, _ok, detail in pushed:
             self.log("{}：{}".format(name, detail))
         failed = [n for n, ok, _d in pushed if not ok]
         if not failed:
-            self.set_banner("ok", "测试消息已发送",
-                            "请查看：{}。".format("、".join(chans)))
+            self.post("banner", ("ok", "测试消息已发送　请查看：{}。".format(
+                "、".join(n for n, _o, _d in pushed)), "", None))
         else:
-            self.set_banner("warn", "推送未成功",
-                            "{} 失败，请在「设置」里检查 key。".format(
-                                "、".join(failed)),
-                            action="  打开设置  ",
-                            action_cmd=self.open_settings)
+            self.post("banner", ("warn", "推送未成功：{}　检查 key。".format(
+                "、".join(failed)), "  设置推送  ", self.open_notify))
 
-    def _open_client_click(self) -> None:
-        self.start_task(self.task_open_client)
+    # ---------------- 弹窗 ----------------
 
-    def _oauth_click(self) -> None:
-        """首页横幅上的「立即授权」：走完授权后顺手重做一次自检。"""
-        def done():
-            self.log("授权流程结束，重新自检…")
-            self.start_task(self.task_env_check)
-        OAuthLoginDialog(self, cfg=self.cfg, on_done=done)
-
-    def task_open_client(self) -> None:
-        self.log("正在打开 WorkBuddy 客户端…")
-        ok, why = core.launch_workbuddy(self.cfg)
-        self.log(why)
-        if not ok:
-            self.set_banner("error", "打开客户端失败", why,
-                            action="  打开设置  ",
-                            action_cmd=self.open_settings)
-            return
-        if self.cfg.get("hide_window", True):
-            hid, note = core.hide_host_window(self.cfg)
-            self.log("窗口隐藏：{}".format(note))
-        self.log("等待宿主通道就绪…")
-        for _ in range(40):
-            time.sleep(3)
-            env = core.detect_env(deep=True, cfg=self.cfg)
-            if env.get("code") == "OK":
-                self.post("env", env)
-                if env.get("status_data"):
-                    self.post("cards",
-                              {"result": "STATUS", **env["status_data"]})
-                self.log("宿主通道已就绪。")
-                return
-        self.set_banner("warn", "打开后仍未就绪",
-                        "客户端可能还在启动或未登录，请稍后点「环境自检」。")
-
-    # ---------------- 杂项 ----------------
-
-    def open_settings(self) -> None:
+    def open_auth(self, push: bool = False) -> None:
         try:
-            SettingsDialog(self)
+            AuthDialog(self, push=push, on_done=self.refresh_all)
         except Exception:
-            self.log("打开设置失败：\n" + traceback.format_exc())
+            self.log("打开授权窗口失败：\n" + traceback.format_exc())
+
+    def open_import(self) -> None:
+        try:
+            ImportDialog(self, on_done=self.refresh_all)
+        except Exception:
+            self.log("打开导入窗口失败：\n" + traceback.format_exc())
 
     def open_schedule(self) -> None:
         try:
@@ -1787,62 +1399,53 @@ class App:
         except Exception:
             self.log("打开定时设置失败：\n" + traceback.format_exc())
 
+    def open_notify(self) -> None:
+        try:
+            NotifyDialog(self)
+        except Exception:
+            self.log("打开推送设置失败：\n" + traceback.format_exc())
+
     def open_log(self) -> None:
-        if not core.LOG_PATH.exists():
+        if not wb_config.LOG_PATH.exists():
             try:
-                core.LOG_PATH.touch()
+                wb_config.LOG_PATH.touch()
             except OSError:
                 pass
         try:
-            os.startfile(str(core.LOG_PATH))  # noqa
+            os.startfile(str(wb_config.LOG_PATH))  # noqa
         except OSError as e:
             self.log("打开日志失败：{}".format(e))
 
 
-def selftest() -> int:
-    """无界面自检：把检测结果写到程序目录的 selftest.json。
+# ---------------- 无界面入口 ----------------
 
-    打包后排查"为什么提示检测不到客户端"，用它最直接：
-        WorkBuddyCheckin.exe --selftest
-    """
+def selftest() -> int:
+    """无界面自检：把结果写到程序目录的 selftest.json（排查环境问题用）。"""
     enable_dpi_awareness()
-    out = {"version": VERSION, "system_dpi": system_dpi(),
-           "scale_percent": round((system_dpi() or 96) / 96.0 * 100),
-           "config_path": str(core.CONFIG_PATH),
-           "script_dir": str(core.SCRIPT_DIR)}
+    cfg = core.load_config()
+    out = {
+        "version": VERSION,
+        "system_dpi": system_dpi(),
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "app_dir": str(wb_config.SCRIPT_DIR),
+        "config_path": str(wb_config.config_path()),
+        "token_file": core.oauth_token_path(cfg),
+        "push_channels": wb_notify.selected_channels(cfg),
+    }
     try:
-        out["env"] = core.detect_env(deep=True)
+        out["env"] = core.detect_env(deep=True, cfg=cfg)
     except Exception:
         out["env_error"] = traceback.format_exc()
     try:
-        import wb_host
-        out["host"] = {
-            "pids": wb_host.pids_of(),
-            "running_exe": wb_host.running_exe_path(),
-            "installed_candidates": wb_host.installed_exe_candidates(),
-        }
+        out["token"] = wb_oauth.summary(core.oauth_token_path(cfg))
     except Exception:
-        out["host_error"] = traceback.format_exc()
-    out["frozen"] = bool(getattr(sys, "frozen", False))
-    cfg = core.load_config()
-    out["install_root"] = core.install_root(cfg) or None
-    out["auth_mode"] = core.auth_mode_of(cfg)
-    if out["auth_mode"] == "oauth":
-        # 直连模式跟内置模块无关，硬去扫盘只会浪费时间并制造误判线索
-        out["oauth_token"] = wb_oauth.summary(core.oauth_token_path(cfg))
-    else:
-        # 候选目录逐条体检：哪条存在、哪条真的含 workbuddy_ipc 包，
-        # 是"找不到模块"这类问题唯一能一眼看明白的证据。
-        out["module_roots"] = core.probe_module_roots(cfg)
-        try:
-            ipc, root = core.load_ipc(cfg)
-            out["ipc_module_ok"] = root
-        except Exception as e:
-            out["ipc_module_error"] = "{}: {}".format(type(e).__name__, e)
-        out["ipc_import_errors"] = list(core.IPC_IMPORT_ERRORS)
-        out["ipc_search_trace"] = list(core.IPC_SEARCH_TRACE)
+        out["token_error"] = traceback.format_exc()
     try:
-        (core.SCRIPT_DIR / "selftest.json").write_text(
+        out["schedule"] = wb_task.query_fast()
+    except Exception:
+        out["schedule_error"] = traceback.format_exc()
+    try:
+        (wb_config.SCRIPT_DIR / "selftest.json").write_text(
             json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
         return 0
     except OSError:
@@ -1851,26 +1454,33 @@ def selftest() -> int:
 
 # 这些参数表示「无界面执行」，绝不能创建窗口
 HEADLESS_FLAGS = ("--run", "--check-only", "--diagnose", "--test-notify",
-                  "--login-oauth")
+                  "--auth", "--auth-push", "--import-token", "--pull-token")
 
 
 def _redirect_output() -> None:
-    """无界面模式：把 stdout/stderr 无条件接到 UTF-8 的日志文件。
+    """无界面模式：既要保证输出不会把进程搞崩，也别吞掉用户要看的输出。
 
-    有两个真实存在、且都会导致「签到明明成功、退出码却是非 0」的坑，
+    两个真实存在的坑，都会导致「签到明明成功、退出码却是非 0」，
     从而被计划任务标记成失败：
+      1) --windowed 打包后 sys.stdout / sys.stderr 可能是 None，print 直接抛异常；
+      2) 即使存在，也可能是 GBK 文本流，中文 / emoji 触发 UnicodeEncodeError。
 
-      1) PyInstaller --windowed 打包后，sys.stdout / sys.stderr 可能是 None，
-         此时任何 print() 直接抛 AttributeError；
-      2) 即使 stdout 存在（例如被无控制台方式启动时仍是 GBK 文本流），
-         中文和 emoji 会触发 UnicodeEncodeError。
-
-    所以这里不判断、不保留原始流，统一重定向。
+    所以分两种情况：
+      * 流不存在（计划任务拉起 exe）→ 重定向到 UTF-8 的 checkin.log；
+      * 流存在（终端里手敲、或 `--json` 接管道）→ 就地改成 UTF-8 + replace，
+        保留输出能力。以前无条件重定向，`exe --json | jq` 会一个字都拿不到。
     """
+    if sys.stdout is not None and sys.stderr is not None:
+        for s in (sys.stdout, sys.stderr):
+            try:
+                s.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        return
     stream = None
     try:
-        stream = open(core.SCRIPT_DIR / "checkin.log", "a",
-                      encoding="utf-8", errors="replace", buffering=1)
+        stream = open(wb_config.LOG_PATH, "a", encoding="utf-8",
+                      errors="replace", buffering=1)
     except OSError:
         try:
             stream = open(os.devnull, "w", encoding="utf-8")
@@ -1881,7 +1491,6 @@ def _redirect_output() -> None:
 
 
 def run_headless(argv: list) -> int:
-    """无界面执行签到（由 Windows 计划任务调起），全程不创建任何窗口。"""
     _redirect_output()
     return core.main(argv)
 
@@ -1890,11 +1499,7 @@ SCHED_FLAG = "--sched-status"
 
 
 def sched_status() -> int:
-    """无界面查看计划任务状态（排查「定时不生效」用，不弹任何窗口）。
-
-    windowed exe 自身没有控制台，print 出去没人看得见，所以结果同时落进
-    checkin.log —— 这也是「定时不生效怎么查」里最省事的一步。
-    """
+    """无界面查看计划任务状态（排查「定时不生效」用，不弹窗口）。"""
     info = wb_task.query()
     desc, ok = wb_task.describe_last_result(info.get("last_result"))
     if not info.get("exists"):
@@ -1912,10 +1517,10 @@ def sched_status() -> int:
         ])
     try:
         print(text)
-    except Exception:                      # 无控制台时 print 可能失败，忽略
+    except Exception:
         pass
     try:
-        with open(core.SCRIPT_DIR / "checkin.log", "a", encoding="utf-8",
+        with open(wb_config.LOG_PATH, "a", encoding="utf-8",
                   errors="replace") as fh:
             fh.write("== 定时状态 ==\n" + text + "\n")
     except OSError:
@@ -1929,16 +1534,19 @@ def main() -> int:
         return selftest()
     if SCHED_FLAG in argv:
         return sched_status()
-    # 计划任务/命令行入口：走这条分支时绝不能弹窗，否则到点会打断用户
     if any(a in HEADLESS_FLAGS for a in argv):
         return run_headless(argv)
 
     # 关键顺序：先声明 DPI 感知，再创建 Tk
     enable_dpi_awareness()
     root = tk.Tk()
-    cfg = core.load_config()
-    apply_tk_scaling(root, int(cfg.get("ui_scale", 0) or 0))
+    apply_tk_scaling(root)
     App(root)
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    w = min(P(640), int(sw * 0.94))
+    h = min(P(760), int(sh * 0.90))
+    root.geometry("{}x{}+{}+{}".format(w, h, P(120), max(0, P(40))))
+    root.minsize(min(P(600), sw), min(P(560), sh))
     root.mainloop()
     return 0
 

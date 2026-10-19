@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 APP_ID = "WorkBuddyCheckin"          # 目录名 / 计划任务名 / 产物名，全英文
 APP_TITLE = "WorkBuddy 签到"
-VERSION = "3.1.1"                    # 唯一版本号来源，打包时也读这里
+VERSION = "3.2.0"                    # 唯一版本号来源，打包时也读这里
 RELEASE_DATE = "2026-10-19"
 
 TOKEN_FILE_NAME = "auth_oauth.json"
@@ -71,6 +71,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "auth_wait_seconds": 180,
     "auth_attempts": 3,
     "auth_backoff_seconds": 60,
+    # 服务端授权时自己开无头浏览器取微信二维码（需要 playwright）。
+    # 设 false = 只推授权链接——手机点开登录拿不到令牌，仅排障用。
+    "auth_qr": True,
     # 令牌剩余天数 <= 该值时，每次签到后额外推一条续期提醒（界面不暴露，
     # 需要改就改 config.json；设 0 = 关闭提醒）
     "expiry_warn_days": 2,

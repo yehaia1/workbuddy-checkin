@@ -5,9 +5,21 @@
 和 Windows 版的关系
 ------------------
 Windows 版是 exe：GUI 配置，计划任务调 `WorkBuddyCheckin.exe --run`。
-服务端版是脚本：没有界面、没有浏览器，全靠推送把授权链接送到手机上。
+服务端版是脚本：没有界面，靠推送把**二维码图片链接**发到企业微信/钉钉。
 
     python3 wb_server.py                  # 日常：该授权就授权，然后签到
+
+为什么推二维码而不是推授权链接
+------------------------------
+授权链接打开的是网页，登录动作在那个网页里完成，最后由**页面自己**回调
+`/console/auth/login` 把 state 标记成「已完成」——登录态落在打开它的那个
+浏览器里。把链接转发到手机上，服务端进程始终是旁观者，轮询一直停在 11217。
+
+所以服务端自己开一个无头浏览器（wb_qrlogin）打开授权页，把页面里的微信
+二维码链接取出来推给用户（微信那张二维码本身就是公网图片，不用上传图床，
+也不用在服务器上开端口暴露文件）。扫码是微信内部完成的，页面跳转发生在我们
+控制的浏览器里，令牌就落到服务端手上。浏览器**只在缺授权时**才启动，拿到
+令牌立刻关掉，日常签到完全不碰。
 
 配置跟着脚本走
 --------------
@@ -20,9 +32,10 @@ workbuddy_checkin.py / wb_server.py + config.json）拷到服务器上就能跑�
 --------------
 1. 检查授权：令牌不存在 / 损坏 / 会话失效 → 进入授权流程
 2. 授权流程（最多 3 轮，指数退避）：
-      申请会话 → 推送链接到企业微信/钉钉 → 等 180 秒
+      申请会话 → 无头浏览器取二维码链接 → 推到企业微信/钉钉 → 等 180 秒
       等不到就隔 60 秒再来一轮（等 180 秒），再等 120 秒 → 第三轮
       等待期间用户随时可以回来改 config.json（每轮都会重读配置）
+      没有 playwright 时退回推授权页链接（--no-qr 可强制，仅排障用）
 3. 拿到授权后立刻签到，并把结果推到同一批渠道
 4. 全部失败则推一条失败通知，退出码非 0（cron 会因此报警）
 
@@ -34,7 +47,8 @@ workbuddy_checkin.py / wb_server.py + config.json）拷到服务器上就能跑�
     3   网络或接口异常
     130 被 Ctrl+C 中断
 
-零依赖，Python 3.8+，Linux / Windows 都能跑（不 import tkinter / wb_task）。
+日常签到零依赖，Python 3.8+，Linux / Windows 都能跑
+（不 import tkinter / wb_task）。只有授权那一步需要 playwright。
 """
 from __future__ import annotations
 
@@ -55,6 +69,7 @@ for _p in (str(Path(__file__).resolve().parent),
 import wb_config
 import wb_notify
 import wb_oauth
+import wb_qrlogin
 import workbuddy_checkin as core
 
 # 配置、日志、令牌都放脚本所在目录。单文件 zipapp 里 __file__ 指向 .pyz 内部，
@@ -138,6 +153,16 @@ def do_check(cfg: dict, config_file: str) -> int:
         say("  {}：{}".format(row["title"], row["state"]))
     usable = [r["name"] for r in rows if r["usable"]]
     say("")
+
+    qr_ok, qr_reason = wb_qrlogin.available()
+    if qr_ok:
+        say("二维码授权：可用（服务端自己开无头浏览器取微信二维码）")
+    else:
+        say("二维码授权：不可用 —— {}".format(qr_reason))
+        say("  装上之后才能扫码授权（手机打开链接登录拿不到令牌）：")
+        say("    " + wb_qrlogin.install_hint())
+    say("")
+
     if not usable:
         say("✗ 没有可用的推送渠道。按上面的提示修配置（勾选 + 填有效 key）：")
         say("  1) 编辑 {}".format(config_file))
@@ -146,7 +171,7 @@ def do_check(cfg: dict, config_file: str) -> int:
     say("✅ 可用渠道：{}".format("、".join(wb_notify.label(c) for c in usable)))
 
     if not info.get("present") or info.get("disabled") or info.get("expired"):
-        say("⚠ 目前没有可用授权：下次运行会先推授权链接，等 {} 秒，".format(
+        say("⚠ 目前没有可用授权：下次运行会先生成二维码推给你扫，等 {} 秒，".format(
             int(cfg.get("auth_wait_seconds") or 180)))
         say("  失败则指数退避重试（最多 {} 轮）。".format(
             int(cfg.get("auth_attempts") or 3)))
@@ -200,6 +225,34 @@ def push_url(cfg: dict, url: str, channels: List[str],
     return push_text(cfg, core.build_auth_message(url, minutes), channels)
 
 
+QR_FILE_NAME = "auth_qr.png"
+
+
+def push_auth_link(cfg: dict, qr_url: str, auth_url: str, channels: List[str],
+                   wait_seconds: int) -> bool:
+    """把**二维码图片链接**推到所有渠道。
+
+    微信 qrconnect 的二维码本身就是一张公网图片
+    （`https://open.weixin.qq.com/connect/qrcode/<code>`），所以企业微信和
+    钉钉都只发文字就行——点开链接看到图，长按识别即可；不用上传图床，
+    也不用在服务器上开端口把 PNG 暴露出去，更不用为"钉钉不能发图片"做降级。
+    """
+    minutes = max(1, wait_seconds // 60)
+    text = (
+        "【WorkBuddy 签到】服务端需要重新授权\n"
+        "① 点开二维码图片：\n"
+        "   {qr}\n"
+        "② 手机上长按这张图 →「识别图中二维码」\n"
+        "   （在电脑上点开的话，直接用手机扫屏幕）\n"
+        "③ 点「允许」，服务端会自动拿到授权、继续签到。\n"
+        "二维码 {minutes} 分钟内有效。\n"
+        "\n"
+        "图片打不开时，把授权页链接放到电脑浏览器里打开也一样：\n"
+        "   {url}"
+    ).format(qr=qr_url, minutes=minutes, url=auth_url)
+    return push_text(cfg, text, channels)
+
+
 # ---------------- 授权 ----------------
 
 def _int_opt(cli_value: Optional[int], cfg: dict, key: str, fallback: int,
@@ -215,16 +268,30 @@ def _int_opt(cli_value: Optional[int], cfg: dict, key: str, fallback: int,
 
 
 def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
-    """推链接 → 等用户授权 → 失败则指数退避重试。
+    """取二维码链接 → 推给用户扫 → 等授权完成 → 失败则指数退避重试。
 
     每轮都重新读一遍 config.json：用户很可能就是在等待的这几分钟里，
     把机器人 key 补上、把渠道勾上的。第一轮没推出去，第二轮就推得出去了。
+
+    二维码靠本机无头浏览器生成（wb_qrlogin）。**浏览器必须一直开着**：
+    扫码结果是那个页面跳转之后才生效的，提前关掉就白等了。
     """
     bind_data_dir(cfg_file)
     base = wb_config.load(cfg_file)
     attempts = _int_opt(opts.attempts, base, "auth_attempts", 3, 1)
     wait = _int_opt(opts.wait, base, "auth_wait_seconds", 180, 30)
     backoff = _int_opt(opts.backoff, base, "auth_backoff_seconds", 60)
+
+    use_qr = (not getattr(opts, "no_qr", False)) and bool(base.get("auth_qr", True))
+    if use_qr:
+        ready, reason = wb_qrlogin.available()
+        if not ready:
+            use_qr = False
+            say("⚠ 二维码授权不可用：{}".format(reason))
+            say("  装上它，服务端才能自己生成二维码：")
+            say("    " + wb_qrlogin.install_hint())
+            say("  本轮退回推送授权链接（手机点链接登录拿不到令牌，"
+                "只对桌面浏览器有效）。")
 
     last = ""
     for i in range(1, attempts + 1):
@@ -244,32 +311,91 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
                 last = "服务端没有返回授权链接"
                 say("✗ {}".format(last))
             else:
-                say("")
-                say("授权链接（也可手动转发）：")
-                say("  " + url)
-                say("")
-                if channels:
-                    say("② 推送到 {}…".format(
-                        "、".join(wb_notify.label(c) for c in channels)))
-                    if not push_url(cfg, url, channels, wait):
-                        say("⚠ 所有渠道都推送失败，只能手动转发上面的链接。")
-                else:
-                    say("⚠ 没有可用的推送渠道（检查 config.json 的"
-                        "push_channels 与 key），请手动转发上面的链接。")
-                say("")
-                say("③ 等待完成授权（最多 {} 秒）；这期间可以改 {}".format(
-                    wait, cfg_file))
-                say("   补配置，下一轮会自动重读。")
+                say("   state={}".format(info["state"]))
+                say("   链接（排查用，正常不用手点）：{}".format(url))
 
-                def on_tick(elapsed, remain, _wait=wait):
-                    step = 30 if _wait > 120 else 15
-                    if elapsed and elapsed % step == 0:
-                        say("  …已等 {} 秒，剩余约 {} 秒".format(
-                            elapsed, max(0, remain)))
+                session = None
+                if use_qr:
+                    say("② 启动无头浏览器，取微信二维码…")
+                    try:
+                        session = wb_qrlogin.QRSession(url).open()
+                    except wb_qrlogin.QRError as e:
+                        say("⚠ 取二维码失败：{}".format(e))
+                        say("  本轮退回推送授权页链接。")
+                        session = None
+                    else:
+                        say("   ✓ 二维码链接：{}".format(session.qr_url or "（只有截图）"))
+                        if session.png:
+                            try:
+                                qr_path = Path(wb_config.data_dir()) / QR_FILE_NAME
+                                qr_path.write_bytes(session.png)
+                                say("     原图留档：{}".format(qr_path))
+                            except OSError as e:
+                                say("     原图留档失败（不影响）：{}".format(e))
+                else:
+                    say("② 跳过二维码（--no-qr 或 auth_qr=false）")
 
                 try:
+                    if session is not None:
+                        label = "③ 推送到 {}".format(
+                            "、".join(wb_notify.label(c) for c in channels)) \
+                            if channels else "③ 没有可用的推送渠道"
+                        say(label + "…")
+                        if channels:
+                            if not push_auth_link(cfg, session.qr_url, url,
+                                                  channels, wait):
+                                say("  ⚠ 所有渠道都推送失败，只能手动打开："
+                                    "{}".format(session.qr_url or url))
+                        else:
+                            say("  ⚠ 检查 config.json 的 push_channels 与 key；"
+                                "二维码链接：{}".format(session.qr_url or url))
+                        say("")
+                        say("④ 等待扫码（最多 {} 秒）；这期间可以改 {}".format(
+                            wait, cfg_file))
+                        say("   补配置，下一轮会自动重读。")
+                    else:
+                        if channels:
+                            say("③ 推送到 {}…".format(
+                                "、".join(wb_notify.label(c) for c in channels)))
+                            if not push_url(cfg, url, channels, wait):
+                                say("⚠ 所有渠道都推送失败，只能手动转发上面的链接。")
+                        else:
+                            say("⚠ 没有可用的推送渠道（检查 config.json 的"
+                                "push_channels 与 key），请手动转发上面的链接。")
+                        say("")
+                        say("④ 等待完成授权（最多 {} 秒）；这期间可以改 {}".format(
+                            wait, cfg_file))
+                        say("   补配置，下一轮会自动重读。")
+
+                    last_code = "-"
+                    printed = [0.0]
+
+                    def on_poll(code, msg):
+                        # 11217 = 还没登录完成；12153 = 会话失效；0 = 拿到了。
+                        # 把返回码打出来，才能分清「扫完了但服务端没收到」和
+                        # 「二维码本身过期了」——否则用户只能看到一个卡住的进度条。
+                        nonlocal last_code
+                        last_code = "code={}{}".format(
+                            code,
+                            " 等待手机扫码" if code == 11217 else
+                            " 会话已失效，本轮放弃" if code == 12153 else
+                            " " + msg if msg else "")
+                        if printed[0] <= 0:      # 第一次轮询就报一次，别让人干等
+                            printed[0] = 1.0
+                            say("   轮询返回 {}（每 3 秒一次）".format(last_code))
+
+                    def on_tick(elapsed, remain, _wait=wait):
+                        # 用「距上次打印超过 N 秒」而不是取模：轮询隔 3 秒，
+                        # elapsed 未必正好落在 15/30 上，取模会一整天不打印。
+                        step = 30 if _wait > 120 else 10
+                        if elapsed - printed[0] >= step:
+                            printed[0] = elapsed
+                            say("  …已等 {} 秒，剩余约 {} 秒（{}）".format(
+                                elapsed, max(0, remain), last_code))
+
                     payload = wb_oauth.poll_token(
-                        info["state"], timeout=wait, on_tick=on_tick)
+                        info["state"], timeout=wait, on_tick=on_tick,
+                        on_poll=on_poll)
                 except wb_oauth.OAuthError as e:
                     last = "{}: {}".format(e.result, e)
                     say("✗ 本轮未完成：{}".format(last))
@@ -283,7 +409,7 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
                         wb_oauth.save(record, path)
                         acct = record.get("account") or {}
                         say("")
-                        say("④ ✅ 授权成功：{}（uid {}）".format(
+                        say("⑤ ✅ 授权成功：{}（uid {}）".format(
                             acct.get("nickname") or "已登录账号",
                             acct.get("uid") or "?"))
                         say("   令牌已保存：{}".format(path))
@@ -291,6 +417,11 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
                                 "uid": acct.get("uid") or "",
                                 "nickname": acct.get("nickname") or "",
                                 "token_file": path}
+                finally:
+                    # 浏览器一定要收掉：成功要收，失败/异常更要收，
+                    # 否则下一轮会再开一个，进程退出前就是好几个 Chromium。
+                    if session is not None:
+                        session.close()
 
         if i < attempts:
             delay = backoff * (2 ** (i - 1))
@@ -391,6 +522,9 @@ def main(argv=None) -> int:
     ap.add_argument("--backoff", type=int, default=None,
                     help="轮次之间的退避基数秒数，按 1x/2x 增长"
                          "（默认取配置 auth_backoff_seconds=60）")
+    ap.add_argument("--no-qr", action="store_true",
+                    help="不生成二维码，只推授权链接"
+                         "（只对桌面浏览器有效，排障用）")
     ap.add_argument("--auth-only", action="store_true", help="只做授权，不签到")
     ap.add_argument("--checkin-only", action="store_true", help="只签到，不检查授权")
     ap.add_argument("--init-config", nargs="?", const="", default=None,

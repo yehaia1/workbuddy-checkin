@@ -7,9 +7,13 @@
 WorkBuddy 客户端进程，也不解密客户端的本地登录态。
 
 设备授权的两个端点都是公共 HTTP 接口，`state` 只是一段服务端会话 id，
-所以「在 A 机器生成链接、在 B 机器轮询拿令牌」在协议上是成立的——
-服务端版没有浏览器，就是靠这一点：先推链接到手机，再在服务器上轮询
-（见 wb_server.py）。
+所以「在 A 机器生成会话、在 B 机器轮询拿令牌」在协议上是成立的。
+
+但**登录动作必须在浏览器里完成**：登录成功后由页面自己回调
+`/console/auth/login?platform=CLI&state=...` 把 state 标记成已完成，那一步
+带着页面自己的登录 cookie。所以服务端版不靠「把链接发到手机」——实测那条路
+服务端轮询一直停在 11217——而是自己开一个无头浏览器，把登录页里的微信二维码
+链接取出来推给用户扫（见 wb_qrlogin.py / wb_server.py）。
 
 授权流程
 --------
@@ -353,11 +357,18 @@ def begin_auth(timeout: int = HTTP_TIMEOUT) -> Dict[str, str]:
 
 def poll_token(state: str, timeout: int = 900, interval: int = POLL_INTERVAL,
                on_tick: Optional[Callable[[int, int], None]] = None,
-               should_stop: Optional[Callable[[], bool]] = None
+               should_stop: Optional[Callable[[], bool]] = None,
+               on_poll: Optional[Callable[[int, str], None]] = None
                ) -> Dict[str, Any]:
     """等用户在任意设备上完成登录，拿到授权响应。
 
-    on_tick(elapsed, remain) 用于界面刷进度；should_stop() 返回 True 时中断。
+    这里**不需要对方回传任何东西**：登录页在浏览器里把 state 标记成已完成
+    （页面调 `GET /console/auth/login?platform=CLI&state=...`），本函数用同一个
+    state 轮询 `GET /v2/plugin/auth/token?state=...`，从 11217 变成 0 就是拿到了。
+
+    on_tick(elapsed, remain)  用于界面刷进度
+    on_poll(code, message)    每次轮询后的返回码（排查"到底卡在哪一步"）
+    should_stop()             返回 True 时中断
     返回原始授权响应体，调用方再用 build_record() 转成落盘格式。
     """
     total = max(30, int(timeout))
@@ -369,6 +380,9 @@ def poll_token(state: str, timeout: int = 900, interval: int = POLL_INTERVAL,
             raise OAuthError("OAUTH_CANCELLED", "已取消授权。", 2)
         status, body, raw = _request("GET", url, timeout=HTTP_TIMEOUT)
         code = body.get("code")
+        if on_poll:
+            on_poll(int(code if isinstance(code, int) else -1),
+                    str(body.get("msg") or "")[:60])
         if status == 200 and code == CODE_OK:
             data = body.get("data")
             if isinstance(data, dict) and _pick(data, "accessToken", "access_token"):
@@ -410,8 +424,9 @@ def login(path: str, emit: Optional[Callable[[str], None]] = None,
     url = info["auth_url"]
     if on_url and url:
         on_url(url)
-    # 链接可以给任何设备打开：手机扫码授权后，**发起方自己**靠 state 轮询取令牌，
-    # 不需要手机回传任何东西。所以 open_browser=False 只影响"是否在本机弹浏览器"。
+    # 令牌不靠任何人"回传"：谁把登录页跑完，state 就在谁那边被标记完成，
+    # 之后按 state 轮询即可。所以 open_browser=False 只是"不在本机弹浏览器"，
+    # 真要不弹浏览器就得另有浏览器接手（服务端走 wb_qrlogin 的那套）。
     if open_browser and url:
         say("请在浏览器完成登录：{}".format(url))
         say("已尝试自动打开浏览器" if _open_browser(url) else "自动打开失败，请手动复制链接")

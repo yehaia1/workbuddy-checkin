@@ -1,7 +1,8 @@
 # 服务端版（cron 定时脚本）
 
-`wb_server.pyz`：无界面、无浏览器，一条命令跑完「授权（必要时）→ 签到 → 推送」，
-交给 cron 定时调用即可。
+`wb_server.pyz`：无界面，一条命令跑完「授权（必要时）→ 签到 → 推送」，
+交给 cron 定时调用即可。缺授权时它自己开一个**无头浏览器**取微信二维码链接
+推给你扫；有授权就完全不启动浏览器。
 
 和 Windows 版是**两套部署，选一个用**。两边同时定时会因为 `refreshToken`
 轮换而互相踢掉（服务端返回 `12153`）。
@@ -10,7 +11,7 @@
 
 ## 1. 部署
 
-服务端只发**一个文件**：`dist/server/wb_server.pyz`（约 30 KB）。
+服务端只发**一个文件**：`dist/server/wb_server.pyz`（约 38 KB）。
 
 ```bash
 python3 build/make_server.py       # 本机构建，产出 dist/server/wb_server.pyz
@@ -24,12 +25,14 @@ scp dist/server/wb_server.pyz server:/opt/wbcheckin/
 wb_server            入口
 workbuddy_checkin    签到流程（不含界面）
 wb_oauth             设备授权 / 续期
+wb_qrlogin           无头浏览器取二维码（只在授权时用，playwright 惰性导入）
 wb_notify            推送
 wb_config            配置与路径
 ```
 
 `src/desktop/` 里的界面（tkinter）、Windows 计划任务、弹窗抑制**不会**进包；
 闭包里一旦出现它们，构建会直接失败并告诉你是哪处导入。
+`playwright` 也不在包里——它是运行环境自己装的，没装只影响授权那一步。
 
 服务器上：
 
@@ -42,14 +45,25 @@ python3 wb_server.pyz --init-config
 # 2) 填 key（企业微信 key 或钉钉 access_token），勾选渠道
 vi config.json
 
-# 3) 体检：不联网，只看配置和授权状态
+# 3) 体检：不联网，只看配置、授权状态、二维码能力
 python3 wb_server.pyz --check
 
-# 4) 先手工跑一次：会推授权链接到手机，等 3 分钟
+# 4) 先手工跑一次：缺授权时会推一条二维码链接，扫码即可，等 3 分钟
 python3 wb_server.pyz
 ```
 
-要求：Python 3.8+，**零第三方依赖**，Linux / Windows 都能跑
+首次授权要装一次 playwright（**只有授权用得到，日常签到不碰**）：
+
+```bash
+# Linux 服务器（自带 chromium + 系统依赖，推荐）
+pip install playwright
+python -m playwright install --with-deps chromium
+
+# Windows / macOS：装了 Chrome 或 Edge 的话只装库即可，不用下 chromium
+pip install playwright
+```
+
+要求：Python 3.8+，**日常签到零第三方依赖**，Linux / Windows 都能跑
 （不 import tkinter，也不碰 Windows 计划任务）。也可以直接 `./wb_server.pyz`
 执行（文件带 shebang）。
 
@@ -68,20 +82,38 @@ python3 wb_server.pyz
 
 ```
 ① 检查授权
-   有效      → 直接进入 ②
+   有效      → 直接进入 ②（不启动浏览器）
    未授权 / 损坏 / 会话失效 → 进入授权流程
    网络不通  → 退出码 3（重试授权没有意义）
 
    授权流程（最多 3 轮，指数退避）
-     轮 1：申请会话 → 推链接到渠道 → 等 180 秒
-     轮 2：（隔 60 秒）重新申请 → 推链接 → 等 180 秒
-     轮 3：（隔 120 秒）重新申请 → 推链接 → 等 180 秒
-   最坏耗时约 12 分钟
+     轮 1：申请会话 → 起无头浏览器取二维码链接 → 推给用户 → 等 180 秒
+     轮 2：（隔 60 秒）新的会话 → 二维码 → 推 → 等 180 秒
+     轮 3：（隔 120 秒）同上
+   拿到令牌立刻关掉浏览器；最坏耗时约 12 分钟
 
 ② 执行签到：查 → 领 → 复核
 
 ③ 推送结果到同一批渠道（含授权到期提醒）
 ```
+
+推给你的是**二维码图片链接**，不是授权页链接：
+
+```
+【WorkBuddy 签到】服务端需要重新授权
+① 点开二维码图片：
+   https://open.weixin.qq.com/connect/qrcode/0813EhAu2z7Pkl2H
+② 手机上长按这张图 →「识别图中二维码」
+③ 点「允许」，服务端会自动拿到授权、继续签到。
+```
+
+微信这张二维码本身就是公网图片，所以**企业微信和钉钉都只发文字**就行，
+不用图床、不用在服务器上开端口，也不用为"钉钉不能发图片"做降级。
+
+为什么不能直接推授权页链接：那个页面登录成功后由**页面自己**回调
+`/console/auth/login` 把 `state` 标记完成，登录态落在打开它的浏览器里。
+把链接转到手机上，服务端轮询只会一直返回 `11217`。所以服务端自己开浏览器，
+让登录发生在我们控制的浏览器里——实测扫码后 100 秒内拿到 `code=0`。
 
 关键点：
 
@@ -97,6 +129,7 @@ python3 wb_server.pyz
 | `auth_wait_seconds` | `180` | `--wait` | 每轮等多久 |
 | `auth_attempts` | `3` | `--attempts` | 最多几轮 |
 | `auth_backoff_seconds` | `60` | `--backoff` | 退避基数，按 1x/2x 增长 |
+| `auth_qr` | `true` | `--no-qr` | 是否用二维码授权（关掉只会推授权页链接，仅排障） |
 
 ---
 
@@ -133,6 +166,7 @@ env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin \
 | `--auth-only` | 只授权，不签到（首次部署时先跑这个） |
 | `--checkin-only` | 只签到，不检查授权 |
 | `--channel wecom` | 强制只用一个渠道 |
+| `--no-qr` | 不生成二维码，只推授权页链接（仅排障） |
 | `--push-only --url <链接>` | 只把一条链接转发到渠道 |
 | `--version` | 版本 |
 | `--json` | 结果输出单行 JSON |
@@ -155,7 +189,9 @@ env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin \
   `chmod 600`），不要进 git、不要打进镜像层。
 - `config.json` 里有机器人 key：同样不要提交。本仓库的 `.gitignore` 已经
   挡住 `config.json`、`auth_oauth.json`、`*.log`。
-- 授权链接里带 `state`，3 分钟内有效；不要把控制台输出整段贴到群里。
+- 授权二维码等于一次登录机会，约 5 分钟内有效；不要把控制台输出整段贴到群里。
+- 服务端授权期间会起一个无头 Chrome/Chromium（约 200 MB 内存），
+  拿到令牌立刻关掉；**有授权时不启动**。想彻底避免可用 `--no-qr`。
 - 建议单独建系统用户跑 cron，目录权限 `700`。
 
 ---
@@ -165,8 +201,10 @@ env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin \
 | 现象 | 原因 / 处理 |
 |---|---|
 | `✗ 没有可用的推送渠道` | `push_channels` 勾了但 key 没填对。跑 `--check` 看是哪一种 |
-| 推了链接，手机点开是空白 | 链接过期（3 分钟）。重跑脚本，会重新申请 |
-| 3 轮都超时 | 人没在 3 分钟内点开。加大 `--wait 300`，或先 `--auth-only` 单独授权 |
+| `二维码授权：不可用` | 没装 playwright。`pip install playwright`（Linux 再加 `python -m playwright install --with-deps chromium`） |
+| `⚠ 取二维码失败：起不了浏览器` | 服务器上没有可用浏览器。装 chromium，或以非 root 运行（脚本已带 `--no-sandbox`） |
+| 二维码链接点开是空白 | 过期了（约 5 分钟）。重跑脚本会重新申请 |
+| 3 轮都超时 | 人没在 3 分钟内扫码。加大 `--wait 300`，或先 `--auth-only` 单独授权 |
 | `12153 Offline user session not found` | 令牌被别处刷新过（两台机器都在跑）。只留一处 |
 | `OAUTH_NETWORK` | 服务器出不了网 / 被墙。检查代理与出站白名单 |
 | cron 里不跑，手工跑正常 | cron 环境变量少、没 `cd`、python 路径不同。用上面的 `env -i` 验证 |

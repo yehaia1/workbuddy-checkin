@@ -12,7 +12,9 @@
   7. 到期提醒：剩余天数 <= expiry_warn_days 才提醒，阈值设 0 等于关闭；
   8. 推送：只推选中的渠道，没填 key 的渠道不参与；
   9. 版本与数据目录：版本号格式、exe 写缓存目录、旧版数据一次性迁移；
- 10. 服务端脚本：能不依赖 tkinter 导入，授权参数取自配置。
+ 10. 服务端脚本：能不依赖 tkinter 导入，授权参数取自配置；
+ 11. 服务端二维码授权：playwright 只能惰性导入，推出去的是二维码图片链接，
+     浏览器只在缺授权时启动。
 
 用法：
     python tools/oauth_mode_check.py
@@ -36,7 +38,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # src/ 是分层的：common（共用）、server（服务端入口）、desktop（exe 版）
@@ -46,6 +48,7 @@ for _sub in ("common", "server", "desktop"):
 import wb_config                                                  # noqa: E402
 import wb_notify                                                  # noqa: E402
 import wb_oauth                                                   # noqa: E402
+import wb_qrlogin                                                 # noqa: E402
 import workbuddy_checkin as core                                  # noqa: E402
 
 RESULTS = []
@@ -463,11 +466,12 @@ def main():
         try:
             import make_server as pkgtool
             mods = pkgtool.collect()
-            check("服务端闭包是 5 个模块", len(mods) == 5, mods)
+            check("服务端闭包是 6 个模块", len(mods) == 6, mods)
             check("闭包不含 GUI / Windows 模块",
                   not (set(mods) & set(pkgtool.FORBIDDEN)), mods)
             check("闭包含入口与签到核心",
                   {"wb_server", "workbuddy_checkin"} <= set(mods), mods)
+            check("闭包含二维码模块", "wb_qrlogin" in mods, mods)
             check("闭包不含 win_quiet（tk/计划任务专用）",
                   "win_quiet" not in mods, mods)
         except Exception as e:  # noqa: BLE001
@@ -514,6 +518,50 @@ def main():
                   wb_config.version_text())
         finally:
             wb_config.SRC_DIR = real_src
+
+        # 15) 服务端二维码授权：只在缺授权时开浏览器，推出去的是**图片链接**
+        check("服务端引用了二维码模块", hasattr(wb_server, "wb_qrlogin"))
+        qr_top = pkgtool.local_imports(Path(wb_qrlogin.__file__)) if pkgtool else set()
+        check("二维码模块模块级不导入 playwright（否则 pyz 会硬依赖它）",
+              "playwright" not in qr_top, sorted(qr_top))
+        qr_ok, qr_why = wb_qrlogin.available()
+        check("没装 playwright 时 available() 不抛异常、给出原因",
+              qr_ok or bool(qr_why), qr_why or "本机已安装")
+        check("二维码图片链接按 iframe 地址拼成绝对路径",
+              urljoin("https://open.weixin.qq.com/connect/qrconnect?appid=x",
+                      "/connect/qrcode/ABC123")
+              == "https://open.weixin.qq.com/connect/qrcode/ABC123")
+
+        captured = {}
+
+        def fake_push(_cfg, text, _chans):
+            captured["text"] = text
+            return True
+
+        real_push = wb_server.push_text
+        wb_server.push_text = fake_push
+        try:
+            wb_server.push_auth_link(
+                {}, "https://open.weixin.qq.com/connect/qrcode/ABC123",
+                "https://copilot.tencent.com/login?platform=CLI&state=s",
+                ["wecom"], 180)
+        finally:
+            wb_server.push_text = real_push
+        msg = captured.get("text", "")
+        check("推出去的就是二维码图片链接（不用图床、不用开端口）",
+              "https://open.weixin.qq.com/connect/qrcode/ABC123" in msg,
+              msg[:80])
+        check("消息里有扫码指引与有效期",
+              "识别图中二维码" in msg and "3 分钟" in msg, msg[:80])
+        check("消息里留了授权页链接兜底", "copilot.tencent.com/login" in msg,
+              msg[:80])
+        check("推送层没有图片消息残留（两家渠道统一走链接）",
+              not hasattr(wb_notify, "IMAGE_SENDERS"))
+        srv_src = Path(wb_server.__file__).read_text(encoding="utf-8")
+        check("有 --no-qr 排障开关", '"--no-qr"' in srv_src)
+        check("浏览器只在 authorize 里起，签到流程不碰",
+              srv_src.count("wb_qrlogin.QRSession") == 1,
+              srv_src.count("wb_qrlogin.QRSession"))
     finally:
         srv.shutdown()
         shutil.rmtree(tmpdir, ignore_errors=True)

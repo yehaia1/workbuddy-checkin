@@ -188,10 +188,24 @@ python3 wb_server.pyz --check
 - 想留更长时间：`--wait 300` 或改 `auth_wait_seconds`；
 - 想先单独把授权做完：`--auth-only`。
 
-### 授权链接点开是空的 / 打不开
+### 收不到二维码 / 扫了没反应
 
-链接里的 `state` 只在等待窗口内有效（默认 3 分钟）。过期就重跑脚本，
-它会重新申请一条。
+服务端推给你的是**二维码图片链接**（`open.weixin.qq.com/connect/qrcode/...`）：
+
+- 手机上点开 → 长按图片 →「识别图中二维码」；电脑上点开则用手机扫屏幕；
+- 链接约 5 分钟失效（`state` 只在等待窗口内有效）。过期就重跑，会重新申请；
+- 扫完还是不动时，看控制台打印的轮询码：
+  `code=11217` 说明还没扫成功，`12153` 说明会话已失效（本轮作废）。
+
+`--check` 里「二维码授权：不可用」= 没装 playwright：
+
+```bash
+pip install playwright
+python -m playwright install --with-deps chromium    # Linux
+```
+
+装完再跑 `--check` 应显示「可用」。实在跑不起浏览器时，可以用
+`--no-qr` 退回推授权页链接（只有桌面浏览器打开能完成登录）。
 
 ### 推送不出去
 

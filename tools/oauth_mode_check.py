@@ -1,27 +1,20 @@
 # -*- coding: utf-8 -*-
-"""账号直连（OAuth）通道回归检查。
+"""账号直连链路回归检查（不碰真实接口、不需要真实账号）。
 
-背景
-----
-客户端 5.6.2 起把本地登录态改成字段级加密，"读 token 直调接口"的老脚本全部
-失效；WBIPC 通道又要求客户端进程在跑。为此新增了第三条通道：用 CodeBuddy CLI
-的设备授权流程重新登录一次，拿明文令牌后纯 HTTP 签到。
+用本地桩服务器把整条链路跑一遍，重点盯住几个真的写错过的地方：
 
-这条通道**没法用手工点一下来验证**（要真的浏览器授权、真的签到），
-所以这里用本地桩服务器把整条链路跑一遍，重点覆盖几个容易写错的地方：
-
-  1. 轮询：11217（等待中）不能当成失败，必须继续等；
-  2. 字段兼容：授权接口用 snake_case、刷新接口用 camelCase，都要能取到；
+  1. 轮询：11217（等待中）不能当失败，必须继续等；
+  2. 字段兼容：授权接口 snake_case、刷新接口 camelCase，都要能取到；
   3. refreshToken 轮换：刷新后必须落盘，否则下次就被判会话失效；
   4. 401 自动续期重试：第一次 401、刷新后第二次成功，业务层应当无感；
-  5. 12153 会话失效：要标记 disabled 并给出"重新授权"而不是含糊的网络错误；
-  6. 两种模式的分发：auth_mode 决定是否启动客户端（wbipc 才拉进程）。
+  5. 12153 会话失效：标记 disabled 并提示"重新授权"，而不是含糊的网络错误；
+  6. 导入码：服务端导出的码必须能原样导入，坏码必须明确报错；
+  7. 推送：只推选中的渠道，没填 key 的渠道不参与。
 
-用法
-----
+用法：
     python tools/oauth_mode_check.py
 
-结果写入当前目录的 oauth_mode_check.json，退出码反映是否全部通过。
+结果写入 oauth_mode_check.json，退出码反映是否全部通过。
 """
 from __future__ import annotations
 
@@ -33,12 +26,13 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import wb_oauth                                                  # noqa: E402
-import workbuddy_checkin as core                                 # noqa: E402
+import wb_notify                                                  # noqa: E402
+import wb_oauth                                                   # noqa: E402
+import workbuddy_checkin as core                                  # noqa: E402
 
 RESULTS = []
 
@@ -56,18 +50,17 @@ class Stub:
     """可编排的假服务端：记录请求，按剧本返回。"""
 
     def __init__(self):
-        self.domain = ""              # 由 serve() 填成 127.0.0.1:port
-        self.state_polls = 0          # 轮询次数（控制 11217 的节奏）
+        self.domain = ""              # 由 point_at() 填成 127.0.0.1:port
+        self.state_polls = 0
         self.refresh_calls = 0
         self.checkin_calls = 0
-        self.checked_in = False        # 领取后置真，供状态接口复核
-        self.force_401_once = False   # 下一次 billing 调用返回 401
-        self.refresh_dead = False     # 刷新返回 12153
+        self.checked_in = False
+        self.force_401_once = False
+        self.refresh_dead = False
         self.headers_seen = []
         self.paths_seen = []
 
     def handle(self, h, method, path, body):
-        q = parse_qs(urlparse(path).query)
         p = urlparse(path).path
         self.paths_seen.append(method + " " + p)
         self.headers_seen.append(dict(h.headers))
@@ -151,12 +144,11 @@ def serve(stub):
 def point_at(stub, port):
     """把所有端点指到桩服务器。"""
     base = "http://127.0.0.1:{}".format(port)
-    stub.domain = base        # 令牌里的 domain，billing 基址由它推导
+    stub.domain = base
     wb_oauth.AUTH_STATE_URL = base + "/v2/plugin/auth/state?platform=CLI"
     wb_oauth.AUTH_TOKEN_URL = base + "/v2/plugin/auth/token?state="
     wb_oauth.REFRESH_URL_CN = base + "/v2/plugin/auth/token/refresh"
     wb_oauth.REFRESH_URL_GLOBAL = base + "/v2/plugin/auth/token/refresh"
-    # billing_base 从令牌 domain 推导；令牌里带 http:// 前缀即可命中桩
     return base
 
 
@@ -169,8 +161,10 @@ def main():
     tmpdir = tempfile.mkdtemp(prefix="wb_oauth_check_")
     token_file = os.path.join(tmpdir, "auth_oauth.json")
     cfg = dict(core.DEFAULT_CONFIG)
-    cfg["auth_mode"] = "oauth"
     cfg["oauth_token_file"] = token_file
+    cfg["push_channels"] = ["wecom"]
+    cfg["wecom_key"] = "WECOM-KEY"
+    cfg["dingtalk_key"] = "DING-KEY"
 
     try:
         # 1) 未授权时给出明确结论，而不是泛泛的连接失败
@@ -193,15 +187,12 @@ def main():
         check("expiresAt 由 expires_in 推出",
               int(auth.get("expiresAt") or 0) > time.time() + 20 * 86400,
               auth.get("expiresAt"))
-        check("令牌文件权限已收紧（POSIX 才生效）",
-              os.path.isfile(token_file))
 
         # 3) 令牌 domain 决定 billing 基址
         check("billing 基址取自 domain",
-              wb_oauth.billing_base(rec) == host,
-              wb_oauth.billing_base(rec))
+              wb_oauth.billing_base(rec) == host, wb_oauth.billing_base(rec))
 
-        # 4) 完整签到：查 → 领 → 复核，业务层对通道无感
+        # 4) 完整签到：查 → 领 → 复核
         with wb_oauth.OAuthSession(token_file) as sess:
             result = core.run(sess, check_only=False)
         check("签到流程成功", result.get("result") == "CLAIMED", result)
@@ -235,43 +226,86 @@ def main():
         except wb_oauth.OAuthError as e:
             check("12153 判定会话失效", e.result == "OAUTH_SESSION_DEAD", e.result)
         marked = wb_oauth.load(token_file)
-        check("失效状态已落盘", bool(marked.get("disabled")) is True, marked.get("disabled"))
+        check("失效状态已落盘", bool(marked.get("disabled")) is True,
+              marked.get("disabled"))
         try:
             wb_oauth.OAuthSession(token_file)
             check("失效令牌拒绝使用", False, "没有抛异常")
         except wb_oauth.OAuthError as e:
             check("失效令牌拒绝使用", e.result == "OAUTH_SESSION_DEAD", e.result)
 
-        # 7) 模式分发：oauth 不该碰客户端进程
-        called = {"launch": 0}
-        orig = core.connect_with_autolaunch
-
-        def spy(*a, **kw):
-            called["launch"] += 1
-            raise AssertionError("oauth 模式不应该走客户端拉起")
-
-        core.connect_with_autolaunch = spy
-        try:
-            stub.refresh_dead = False
-            wb_oauth.login(token_file, emit=lambda m: None,
-                           open_browser=False, timeout=30)
-            sess, launched = core.open_session(cfg)
-            check("oauth 模式不拉起客户端", called["launch"] == 0, called)
-            check("oauth 模式 launched=False", launched is False, launched)
-            sess.close()
-
-            cfg2 = dict(cfg)
-            cfg2["auth_mode"] = "wbipc"
+        # 7) 导入码：服务端导出的东西必须能原样导入
+        stub.refresh_dead = False
+        fresh = wb_oauth.login(token_file, emit=lambda m: None,
+                              open_browser=False, timeout=30)
+        code = wb_oauth.export_code(fresh)
+        check("导入码有前缀", code.startswith(wb_oauth.IMPORT_PREFIX), code[:12])
+        check("导入码是单行", "\n" not in code, len(code))
+        os.remove(token_file)
+        res = core.import_token(code, cfg)
+        check("导入码导入成功", res.get("result") == "IMPORTED", res)
+        back = wb_oauth.load(token_file)
+        check("导入后令牌一致",
+              back["auth"]["accessToken"] == fresh["auth"]["accessToken"],
+              back["auth"]["accessToken"][:12])
+        check("导入会清掉失效标记", not back.get("disabled"), back.get("disabled"))
+        # 从聊天窗口粘贴常带换行/空格，必须容忍
+        wrapped = code[:20] + "\n" + code[20:]
+        check("导入码容忍换行", bool(wb_oauth.decode_code(wrapped).get("auth")))
+        for bad in ("", "WBAT1.", "WBAT1.!!!!", "not-a-code"):
             try:
-                core.open_session(cfg2)
-            except AssertionError:
-                pass
-            check("wbipc 模式仍走客户端通道", called["launch"] == 1, called)
-        finally:
-            core.connect_with_autolaunch = orig
+                wb_oauth.decode_code(bad)
+                check("坏导入码被拒绝({!r})".format(bad), False, "没有抛异常")
+            except wb_oauth.OAuthError as e:
+                check("坏导入码被拒绝({!r})".format(bad),
+                      e.result == "OAUTH_IMPORT_BAD", e.result)
 
-        # 8) 请求头：鉴权与身份头都要带齐
-        hdrs = stub.headers_seen[-1] if stub.headers_seen else {}
+        # 7b) 从文件导入 —— 服务端 --save-token 导出的就是一份 auth_oauth.json，
+        #     它必须是 JSON 而不是导入码，两种都得认。
+        server_file = os.path.join(tmpdir, "from_server.json")
+        with open(server_file, "w", encoding="utf-8") as fh:
+            json.dump(fresh, fh, ensure_ascii=False)
+        os.remove(token_file)
+        res = core.import_token(server_file, cfg)
+        check("从令牌文件导入成功", res.get("result") == "IMPORTED", res)
+        check("文件导入后令牌可读",
+              wb_oauth.load(token_file)["auth"]["accessToken"]
+              == fresh["auth"]["accessToken"])
+
+        # 8) 推送：只推选中的渠道，没填 key 的不参与
+        check("只推选中的渠道", wb_notify.selected_channels(cfg) == ["wecom"],
+              wb_notify.selected_channels(cfg))
+        check("企业微信地址只拼官方域名",
+              wb_notify.wecom_url(cfg).startswith(wb_notify.WECOM_API_PREFIX),
+              wb_notify.wecom_url(cfg))
+        cfg2 = dict(cfg)
+        cfg2["push_channels"] = ["wecom", "dingtalk"]
+        check("未选渠道不参与",
+              wb_notify.selected_channels(dict(cfg, push_channels=[])) == [],
+              wb_notify.selected_channels(dict(cfg, push_channels=[])))
+        check("整条链接也能抽出 key",
+              wb_notify.wecom_key_of(
+                  {"wecom_key": "https://qyapi.weixin.qq.com/cgi-bin/webhook/"
+                                "send?key=ABC123"}) == "ABC123")
+        check("看着像链接却不合法就拒发",
+              wb_notify.wecom_url({"wecom_key": "https://evil.example/x?k=1"}) == "")
+
+        # 9) 文案里必须带链接和有效期，否则手机上没法用
+        msg = core.build_auth_message("https://example.invalid/login?state=x", 10)
+        check("授权文案含链接", "https://example.invalid/login?state=x" in msg, msg)
+        check("授权文案含有效期", "10 分钟" in msg, msg)
+
+        # 10) 服务端脚本必须能导入（服务器上没有 tkinter / 没有 wb_task）
+        try:
+            import wb_auth_server
+            chans = wb_auth_server.resolve_channels(cfg, "")
+            check("服务端脚本可导入并解析渠道", chans == ["wecom"], chans)
+            forced = wb_auth_server.resolve_channels(cfg2, "dingtalk")
+            check("服务端可强制指定渠道", forced == ["dingtalk"], forced)
+        except Exception as e:
+            check("服务端脚本可导入并解析渠道", False, repr(e))
+
+        # 11) 请求头：鉴权与身份头都要带齐
         with wb_oauth.OAuthSession(token_file) as sess:
             sess.fetch("POST", core.STATUS_PATH)
         hdrs = stub.headers_seen[-1]

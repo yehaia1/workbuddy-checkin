@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -200,6 +201,35 @@ def main():
         check("expiresAt 由 expires_in 推出",
               int(auth.get("expiresAt") or 0) > time.time() + 20 * 86400,
               auth.get("expiresAt"))
+
+        # 2b) 链接不绑定设备：open_browser 只决定要不要在本机弹浏览器
+        opened = []
+        real_open = wb_oauth._open_browser
+        wb_oauth._open_browser = lambda url: (opened.append(url), True)[1]
+        try:
+            wb_oauth.login(token_file, emit=lambda m: None,
+                           open_browser=False, timeout=30)
+            check("open_browser=False 不弹本机浏览器", opened == [], opened)
+            rec_b = wb_oauth.login(token_file, emit=lambda m: None,
+                                   open_browser=True, timeout=30)
+            check("open_browser=True 才弹本机浏览器", len(opened) == 1, opened)
+            check("两种方式都拿得到令牌",
+                  bool((rec_b.get("auth") or {}).get("accessToken")))
+        finally:
+            wb_oauth._open_browser = real_open
+
+        # 2c) 统一入口透传该开关；命令行留了「只打印链接」的口子
+        sig = inspect.signature(core.login_oauth)
+        check("login_oauth 支持 open_browser", "open_browser" in sig.parameters)
+        check("login_oauth 默认仍弹浏览器",
+              sig.parameters["open_browser"].default is True)
+        ns = core.parse_args(["--auth", "--no-browser"])
+        check("命令行有 --no-browser",
+              ns.auth is True and ns.no_browser is True, vars(ns))
+        gui_src = (Path(ROOT) / "src" / "desktop" / "checkin_gui.py").read_text(
+            encoding="utf-8")
+        check("桌面端默认不弹本机浏览器", "open_browser=False" in gui_src)
+        check("桌面端仍保留本机打开入口", "在本机打开" in gui_src)
 
         # 3) 令牌 domain 决定 billing 基址
         check("billing 基址取自 domain",

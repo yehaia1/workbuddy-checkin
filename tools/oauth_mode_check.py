@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -37,7 +38,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "src"))
+# src/ 是分层的：common（共用）、server（服务端入口）、desktop（exe 版）
+for _sub in ("common", "server", "desktop"):
+    sys.path.insert(0, os.path.join(ROOT, "src", _sub))
 
 import wb_config                                                  # noqa: E402
 import wb_notify                                                  # noqa: E402
@@ -422,17 +425,17 @@ def main():
             wb_config.install_dir = real_install
             wb_config.set_data_dir(Path(ROOT))
 
-        # 14) 服务端打包：只带该带的模块，数据落脚本目录
+        # 14) 服务端单文件包：只带该带的模块，数据落脚本目录
         check("仓库布局识别正确", wb_config.is_repo_layout() is True)
         build_dir = os.path.join(str(ROOT), "build")
-        bundle = None
+        pkgtool = None
         sys.path.insert(0, build_dir)
         try:
-            import make_server_bundle as bundle
-            mods = bundle.collect()
+            import make_server as pkgtool
+            mods = pkgtool.collect()
             check("服务端闭包是 5 个模块", len(mods) == 5, mods)
             check("闭包不含 GUI / Windows 模块",
-                  not (set(mods) & set(bundle.FORBIDDEN)), mods)
+                  not (set(mods) & set(pkgtool.FORBIDDEN)), mods)
             check("闭包含入口与签到核心",
                   {"wb_server", "workbuddy_checkin"} <= set(mods), mods)
             check("闭包不含 win_quiet（tk/计划任务专用）",
@@ -442,14 +445,29 @@ def main():
         finally:
             sys.path.remove(build_dir)
 
-        pkg = Path(ROOT) / "dist" / "server"
-        if pkg.is_dir() and bundle is not None:
-            names = sorted(p.name for p in pkg.glob("*.py"))
-            check("dist/server 里没有 GUI / Windows 模块",
-                  not ({"{}.py".format(f) for f in bundle.FORBIDDEN}
+        pyz = Path(ROOT) / "dist" / "server" / "wb_server.pyz"
+        if pyz.is_file() and pkgtool is not None:
+            import zipfile
+            with zipfile.ZipFile(str(pyz)) as zf:
+                names = sorted(zf.namelist())
+            check("服务端产物是单文件 .pyz", zipfile.is_zipfile(str(pyz)))
+            check("pyz 里没有 GUI / Windows 模块",
+                  not ({"{}.py".format(f) for f in pkgtool.FORBIDDEN}
                        & set(names)), names)
-            check("dist/server 自带配置模板",
-                  (pkg / "config.example.json").is_file())
+            check("pyz 里有 __main__ 入口", "__main__.py" in names, names)
+            check("pyz 里模块数与闭包一致",
+                  len([n for n in names if n.endswith(".py")]) == len(pkgtool.collect()) + 1,
+                  names)
+            # 单文件在空目录里必须能跑，且把配置写到 pyz 旁边
+            with tempfile.TemporaryDirectory() as solo:
+                shutil.copy2(str(pyz), os.path.join(solo, "wb_server.pyz"))
+                proc = subprocess.run(
+                    [sys.executable, "-B", "wb_server.pyz", "--version"],
+                    cwd=solo, capture_output=True, text=True, timeout=60)
+                out = (proc.stdout or "") + (proc.stderr or "")
+                check("单文件在空目录能跑", proc.returncode == 0 and
+                      wb_config.VERSION in out, out.strip()[:80])
+                check("单文件版本行写「脚本运行」", "脚本运行" in out, out.strip()[:80])
 
         # 平铺目录（服务器上的样子）数据必须落脚本目录，不能落父目录
         flat = Path(tmpdir) / "flat"

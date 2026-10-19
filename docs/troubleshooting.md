@@ -4,40 +4,36 @@
 
 ---
 
-## 0. 先分清：你看的是哪一套数据？
+## 0. 先确认：你看的是哪一份数据？
 
-现在有两种运行方式，各自有独立的配置与日志，**最容易误判的地方就在这里**：
+三种运行方式各写各的目录，**最容易误判的地方就在这里**：
 
-| | 本地运行 | 独立运行 |
+| 运行方式 | 启动 | 数据目录 |
 |---|---|---|
-| 启动 | `python run.py` | `dist/WorkBuddy签到.exe` |
-| 数据目录 | 仓库根目录 | `dist/` |
-| 计划任务调用 | `pythonw run.py --run` | `WorkBuddy签到.exe --run` |
+| Windows 版（exe） | `WorkBuddyCheckin.exe` | `%LOCALAPPDATA%\WorkBuddyCheckin` |
+| 服务端版（脚本） | `python3 wb_server.py` | 脚本所在目录 |
+| 源码运行（开发） | `python run.py` | 仓库根目录 |
 
-界面日志区第一行会打印"运行方式"和"程序目录"，先对一下：如果你在改根目录的
-`config.json`，而实际跑的是 `dist/` 里的 exe，那当然"改了没反应"。
+界面日志第一行、`--version`、`--selftest` 都会打印数据目录。先对一下：
+如果你在改根目录的 `config.json`，而实际跑的是 exe，那当然"改了没反应"。
 
 ---
 
 ## 1. 先跑一次自检
 
 ```bash
-# 独立运行
-dist/WorkBuddy签到.exe --selftest
-dist/WorkBuddy签到.exe --diagnose
-
-# 本地运行
-python run.py --selftest
-python run.py --diagnose
+WorkBuddyCheckin.exe --selftest       # 结果写 数据目录\selftest.json
+WorkBuddyCheckin.exe --diagnose       # 授权 + 接口连通性（不含令牌）
+WorkBuddyCheckin.exe --version        # 版本 / 运行方式 / 数据目录
 ```
 
-`--selftest` 写 `selftest.json`，重点字段：
+`selftest.json` 重点字段：
 
 | 字段 | 期望 |
 |---|---|
-| `frozen` | 独立运行必须是 `true`；`false` 说明你跑的是源码 |
-| `app_dir` | 独立运行应为 `dist`，本地运行为仓库根目录 |
-| `config_path` / `token_file` | 是否落在你以认为的目录 |
+| `frozen` | exe 必须是 `true`；`false` 说明你跑的是源码 |
+| `data_dir` / `data_origin` | 应为缓存目录 / `用户缓存目录` |
+| `install_dir` | exe 所在目录（不写数据，只用来确认程序在哪） |
 | `token.present` / `expired` / `disabled` | 授权状态 |
 | `schedule.exists` / `command` | 任务是否存在、指向哪个程序 |
 
@@ -45,27 +41,26 @@ python run.py --diagnose
 
 ## 2. 提示「尚未授权」
 
-本机没有 `auth_oauth.json`，或文件不完整。此时界面上除「立即授权」外**全部按钮
-都是灰的**——这是设计好的门禁，不是按钮坏了。
+数据目录里没有 `auth_oauth.json`，或文件不完整。此时界面上除「立即授权」外
+**全部按钮都是灰的**——这是设计好的门禁，不是按钮坏了。
 
 1. 点 **立即授权**，在本机浏览器登录一次即可
-2. 这台机器没有浏览器 / 没人守着 → 走服务端流程：服务器跑
-   `wb_auth_server.py`，再用命令行把令牌交给这台机器
-   （`--import-token` 或 `--pull-token`，见 [server.md](server.md)）。
-   **界面里没有导入入口**，只能在命令行做。
+2. 浏览器走不通时（企业策略 / 代理拦截）：在别处命令行授权后，
+   `WorkBuddyCheckin.exe --import-token "<导入码>"` 导入
+   （界面没有导入入口，只在命令行）
 
 ---
 
 ## 3. 提示「授权已失效」/ 收到「授权还剩 2 天」
 
-`refreshToken` 也过期了：约 30 天没跑过，或服务端提前撤销。重新授权一次即可。
+`refreshToken` 也过期了：约 30 天没跑过，或被提前撤销。重新授权一次即可。
 
-「还剩 N 天」的提醒是**每次签到后顺手检查**发出来的（阈值 `expiry_warn_days`，
+「还剩 N 天」是**每次签到后顺手检查**发出来的（阈值 `expiry_warn_days`，
 默认 2 天）。它出现说明**自动续期没成功**——别等，直接重新授权。
 
-> 隐蔽情况：**服务器那边还留着一份令牌在续期**（比如用了 `--save-token`），
-> 两边刷新会互相踢掉（`refreshToken` 轮换），服务端返回 `12153`。
-> 令牌只能有一份，删掉多余那份。
+> 隐蔽情况：同一账号在**两台机器**上都在跑（比如 Windows 版和服务端版同时定时）。
+> `refreshToken` 每次刷新都会轮换，两边互相踢，服务端返回 `12153`。
+> 只留一处运行，另一处的定时删掉。
 
 ---
 
@@ -89,8 +84,7 @@ python run.py --diagnose
 ### 6.1 看系统里到底有没有任务
 
 ```bash
-WorkBuddy签到.exe --sched-status     # 独立运行
-python run.py --sched-status         # 本地运行
+WorkBuddyCheckin.exe --sched-status
 ```
 
 windowed exe 没有控制台，`print` 没人看见，所以结果同时写进 `checkin.log`：
@@ -102,7 +96,8 @@ windowed exe 没有控制台，`print` 没人看见，所以结果同时写进 `
   触发时间  09:00
   下次运行  2026-10-20T09:07:41
   上次运行  2026-10-19T09:11:03（成功）
-  执行命令  D:\workbuddy-checkin\WorkBuddy签到.exe --run
+  执行命令  D:\dist\WorkBuddyCheckin.exe --run
+  指向当前  是
 ```
 
 ### 6.2 对照常见原因
@@ -110,20 +105,20 @@ windowed exe 没有控制台，`print` 没人看见，所以结果同时写进 `
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | 状态行「未注册」 | 只改了配置，没点「应用到系统」 | 点一次 |
-| 状态行「路径失效」 | 程序挪了位置 | 重新「应用到系统」 |
-| 上次结果「未授权 / 令牌失效」，退出码 2 | 授权没了 | 重新授权 |
+| 状态行「路径失效」 | exe 挪了位置 | 打开程序会自动修；或重新「应用到系统」 |
+| 「指向当前 否」 | 任务还指向旧路径（如旧版 `run.py`） | 同上 |
+| 上次结果「未完成（客户端未就绪或未登录）」，退出码 2 | 授权没了 | 重新授权 |
 | 上次结果系统标记异常（0x…） | 实例冲突 / 被安全软件拦 | 稍后重试，检查杀软 |
 | 上次结果「尚未运行过」 | 新建任务还没到点 | 不是故障 |
 | 到点但电脑关机 / 休眠 | 已开「错过后尽快启动」 | 开机后自动补跑 |
 
-> 本地运行和独立运行注册的是**同一个任务名** `WorkBuddyCheckin`。
-> 后应用的会覆盖前一个：在源码态点过「应用到系统」，之后又换成 exe，
-> 必须重新应用一次，否则任务还在调旧的 `run.py`。
+> 任务里存的是 **exe 的绝对路径**。exe 换目录后，打开一次程序即可自动修正
+> （v3.0 起）。源码运行**不会**改这个任务，避免开发动作影响已部署的机器。
 
 ### 6.3 手动跑一次，区分任务问题还是程序问题
 
 ```bash
-WorkBuddy签到.exe --run
+WorkBuddyCheckin.exe --run
 ```
 
 和计划任务调的是同一个入口。这条能成、定时不成 → 问题在任务注册；
@@ -140,13 +135,13 @@ WorkBuddy签到.exe --run
 ### 原因
 
 窗口程序自身没有控制台，拉起 `powershell.exe` 时 Windows 会给它新建一个。
-修法见 [architecture.md](architecture.md#8-子进程不弹控制台窗口)：
+修法见 [architecture.md](architecture.md#9-子进程不弹控制台窗口)：
 所有子进程统一加 `CREATE_NO_WINDOW` + `startupinfo(SW_HIDE)`。
 
 ### 自己确认
 
 ```bash
-pythonw tools/no_popup_check.py --exe "dist/WorkBuddy签到.exe" -- --sched-status
+pythonw tools/no_popup_check.py --exe "dist/WorkBuddyCheckin.exe" -- --sched-status
 ```
 
 它用 `EnumWindows` 枚举全系统可见顶层窗口，报告期间出现了几个控制台类窗口，
@@ -165,7 +160,7 @@ pythonw tools/no_popup_check.py --exe "dist/WorkBuddy签到.exe" -- --sched-stat
 
 1. 「消息推送」里点 **发送测试**，界面会给出每个渠道的成败
 2. 检查是不是**没勾渠道**：勾了才会推，填了 key 不算
-3. 企业微信：key 是 webhook 链接里 `?key=` 后面那段，不要带整条链接
+3. 企业微信：key 是 webhook 链接里 `?key=` 后面那段（贴整条链接也能自动抽）
 4. 钉钉：机器人安全设置选「自定义关键词」时，关键词要含「签到」
 5. 两个渠道互相独立，一个挂了不影响另一个
 
@@ -173,49 +168,61 @@ pythonw tools/no_popup_check.py --exe "dist/WorkBuddy签到.exe" -- --sched-stat
 
 ---
 
-## 9. 服务端脚本
+## 9. 服务端（cron）
 
 完整说明见 [server.md](server.md)，这里只列最常卡住的地方。
 
 ### 先别猜，跑体检
 
 ```bash
-python src/wb_auth_server.py --config /etc/wbcheckin/config.json --check
+python3 wb_server.py --check
 ```
 
-它不联网，只告诉你每个渠道是「可用 / 勾了没填 key / 填了没勾 / 未启用」。
+不联网，只告诉你授权状态和每个渠道是「可用 / 勾了没填 key / 填了没勾 / 未启用」。
 没有可用渠道时退出码 `2`。
+
+### 卡在授权
+
+- 默认每轮等 180 秒，最多 3 轮，轮间退避 60 / 120 秒；
+- 3 轮都没点 → 推失败通知，退出码 `2`；
+- 想留更长时间：`--wait 300` 或改 `auth_wait_seconds`；
+- 想先单独把授权做完：`--auth-only`。
+
+### 授权链接点开是空的 / 打不开
+
+链接里的 `state` 只在等待窗口内有效（默认 3 分钟）。过期就重跑脚本，
+它会重新申请一条。
 
 ### 推送不出去
 
 服务器要能访问 `qyapi.weixin.qq.com` / `oapi.dingtalk.com`。很多内网只放行白名单。
 单独试推送：`--push-only --url "https://example.com"`。
 
-### 授权链接点开是空的 / 打不开
+### cron 里不跑，手工跑正常
 
-链接有效期有限（默认 10 分钟），过期就重新跑一次脚本，或把 `--timeout` 调大。
+- 没有 `cd` 到脚本目录，或用了相对路径
+- cron 的 `PATH` 很短，`python3` 找不到 → 写绝对路径
+- 用干净环境验证：
 
-### `--handoff` 取不到令牌
-
-- Windows 端要能访问服务器端口（先在 Windows 上 `curl http://<ip>:8787/status`）
-- 端口被占用时脚本会自动换一个，用控制台打印出来的那个地址
-- secret 一次性有效：取过之后再取会返回 `410`
-- 超过 `--handoff-timeout`（默认 600 秒）没人取，脚本退出码 `4`
-
-### 导入码报「无法解析」
-
-多半是复制不全。整段重新复制；或让服务端用 `--save-token` 导出文件，再
-`--import-token <文件路径>`。
+```bash
+env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin \
+  sh -c 'cd /opt/wbcheckin && python3 wb_server.py --check'
+```
 
 ### 服务端读的是哪份配置
 
-默认是**数据目录**的 `config.json`。服务器上没有仓库结构时显式指定：
+默认是**脚本同目录**的 `config.json`。放别处：
 
 ```bash
-python src/wb_auth_server.py --config /etc/wbcheckin/config.json
+python3 wb_server.py --config /etc/wbcheckin/config.json
 ```
 
-还没有配置文件就先 `--init-config` 生成一份模板。
+此时日志和令牌也跟着写到 `/etc/wbcheckin/`。
+
+### 导入码报「无法解析」
+
+多半是复制不全。整段重新复制，或直接用文件：
+`WorkBuddyCheckin.exe --import-token D:\path\auth_oauth.json`。
 
 ---
 
@@ -245,15 +252,15 @@ python -m pip install --target .build/pylibs pyinstaller
 python build/build_exe.py
 ```
 
-它会挑解释器、打包、跑 `--selftest` 校验，不通过直接报错。
-手工跑 PyInstaller 时**必须带 `--paths src`**，否则找不到 `src/` 里的模块；
-完整命令见 [build.md](build.md#等价的-pyinstaller-命令)。
+它会挑解释器、写入版本资源、打包、跑 `--selftest` 校验，不通过直接报错。
+手工跑 PyInstaller 时**必须带 `--paths src`** 并指向 `build/entry.py`，
+完整命令见 [build.md](build.md)。
 
 ### 源码能跑，exe 不能
 
-先看 `dist/selftest.json` 的 `app_dir` 和 `config_path` 是不是都指向 `dist/`。
-最常见的两类：路径问题（配置读到了别处）、权限问题（exe 放在 `Program Files`
-下，写不了日志）。
+先看 `selftest.json` 的 `data_dir` 和 `config_path`。最常见的两类：
+路径问题（`frozen` 不是 `true`，跑的还是源码）、缓存目录没权限
+（极少见，`%LOCALAPPDATA%` 一般都可写）。
 
 ### 打包时 PermissionError
 
@@ -271,9 +278,5 @@ python build/build_exe.py
 | `checkin.log` | 执行结果摘要，无敏感信息 | 随便删 |
 | `selftest.json` | `--selftest` 的输出 | 随便删 |
 
-它们的位置：
-
-| 运行方式 | 位置 |
-|---|---|
-| 本地运行 | 仓库根目录 |
-| 独立运行 | exe 所在目录（通常是 `dist/`） |
+位置见第 0 节。从 v2.x 升级后，旧的 exe 旁边可能还留着一份
+`config.json` / `auth_oauth.json`——已复制到缓存目录，确认没问题后可以删。

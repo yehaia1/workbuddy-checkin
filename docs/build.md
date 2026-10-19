@@ -1,189 +1,136 @@
 # 构建与打包
 
-本文只讲**怎么把源码变成可发布的 exe**。业务逻辑在 `src/`，
-构建相关的所有东西都在 `build/`，两者不互相引用。
+## 1. 版本管理
 
----
+**版本号只有一个来源**：`src/wb_config.py` 的 `VERSION`
 
-## 1. 前置条件
+```python
+VERSION = "3.0.0"
+RELEASE_DATE = "2026-10-19"
+```
 
-| 用途 | 要求 |
+三处会用到它，都从这里读：
+
+| 位置 | 表现 |
 |---|---|
-| 本地运行 | Python 3.8+，**带 tkinter** |
-| 打包 | 同上 + PyInstaller（可装在隔离目录） |
+| 界面右上角 / 启动日志 | `v3.0.0` |
+| `--version`（exe 与服务端脚本） | `WorkBuddyCheckin 3.0.0 (2026-10-19)` |
+| exe 文件属性（右键 → 详细信息） | 文件版本 / 产品版本 `3.0.0` |
 
-本项目**零第三方运行时依赖**，但打包器本身要单独装：
+打包时 `build/build_exe.py` 会读取 `VERSION`，生成 PyInstaller 的版本资源
+（`.build/pyi/version_info.txt`）再喂给 `--version-file`。所以**改了版本号，
+exe 属性里的版本就跟着变**，不需要另外维护 `.rc` 文件。
+
+发版流程：
+
+1. 改 `src/wb_config.py` 的 `VERSION` / `RELEASE_DATE`
+2. 在 `CHANGELOG.md` 顶部加一节（`## [3.1.0] - 2026-xx-xx`）
+3. `python build/build_exe.py`
+4. 打包脚本末尾会打印 `打包完成：v3.1.0`，异常说明版本没进产物
+
+版本语义按 [SemVer](https://semver.org/lang/zh-CN/)：破坏性改动进次版本号
+（本项目 2.0 → 3.0 都改了运行方式与数据目录），功能进 MINOR，修 bug 进 PATCH。
+
+## 2. 环境要求
+
+- Windows（计划任务、`pythonw`、无控制台行为都只在 Windows 上有意义）
+- **带 tkinter 的 Python 3.8+**
+- PyInstaller（本机隔离安装即可）
+
+> 打包脚本会自己挑一个能 `import tkinter` 的解释器。本机可用的是
+> `C:\Users\<你>\AppData\Local\Programs\Python\Python313\python3.exe`
+> （该目录没有 `python.exe`，只有 `python3.exe` / `pythonw3.exe`）。
+
+第一次打包先装 PyInstaller 到本地隔离目录：
 
 ```bash
-# 装到仓库内的隔离目录，不污染系统环境
 python -m pip install --target .build/pylibs pyinstaller
 ```
-
-`.build/` 已在 `.gitignore` 中，构建产物不会进版本库。
-
----
-
-## 2. 本地运行（不打包）
-
-```bash
-python run.py
-```
-
-`run.py` 只做路径引导：把 `src/` 加进 `sys.path`，然后调用
-`checkin_gui.main()`。配置、日志、令牌都写在**仓库根目录**。
-
-无界面调试：
-
-```bash
-python run.py --run --json
-python run.py --selftest
-python run.py --diagnose
-```
-
-> 本地运行和独立运行的数据目录是分开的（根目录 vs exe 旁边），
-> 别拿根目录的 `config.json` 去推断 exe 的配置。
-
----
 
 ## 3. 打包
 
 ```bash
-python build/build_exe.py
+python build/build_exe.py                    # 自动挑解释器
+python build/build_exe.py --python <解释器>   # 指定解释器
 ```
 
-脚本做四件事：
-
-1. **挑解释器** —— 从常见安装路径里找第一个 `import tkinter` 成功的
-2. **调用 PyInstaller** —— `--onefile --windowed`，入口是 `build/entry.py`，
-   源码搜索路径是 `src/`
-3. **自检** —— 跑一次 `--selftest`，并校验 `frozen == true`
-4. **出中文名** —— 顺手复制一份 `dist/WorkBuddy签到.exe`
-
-产物：
+产物**只有一个**：
 
 ```
-dist/WorkBuddyCheckin.exe      # 主产物
-dist/WorkBuddy签到.exe          # 直接对外发的那个名字
+dist/WorkBuddyCheckin.exe      # 单文件，双击即用，目标机器不用装 Python
 ```
 
-PyInstaller 先输出到 `.build/out/`，校验通过后再复制进 `dist/`——
-这样在 `dist/` 里的 exe 正在运行时也不会写不进去（覆盖一个被占用的文件会
-`PermissionError`）。
+不再生成中文名副本。中文名在命令行、计划任务、日志、编码转换里都会被折腾，
+而 exe 名字只影响用户看到什么——所以统一用英文名。如果 dist 里还留着
+`WorkBuddy签到.exe` 这类旧产物，打包脚本会顺手删掉，避免两个文件混在一起。
 
-正常体积约 **11.4 MB**。如果只有 8 MB 左右，几乎一定是没打进去 tkinter，
-脚本的自检会拦住这种产物。
+打包过程：
 
-### 指定解释器
-
-```bash
-python build/build_exe.py --python "C:\...\Python313\python3.exe"
+```
+src/            --paths 挂进去（业务代码都在这里）
+build/entry.py  PyInstaller 的入口（冻结态启动 + 设数据目录）
+--onefile       单文件
+--windowed      不带控制台（配合 win_quiet 保证不弹黑框）
+--version-file  版本资源
+先出到 .build/out，校验通过再 copy 到 dist/
 ```
 
-### 等价的 PyInstaller 命令
+先出到 `.build/out` 再复制，是为了避开 dist 里的 exe 正在运行时的
+`PermissionError`。
 
-脚本只是把这些参数固定下来；手工执行时必须保留 `--paths src`，
-否则 PyInstaller 找不到 `src/` 里的模块：
+## 4. 打包后的自动校验
 
-```bash
-python -m PyInstaller --noconfirm --clean --onefile --windowed \
-  --name WorkBuddyCheckin \
-  --paths src \
-  --distpath dist \
-  --workpath .build/pyi/work \
-  --specpath .build/pyi \
-  --hidden-import wb_config --hidden-import wb_notify \
-  --hidden-import wb_oauth --hidden-import wb_task \
-  --hidden-import win_quiet --hidden-import workbuddy_checkin \
-  --hidden-import checkin_gui \
-  build/entry.py
+`build_exe.py` 打完会立刻运行一次 `dist/WorkBuddyCheckin.exe --selftest`，
+只有同时满足下面条件才算成功：
+
+- 退出码为 `0`
+- 重新生成了 `selftest.json`（打包前会先删旧的，防止拿旧结果蒙过去）
+- `selftest.json` 里 `frozen` 为 `true`
+
+校验通过会打印版本、授权状态、推送渠道。**最重要的一条是 `frozen=true`**：
+缺 tkinter 的坏包通常在更早的导入阶段就崩了，但偶尔会有"能跑但不是冻结态"
+的诡异产物。
+
+`selftest.json` 写在**数据目录**（exe 是 `%LOCALAPPDATA%\WorkBuddyCheckin`），
+里面重点看：
+
+```json
+{
+  "version": "3.0.0",
+  "frozen": true,
+  "data_dir": "C:\\Users\\<你>\\AppData\\Local\\WorkBuddyCheckin",
+  "data_origin": "用户缓存目录",
+  "install_dir": "D:\\dist",
+  "token": {"present": true, "days_left": 27},
+  "schedule": {"exists": true, "command": "D:/dist/WorkBuddyCheckin.exe"}
+}
 ```
-
----
-
-## 4. 打包后验证
-
-```bash
-# 1) 冻结态自检：会写 dist/selftest.json
-dist/WorkBuddy签到.exe --selftest
-
-# 2) 无界面跑一次（建议先临时关掉推送，避免真发消息）
-dist/WorkBuddy签到.exe --run --json
-
-# 3) 确认没有控制台黑框
-pythonw tools/no_popup_check.py --exe "dist/WorkBuddy签到.exe" -- --sched-status
-
-# 4) 授权链路回归（本地桩服务器，不碰真接口）
-python tools/oauth_mode_check.py
-#    结果写 .build/oauth_mode_check.json
-```
-
-`selftest.json` 里重点看：
-
-- `frozen` 必须是 `true`（否则你跑的是源码）
-- `app_dir` 必须是 `dist`（配置和令牌才会跟着 exe 走）
-- `token.present` / `expired`
-- `schedule.exists` / `command` 是否指向当前 exe 路径
-
-> 挪动 exe 之后，计划任务里的旧路径会失效，需要在界面里重新「应用到系统」。
-
----
 
 ## 5. 发布前检查清单
 
-- [ ] `python tools/oauth_mode_check.py` 全绿（当前 52 项）
-- [ ] `dist/WorkBuddy签到.exe --selftest` 退出码 0，`frozen=true`
+- [ ] `python tools/oauth_mode_check.py` 全绿（67 项）
+- [ ] `dist/WorkBuddyCheckin.exe --version` 版本号正确
+- [ ] `--selftest` 退出码 0，`frozen=true`，`data_origin=用户缓存目录`
+- [ ] 把 exe 拷到**另一个目录**再运行，确认仍能读到配置（数据目录不在 exe 旁）
 - [ ] `--sched-status` 不弹控制台黑框
-- [ ] `--run` 退出码 0（测之前把**两套**配置的 `push_channels` 都临时清空，
-      跑完还原）
-- [ ] 未授权状态下启动界面，除「立即授权」外按钮全灰
-- [ ] `dist/config.json` 里没有真实 key（发布包不带配置）
-- [ ] 不在 `dist/` 里留下 `auth_oauth.json`、`checkin.log`
-- [ ] README 的截图与新界面一致
-
-分发包只需要 **exe 一个文件**。`config.json` 由程序首次运行时生成，
-不要把带 key 的配置一起发出去。
-
----
+- [ ] `--run` 退出码 0（**测之前先清空 `push_channels`**，别真发消息）
+- [ ] 未授权时打开界面，除「立即授权」外按钮全灰
+- [ ] 没有把 `config.json` / `auth_oauth.json` / `*.log` 打进发布包
+- [ ] README 截图与当前界面一致
 
 ## 6. 踩过的坑
 
-### 解释器没有 tkinter
+**用不带 tkinter 的解释器打包**：PyInstaller 不报错，只是悄悄少收集
+`_tkinter.pyd` 和 tcl/tk 运行时，产物一启动就 `ModuleNotFoundError: tkinter`。
+唯一线索是体积小掉约 3 MB（正常约 11 MB）。所以脚本强制挑解释器 + 打完自检。
 
-PyInstaller **不会报错**，只是少收集 `_tkinter.pyd` 和 tcl/tk；产物能生成，
-双击就 `ModuleNotFoundError`。`build_exe.py` 因此强制先 `import tkinter` 试一下。
+**拿旧 `selftest.json` 当通过依据**：文件在 ≠ 这次跑过。打包前必须先删。
 
-### 上一版的自检结果冒充这一次
+**dist 里的 exe 正在运行**：往 dist 写会 `PermissionError`。先出到 `.build/out`
+再复制。
 
-`selftest.json` 没删就跑，校验会无条件通过。脚本先 unlink 再跑，并且
-额外校验 `frozen` 字段（源码态自检同样会生成这个文件）。
+**中文名 exe**：曾经打两个名字，结果计划任务、文档、日志里各写各的，
+还出现过"改了新 exe、用户双击的是旧中文名"的情况。v3.0 起只出英文名。
 
-### 旧 exe 被占用
-
-exe 正在运行（或计划任务刚拉起）时覆盖会 `PermissionError`。
-先确认 `dist/` 里没有进程在跑；必要时换一个 `--distpath` 再复制回来。
-
-### 无控制台程序的输出
-
-`--windowed` 打包后 `sys.stdout` 可能是 `None`。无界面入口会把输出接到
-UTF-8 的 `checkin.log`，否则中文/emoji 打印会抛异常，表现为
-**签到成功但退出码非 0**，计划任务记成失败。细节见
-[architecture.md](architecture.md#9-无控制台程序的输出)。
-
----
-
-## 7. 目录约定
-
-```
-run.py            本地运行入口，不参与打包
-build/entry.py    独立运行入口，只给 PyInstaller 用
-src/              全部业务逻辑，不含构建代码
-build/            全部构建脚本，不含业务逻辑
-.build/           PyInstaller 中间产物、隔离安装的依赖（不入库）
-dist/             发布产物（不入库，截图除外）
-```
-
-新增模块时：
-
-- 业务代码放 `src/`，按现有风格 `import wb_xxx`
-- 如果引入新的顶层模块，记得加进 `build_exe.py` 的 `HIDDEN_IMPORTS`
-- 不要从 `src/` 反向 import `build/` 里的任何东西
+**`--windowed` 下 stdout 可能是 None**：日志重定向和 `--json` 输出都要先判断，
+否则"签到成功但退出码非 0"，计划任务天天标红。

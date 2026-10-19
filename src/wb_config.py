@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 APP_TITLE = "WorkBuddy 签到"
-VERSION = "2.1"
+VERSION = "2.2"
 
 TOKEN_FILE_NAME = "auth_oauth.json"
 
@@ -60,6 +60,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # ---- 授权 ----
     "oauth_token_file": "",         # 留空 = 程序目录下 auth_oauth.json
     "oauth_auth_timeout": 300,      # 等待扫码/浏览器登录的上限（秒）
+    # 令牌剩余天数 <= 该值时，每次签到后额外推一条续期提醒（界面不暴露，
+    # 需要改就改 config.json；设 0 = 关闭提醒）
+    "expiry_warn_days": 2,
     # ---- 定时 ----
     "schedule_enabled": False,      # 是否已写入 Windows 计划任务
     "schedule_times": ["09:00"],    # 每日触发时间点，可多个

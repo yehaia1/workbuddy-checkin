@@ -20,13 +20,17 @@
     python run.py                          # 图形界面
     python run.py --run                    # 无界面执行一次（计划任务用）
     python run.py --check-only
-    python run.py --auth                   # 本机浏览器授权
-    python run.py --auth-push              # 授权链接推到手机，本机等待
-    python run.py --import-token <导入码|文件>
-    python run.py --pull-token <url> <secret>
+    python run.py --auth                   # 本机浏览器授权（界面唯一入口）
     python run.py --test-notify
     python run.py --diagnose
   以上均可加 --json 输出单行 JSON
+
+下面是**服务端授权流程**专用的两条命令，界面上没有对应入口
+（详见 docs/server.md）：服务器跑 wb_auth_server.py 拿到令牌后，用它们把
+令牌交到真正执行签到的那台 Windows 上。
+
+    python run.py --import-token <导入码|令牌文件>
+    python run.py --pull-token <url> <secret>
 """
 from __future__ import annotations
 
@@ -191,12 +195,75 @@ def build_message(result: Dict[str, Any]) -> str:
 
 
 def build_auth_message(url: str, minutes: int) -> str:
-    """授权链接的推送文案。"""
+    """授权链接的推送文案（服务端脚本用它把链接发到群里）。"""
     return ("【WorkBuddy 签到】🔐 请完成账号授权\n"
             "1) 点开下面这条链接（手机上点开即可）\n"
             "2) 登录并确认授权\n"
-            "有效期约 {} 分钟；授权成功后会自动完成签到配置。\n"
+            "有效期约 {} 分钟。\n"
             "{}".format(minutes, url))
+
+
+# ---------------- 授权到期提醒 ----------------
+
+# 令牌剩余天数 <= 这个值时提醒（配置项 expiry_warn_days 可改，0 = 关闭）
+EXPIRY_WARN_DAYS = 2
+
+
+def build_expiry_message(days: int, expires_text: str = "",
+                         nickname: str = "") -> str:
+    """到期提醒文案。days 为负数表示已经过期。"""
+    if days < 0:
+        state = "授权已过期"
+        action = ("现在签到会失败，请打开程序点「立即授权」重新登录一次。")
+    else:
+        state = "授权还剩 {} 天".format(days)
+        action = ("到期后签到会失败。程序会在到期前 5 天自动续期，"
+                  "收到这条提醒说明自动续期没有成功，"
+                  "请打开程序点「立即授权」重新登录一次。")
+    return ("【WorkBuddy 签到】⚠️ {}\n"
+            "账号：{}\n"
+            "令牌到期：{}\n"
+            "{}".format(state, nickname or "当前账号",
+                        expires_text or "未知", action))
+
+
+def check_expiry_notice(cfg: Optional[Dict[str, Any]] = None,
+                        progress: Optional[Any] = None,
+                        notify: bool = True) -> Optional[Dict[str, Any]]:
+    """令牌快到期就推一条提醒；不需要提醒时返回 None。
+
+    挂在**每次签到之后**：签到每天本来就会跑一次，顺手看一眼不增加任何调度；
+    而且令牌真挂了下次签到就会失败，这条提醒只是提前一步。
+
+    只认「有令牌但不健康」这一种情况——没令牌属于未授权，由界面横幅报，
+    不必再往群里推一条。
+    """
+    cfg = cfg or load_config()
+    emit = progress or _progress
+    try:
+        days_warn = int(cfg.get("expiry_warn_days", EXPIRY_WARN_DAYS) or 0)
+    except (TypeError, ValueError):
+        days_warn = EXPIRY_WARN_DAYS
+    if days_warn <= 0:
+        return None
+    info = wb_oauth.summary(oauth_token_path(cfg))
+    if not info.get("present") or info.get("error") or info.get("disabled"):
+        return None
+    days = info.get("days_left")
+    if days is None or days > days_warn:
+        return None
+
+    expires_text = info.get("expires_text") or ""
+    text = build_expiry_message(days, expires_text, info.get("nickname") or "")
+    emit("授权只剩 {} 天（{}），发送续期提醒".format(days, expires_text or "?"))
+    pushed = wb_notify.push(cfg, text) if notify else []
+    for name, _ok, detail in pushed:
+        emit("{}：{}".format(name, detail))
+    out: Dict[str, Any] = {"days_left": days, "expires_text": expires_text}
+    if pushed:
+        out["notify_results"] = [{"channel": n, "ok": ok, "detail": d}
+                                 for n, ok, d in pushed]
+    return out
 
 
 def notify_result(cfg: Dict[str, Any], result: Dict[str, Any],
@@ -217,22 +284,27 @@ def run_once(cfg: Optional[Dict[str, Any]] = None,
              check_only: bool = False,
              progress: Optional[Any] = None,
              notify: bool = True) -> Dict[str, Any]:
-    """完整跑一次：连 → 查 → 领 → 复核 → 推送。
+    """完整跑一次：连 → 查 → 领 → 复核 → 推送 → 到期检查。
 
     GUI 和命令行走同一条路径，避免两套实现慢慢走偏。
     """
     cfg = cfg or load_config()
     emit = progress or _progress
 
+    def finish(res: Dict[str, Any]) -> Dict[str, Any]:
+        append_log(res)
+        if notify:
+            notify_result(cfg, res, emit)
+            notice = check_expiry_notice(cfg, emit, notify=True)
+            if notice:
+                res["expiry_notice"] = notice
+        return res
+
     try:
         sess = open_session(cfg, progress=emit)
     except SESSION_ERRORS as e:
-        result = {"result": e.result, "message": str(e),
-                  "exit_code": e.exit_code}
-        append_log(result)
-        if notify:
-            notify_result(cfg, result, emit)
-        return result
+        return finish({"result": e.result, "message": str(e),
+                       "exit_code": e.exit_code})
 
     try:
         with sess:
@@ -240,27 +312,21 @@ def run_once(cfg: Optional[Dict[str, Any]] = None,
     except SESSION_ERRORS as e:
         result = {"result": e.result, "message": str(e),
                   "exit_code": e.exit_code}
-
-    append_log(result)
-    if notify:
-        notify_result(cfg, result, emit)
-    return result
+    return finish(result)
 
 
 # ---------------- 授权 ----------------
 
 def login_oauth(cfg: Optional[Dict[str, Any]] = None,
                 progress: Optional[Any] = None,
-                push: bool = False,
                 timeout: Optional[int] = None,
                 on_url: Optional[Callable[[str], None]] = None,
                 should_stop: Optional[Callable[[], bool]] = None
                 ) -> Dict[str, Any]:
-    """走一遍设备授权，把令牌落到本机。
+    """走一遍设备授权，把令牌落到本机（本机浏览器，界面唯一入口）。
 
-    push=False：自动打开本机浏览器（有桌面的机器）
-    push=True ：不碰浏览器，把授权链接推送到已选渠道（手机点开、扫码/登录），
-                本机在后台轮询等结果。适合无人值守 / 没有浏览器的机器。
+    远程授权（把链接推到手机）不在这里：那属于服务端流程，
+    由 wb_auth_server.py 发起，见 docs/server.md。
 
     on_url(url)   拿到链接的瞬间回调（界面靠它立刻把链接显示出来）
     should_stop() 返回 True 时中断等待（用户点了取消）
@@ -269,32 +335,12 @@ def login_oauth(cfg: Optional[Dict[str, Any]] = None,
     emit = progress or _progress
     path = oauth_token_path(cfg)
     timeout = int(timeout or cfg.get("oauth_auth_timeout", 300) or 300)
-    push_info: Dict[str, Any] = {}
-
-    def handle_url(url: str) -> None:
-        if on_url:
-            on_url(url)
-        if not push:
-            return
-        channels = wb_notify.selected_channels(cfg)
-        if not channels:
-            raise CheckinError(
-                "PUSH_NOT_CONFIGURED",
-                "没有可用的推送渠道，无法把授权链接发到手机。"
-                "请先在「推送」里选好渠道并填 key。", 2)
-        sent = wb_notify.push(cfg, build_auth_message(url, max(1, timeout // 60)))
-        push_info["results"] = sent
-        for name, ok, detail in sent:
-            emit("{}：{}".format(name, detail))
-        if not any(ok for _n, ok, _d in sent):
-            raise CheckinError("PUSH_FAILED",
-                               "授权链接推送失败，请检查推送配置。", 2)
 
     try:
-        rec = wb_oauth.login(path, emit=emit, open_browser=not push,
-                             timeout=timeout, on_url=handle_url,
+        rec = wb_oauth.login(path, emit=emit, open_browser=True,
+                             timeout=timeout, on_url=on_url,
                              should_stop=should_stop)
-    except (wb_oauth.OAuthError, CheckinError) as e:
+    except wb_oauth.OAuthError as e:
         result = {"result": e.result, "message": str(e),
                   "exit_code": e.exit_code}
         append_log(result)
@@ -310,10 +356,6 @@ def login_oauth(cfg: Optional[Dict[str, Any]] = None,
         "expires_at": auth.get("expiresAt") or 0,
         "token_file": path,
     }
-    if push_info.get("results"):
-        result["notify_results"] = [
-            {"channel": n, "ok": ok, "detail": d}
-            for n, ok, d in push_info["results"]]
     append_log({"result": "AUTHORIZED",
                 "note": "uid={} domain={}".format(result["uid"],
                                                   result["domain"])})
@@ -540,13 +582,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--test-notify", action="store_true",
                         help="发送测试消息到已选推送渠道")
     parser.add_argument("--auth", action="store_true",
-                        help="本机浏览器授权")
-    parser.add_argument("--auth-push", action="store_true",
-                        help="把授权链接推送到手机，本机等待授权结果")
+                        help="本机浏览器授权（界面唯一入口）")
     parser.add_argument("--import-token", metavar="CODE_OR_FILE",
-                        help="导入服务端授权结果（导入码或令牌文件）")
+                        help="服务端流程：导入服务端授权结果（导入码或令牌文件）")
     parser.add_argument("--pull-token", nargs=2, metavar=("URL", "SECRET"),
-                        help="从服务端一次性端口领取令牌")
+                        help="服务端流程：从服务端一次性端口领取令牌")
     parser.add_argument("--json", action="store_true", help="输出单行 JSON")
     # 无界面签到入口：计划任务调起时用
     parser.add_argument("--run", action="store_true", help=argparse.SUPPRESS)
@@ -579,8 +619,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(diagnose(), ensure_ascii=False, indent=2))
         return 0
 
-    if args.auth or args.auth_push:
-        result = login_oauth(cfg, progress=_progress, push=bool(args.auth_push))
+    if args.auth:
+        result = login_oauth(cfg, progress=_progress)
         render(result, args.json)
         return int(result.get("exit_code", 0))
 

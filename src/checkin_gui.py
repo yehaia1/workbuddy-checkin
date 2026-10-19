@@ -22,7 +22,7 @@ import time
 import traceback
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import messagebox, scrolledtext, ttk
 
 import wb_config
 import wb_notify
@@ -60,6 +60,8 @@ C_INPUT_BG = "#FFFFFF"
 C_OK = "#1E7A46"
 C_BAD = "#C0342B"
 C_WARN = "#B26A00"
+C_DISABLED_BG = "#EDEFF3"
+C_DISABLED_FG = "#A8AEB8"
 
 BANNER = {
     "checking": ("#EEF1F5", "#5A6472"),
@@ -169,12 +171,27 @@ def flat_button(parent, text, cmd, primary=False, small=True):
         fg="#FFFFFF" if primary else C_TEXT,
         activebackground=C_PRIMARY_DK if primary else "#EDEFF3",
         activeforeground="#FFFFFF" if primary else C_TEXT,
+        disabledforeground=C_DISABLED_FG,
         relief="flat", bd=0,
         padx=P(14) if primary else P(12),
         pady=P(6) if primary else P(5),
         cursor="hand2", highlightbackground=C_BORDER,
         highlightthickness=1)
+    # 记住正常态配色：禁用时背景也要一起变，否则主按钮（蓝底白字）看起来
+    # 还是"能点"的，只有文字变灰根本不够明显。
+    b.wb_bg = C_PRIMARY if primary else C_CARD
+    b.wb_fg = "#FFFFFF" if primary else C_TEXT
     return b
+
+
+def set_button_enabled(button, enabled: bool) -> None:
+    """统一的按钮开关（含配色），禁用态要一眼看出来。"""
+    if enabled:
+        button.configure(state="normal", bg=button.wb_bg, fg=button.wb_fg,
+                         cursor="hand2")
+    else:
+        button.configure(state="disabled", bg=C_DISABLED_BG,
+                         fg=C_DISABLED_FG, cursor="arrow")
 
 
 def short_time(iso) -> str:
@@ -218,18 +235,21 @@ def center_over(parent: tk.Misc, top: tk.Toplevel, frac: int = 3) -> None:
 # ---------------- 授权窗口 ----------------
 
 class AuthDialog:
-    """账号授权：本机浏览器 / 推送到手机 两种发起方式。
+    """账号授权：只做本机浏览器授权。
 
-    为什么单独一个窗口：浏览器（或手机）那头登录完，用户需要看到"到底成没成"，
+    为什么单独一个窗口：浏览器那头登录完，用户需要看到"到底成没成"，
     否则只能靠再点一次签到去试，失败了也说不清是授权没完成还是别的问题。
+
+    **远程授权（把链接推到手机）不在这里**：那是服务端流程的一部分，
+    由 wb_auth_server.py 发起、命令行交接（见 docs/server.md）。
+    本地版只保留这一个入口，界面和心智负担都最简单。
 
     线程模型：网络轮询在后台线程，结果通过队列回主线程刷控件。
     """
 
-    def __init__(self, app: "App", push: bool = False, on_done=None):
+    def __init__(self, app: "App", on_done=None):
         self.app = app
         self.cfg = dict(app.cfg)
-        self.push = push
         self.on_done = on_done
         self.stop = False
         self.q: "queue.Queue[tuple]" = queue.Queue()
@@ -249,14 +269,11 @@ class AuthDialog:
         body = tk.Frame(top, bg=C_BG)
         body.pack(fill="both", expand=True, padx=P(20), pady=(P(16), 0))
 
-        title = "在手机上完成授权" if push else "在本机浏览器完成登录"
-        tk.Label(body, text=title, font=UI_FONT_BOLD, bg=C_BG,
+        tk.Label(body, text="在本机浏览器完成登录", font=UI_FONT_BOLD, bg=C_BG,
                  fg=C_TEXT, anchor="w").pack(fill="x")
-        desc = ("正在生成授权链接并推送到手机…" if push
-                else "正在申请授权链接…")
-        self.lbl_desc = tk.Label(body, text=desc, font=UI_FONT_SM, bg=C_BG,
-                                 fg=C_MUTED, anchor="w", justify="left",
-                                 wraplength=P(480))
+        self.lbl_desc = tk.Label(body, text="正在申请授权链接…", font=UI_FONT_SM,
+                                 bg=C_BG, fg=C_MUTED, anchor="w",
+                                 justify="left", wraplength=P(480))
         self.lbl_desc.pack(fill="x", pady=(P(6), P(10)))
 
         self.var_url = tk.StringVar(value="")
@@ -269,8 +286,6 @@ class AuthDialog:
         self.btn_copy.pack(side="left", padx=(0, P(8)))
         self.btn_open = flat_button(row, "打开浏览器", self._open)
         self.btn_open.pack(side="left", padx=(0, P(8)))
-        if push:
-            self.btn_open.pack_forget()
         self.btn_close = flat_button(row, "取消", self._cancel)
         self.btn_close.pack(side="left")
 
@@ -296,7 +311,6 @@ class AuthDialog:
             rec = core.login_oauth(
                 self.cfg,
                 progress=lambda m: self.q.put(("msg", m)),
-                push=self.push,
                 timeout=self.timeout,
                 on_url=lambda u: self.q.put(("url", u)),
                 should_stop=lambda: self.stop)
@@ -315,9 +329,7 @@ class AuthDialog:
                     self.url = str(payload)
                     self.var_url.set(self.url)
                     self.lbl_desc.configure(
-                        text=("授权链接已发送，请在手机上点开并登录。"
-                              "本窗口会一直等到授权完成。") if self.push else
-                             ("浏览器已打开授权页；若没反应，点「打开浏览器」"
+                        text=("浏览器已打开授权页；若没反应，点「打开浏览器」"
                               "或复制下方链接手动访问。"))
                 elif kind == "msg":
                     self._status(str(payload), "info")
@@ -355,8 +367,6 @@ class AuthDialog:
                 "OAUTH_TIMEOUT": "超时了，重新发起一次授权。",
                 "OAUTH_STATE_EXPIRED": "授权会话过期，请重新发起。",
                 "OAUTH_NETWORK": "网络不通，检查代理/防火墙后重试。",
-                "PUSH_NOT_CONFIGURED": "先在「推送」里选好渠道并填 key。",
-                "PUSH_FAILED": "推送失败，检查机器人 key 是否有效。",
             }.get(code, "可重试；反复失败请把日志发出来看。")
             self._status("❌ {}　{}".format(msg, hint), "bad")
             self.btn_close.configure(text="关闭")
@@ -397,87 +407,6 @@ class AuthDialog:
             self.top.destroy()
         except Exception:
             pass
-
-
-class ImportDialog:
-    """导入服务端授权结果：粘贴 WBAT1.xxx 导入码，或选一个令牌文件。"""
-
-    def __init__(self, app: "App", on_done=None):
-        self.app = app
-        self.on_done = on_done
-
-        top = self.top = tk.Toplevel(app.root)
-        top.title("导入授权")
-        top.configure(bg=C_BG)
-        top.resizable(False, False)
-        top.transient(app.root)
-        apply_dialog_theme(top)
-
-        body = tk.Frame(top, bg=C_BG)
-        body.pack(fill="both", expand=True, padx=P(20), pady=(P(16), 0))
-
-        tk.Label(body, text="粘贴服务端给出的导入码", font=UI_FONT_BOLD,
-                 bg=C_BG, fg=C_TEXT, anchor="w").pack(fill="x")
-        tk.Label(body, text="服务端脚本跑完后会输出一串 WBAT1. 开头的导入码，"
-                            "整段粘到下面即可。导入码等同于令牌本身，别外传。",
-                 font=UI_FONT_SM, bg=C_BG, fg=C_MUTED, anchor="w",
-                 justify="left", wraplength=P(470)).pack(
-            fill="x", pady=(P(6), P(8)))
-
-        self.txt = tk.Text(body, height=5, width=56, font=MONO_FONT,
-                           bg=C_INPUT_BG, fg=C_TEXT, relief="flat",
-                           wrap="char", padx=P(8), pady=P(6),
-                           highlightbackground=C_BORDER, highlightthickness=1)
-        self.txt.pack(fill="x")
-
-        self.lbl_status = tk.Label(body, text="", font=UI_FONT_SM, bg=C_BG,
-                                   fg=C_MUTED, anchor="w", justify="left",
-                                   wraplength=P(470))
-        self.lbl_status.pack(fill="x", pady=(P(8), P(4)))
-
-        bar = tk.Frame(top, bg=C_BG)
-        bar.pack(fill="x", padx=P(20), pady=P(14))
-        flat_button(bar, "从文件导入…", self._from_file).pack(
-            side="left", padx=(0, P(8)))
-        flat_button(bar, "取消", self.top.destroy).pack(side="right")
-        flat_button(bar, "导入", self._do_import, primary=True).pack(
-            side="right", padx=(0, P(8)))
-
-        center_over(app.root, top)
-        top.bind("<Escape>", lambda _e: self.top.destroy())
-        top.grab_set()
-        top.focus_set()
-
-    def _from_file(self):
-        path = filedialog.askopenfilename(
-            parent=self.top, title="选择令牌文件",
-            filetypes=[("令牌文件", "auth_oauth.json"), ("JSON", "*.json"),
-                       ("全部文件", "*.*")])
-        if path:
-            self._apply(path)
-
-    def _do_import(self):
-        raw = self.txt.get("1.0", "end").strip()
-        if not raw:
-            self.lbl_status.configure(text="请先粘贴导入码。", fg=C_BAD)
-            return
-        self._apply(raw)
-
-    def _apply(self, raw):
-        try:
-            res = core.import_token(raw, self.app.cfg)
-        except Exception as e:
-            self.lbl_status.configure(text="❌ {}".format(e), fg=C_BAD)
-            return
-        who = res.get("nickname") or "账号"
-        self.app.log("授权已导入：{}".format(who))
-        self.lbl_status.configure(text="✅ 导入成功：{}".format(who), fg=C_OK)
-        if self.on_done:
-            try:
-                self.on_done()
-            except Exception:
-                pass
-        self.top.after(800, self.top.destroy)
 
 
 # ---------------- 定时窗口 ----------------
@@ -935,12 +864,19 @@ class Section:
         self.btn_row = tk.Frame(wrap, bg=C_CARD)
         self.btn_row.pack(fill="x", padx=P(12), pady=(P(8), P(10)))
         self.buttons = []
+        self.enabled = True
 
     def add(self, text, cmd, primary=False):
         b = flat_button(self.btn_row, text, cmd, primary=primary)
         b.pack(side="left", padx=(P(2), P(6)))
         self.buttons.append(b)
         return b
+
+    def set_enabled(self, enabled: bool) -> None:
+        """整块按钮可用性（未授权时除了授权那一块，其余全都要灰掉）。"""
+        self.enabled = bool(enabled)
+        for b in self.buttons:
+            set_button_enabled(b, self.enabled)
 
     def set(self, status: str, detail: str = "", color: str = C_OK):
         self.lbl_status.configure(text=status, fg=color)
@@ -954,6 +890,8 @@ class App:
         self.busy = False
         self.cfg = core.load_config()
         self.sched_state = None
+        self.auth_info = {}
+        self.authorized = False       # 授权门禁：未授权时除「立即授权」全灰
         self._fit_size = None
 
         root.title(APP_TITLE)
@@ -1065,10 +1003,9 @@ class App:
         holder.pack(fill="x")
 
         self.sec_auth = Section(self, holder, 1, "账号授权")
-        self.sec_auth.add("立即授权", lambda: self.open_auth(push=False),
-                          primary=True)
-        self.sec_auth.add("推到手机授权", lambda: self.open_auth(push=True))
-        self.sec_auth.add("导入授权", self.open_import)
+        # 授权入口永远可用：未授权时其它按钮全灰，只剩它能点，
+        # 否则就成了"要授权才能授权"的死锁。
+        self.sec_auth.add("立即授权", self.open_auth, primary=True)
 
         self.sec_sched = Section(self, holder, 2, "每日定时")
         self.sec_sched.add("设置定时", self.open_schedule, primary=True)
@@ -1103,29 +1040,56 @@ class App:
         self.refresh_schedule_state()
 
     def refresh_auth(self) -> None:
+        """刷新授权区块，并据此开关其余按钮。
+
+        **未授权 = 什么都做不了**：签到、定时、推送的按钮全部灰掉，
+        只留「立即授权」。这样用户不会看到一堆点了就报错的按钮，
+        也不会误以为"已经配好了"。
+        """
         info = wb_oauth.summary(core.oauth_token_path(self.cfg))
+        self.auth_info = info
+        self.authorized = bool(
+            info.get("present") and not info.get("error")
+            and not info.get("disabled") and not info.get("expired"))
+
         if not info.get("present"):
-            self.sec_auth.set("● 未授权", "还没有登录过，先点「立即授权」"
-                                         "（或让服务器发链接到手机）。", C_BAD)
-            return
-        if info.get("error"):
-            self.sec_auth.set("● 令牌异常", str(info["error"]), C_BAD)
-            return
-        if info.get("disabled") or info.get("expired"):
+            self.sec_auth.set("● 未授权",
+                              "还没有登录过。点「立即授权」完成一次浏览器登录，"
+                              "授权前其它操作都不可用。", C_BAD)
+        elif info.get("error"):
+            self.sec_auth.set("● 令牌异常",
+                              "{}　重新授权一次即可。".format(info["error"]),
+                              C_BAD)
+        elif info.get("disabled") or info.get("expired"):
             self.sec_auth.set("● 已失效", "登录会话过期了，重新授权一次即可。",
                               C_BAD)
-            return
-        who = info.get("nickname") or "已授权账号"
-        uid = str(info.get("uid") or "")
-        days = info.get("days_left")
-        expire = info.get("expires_text") or ""
-        detail = "{}{}".format(who, "（uid {}…）".format(uid[:8]) if uid else "")
-        if expire:
-            detail += "　令牌有效期至 {}（剩 {} 天，到期前自动续期）".format(
-                expire, days if days is not None else "?")
-        self.sec_auth.set(
-            "● 已授权", detail,
-            C_OK if (days is None or days > 3) else C_WARN)
+        else:
+            who = info.get("nickname") or "已授权账号"
+            uid = str(info.get("uid") or "")
+            days = info.get("days_left")
+            expire = info.get("expires_text") or ""
+            detail = "{}{}".format(
+                who, "（uid {}…）".format(uid[:8]) if uid else "")
+            if expire:
+                detail += "　令牌有效期至 {}（剩 {} 天，到期前自动续期）".format(
+                    expire, days if days is not None else "?")
+            warn_days = self._expiry_warn_days()
+            near = (days is not None and days <= warn_days)
+            if near:
+                # 状态列直接写"快到期"，别在详情里再挤一句长文案（会折行）
+                self.sec_auth.set(
+                    "● 快到期（剩 {} 天）".format(days),
+                    detail + "　自动续期没成功，建议现在重新授权一次。", C_WARN)
+            else:
+                self.sec_auth.set("● 已授权", detail, C_OK)
+        self._sync_controls()
+
+    def _expiry_warn_days(self) -> int:
+        try:
+            return int(self.cfg.get("expiry_warn_days",
+                                    core.EXPIRY_WARN_DAYS) or 0)
+        except (TypeError, ValueError):
+            return core.EXPIRY_WARN_DAYS
 
     def refresh_push(self) -> None:
         chans = wb_notify.selected_channels(self.cfg)
@@ -1180,7 +1144,8 @@ class App:
             self.log("上一个任务还在跑，稍等一下…")
             return
         self.busy = True
-        self._set_buttons(False, quiet=quiet)
+        if not quiet:
+            self._sync_controls()
         threading.Thread(target=self._guard(fn), daemon=True).start()
 
     def _guard(self, fn):
@@ -1193,12 +1158,17 @@ class App:
                 self.q.put(("busy", False))
         return run
 
-    def _set_buttons(self, enabled: bool, quiet: bool = False) -> None:
-        if quiet:
-            return
-        state = "normal" if enabled else "disabled"
+    def _sync_controls(self) -> None:
+        """唯一决定按钮开关的地方：**已授权 且 不忙** 才可点。
+
+        其它地方不要再单独 configure(state=…)，否则两套判断迟早打架
+        （比如签到结束把按钮全开了，而这时授权其实已经失效）。
+        """
+        enabled = bool(getattr(self, "authorized", False)) and not self.busy
         for b in self.main_buttons:
-            b.configure(state=state)
+            set_button_enabled(b, enabled)
+        self.sec_sched.set_enabled(enabled)
+        self.sec_push.set_enabled(enabled)
 
     def post(self, kind: str, payload=None) -> None:
         self.q.put((kind, payload))
@@ -1220,7 +1190,7 @@ class App:
                     self.refresh_all()
                 elif kind == "busy":
                     self.busy = payload
-                    self._set_buttons(not payload)
+                    self._sync_controls()
                 elif kind == "call":
                     try:
                         payload()
@@ -1290,18 +1260,25 @@ class App:
         if code == "OK":
             who = tok.get("nickname") or "已授权账号"
             days = tok.get("days_left")
-            self.set_banner(
-                "ok", "环境正常　账号 {}{}　可以直接签到。".format(
-                    who, "，令牌剩 {} 天".format(days) if days is not None else ""))
+            if days is not None and days <= self._expiry_warn_days():
+                self.set_banner(
+                    "warn", "账号 {}　⚠ 令牌只剩 {} 天　到期后签到会失败，"
+                            "现在重新授权一次最稳。".format(who, days),
+                    "  重新授权  ", self.open_auth)
+            else:
+                self.set_banner(
+                    "ok", "环境正常　账号 {}{}　可以直接签到。".format(
+                        who, "，令牌剩 {} 天".format(days)
+                        if days is not None else ""))
         elif code == "OAUTH_NOT_AUTHORIZED":
             self.set_banner(
-                "error", "尚未授权　点右边开始登录（只需一次）。",
-                "  立即授权  ", lambda: self.open_auth(push=False))
+                "error", "尚未授权　先完成一次浏览器登录，授权前其它操作都不可用。",
+                "  立即授权  ", self.open_auth)
         elif code in ("OAUTH_SESSION_DEAD", "OAUTH_TOKEN_BAD"):
             self.set_banner(
                 "error", "授权已失效　{}　重新授权一次即可恢复。".format(
                     env.get("message", "")),
-                "  重新授权  ", lambda: self.open_auth(push=False))
+                "  重新授权  ", self.open_auth)
         elif code == "OAUTH_NETWORK":
             self.set_banner(
                 "warn", "网络不通　{}　检查代理或防火墙后重试。".format(
@@ -1348,6 +1325,10 @@ class App:
             self.post("banner", ("warn", "当前没有进行中的签到活动", "", None))
         else:
             self._report_failure(res)
+        notice = res.get("expiry_notice")
+        if notice:
+            self.log("授权只剩 {} 天（{}），已发送续期提醒".format(
+                notice.get("days_left"), notice.get("expires_text") or "?"))
 
     def _report_failure(self, res: dict) -> None:
         code = res.get("result")
@@ -1355,8 +1336,7 @@ class App:
                              "OAUTH_TOKEN_BAD", "OAUTH_NO_REFRESH")
         if auth_like:
             self.post("banner", ("error", "签到失败：授权无效　{}".format(
-                res.get("message", "")), "  重新授权  ",
-                lambda: self.open_auth(push=False)))
+                res.get("message", "")), "  重新授权  ", self.open_auth))
         else:
             self.post("banner", ("error", "签到失败：{}　{}".format(
                 code, res.get("message", "")), "  重新自检  ",
@@ -1384,17 +1364,11 @@ class App:
 
     # ---------------- 弹窗 ----------------
 
-    def open_auth(self, push: bool = False) -> None:
+    def open_auth(self) -> None:
         try:
-            AuthDialog(self, push=push, on_done=self.refresh_all)
+            AuthDialog(self, on_done=self.refresh_all)
         except Exception:
             self.log("打开授权窗口失败：\n" + traceback.format_exc())
-
-    def open_import(self) -> None:
-        try:
-            ImportDialog(self, on_done=self.refresh_all)
-        except Exception:
-            self.log("打开导入窗口失败：\n" + traceback.format_exc())
 
     def open_schedule(self) -> None:
         try:
@@ -1457,7 +1431,7 @@ def selftest() -> int:
 
 # 这些参数表示「无界面执行」，绝不能创建窗口
 HEADLESS_FLAGS = ("--run", "--check-only", "--diagnose", "--test-notify",
-                  "--auth", "--auth-push", "--import-token", "--pull-token")
+                  "--auth", "--import-token", "--pull-token")
 
 
 def _redirect_output() -> None:

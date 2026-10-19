@@ -164,7 +164,7 @@ exe 正在运行（或计划任务刚拉起）时覆盖会 `PermissionError`。
 `--windowed` 打包后 `sys.stdout` 可能是 `None`。无界面入口会把输出接到
 UTF-8 的 `checkin.log`，否则中文/emoji 打印会抛异常，表现为
 **签到成功但退出码非 0**，计划任务记成失败。细节见
-[architecture.md](architecture.md#无控制台程序的输出)。
+[architecture.md](architecture.md#9-无控制台程序的输出)。
 
 ---
 

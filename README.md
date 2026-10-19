@@ -91,7 +91,7 @@ python run.py
 > （服务端返回 `12153`，表现为"授权莫名失效"）。所以服务端授权默认不留令牌，
 > 只给导入码；Windows 端导入后由它独占续期。
 
-详见 [docs/usage.md](docs/usage.md#账号授权)。
+详见 [docs/usage.md](docs/usage.md#1-账号授权)。
 
 ---
 
@@ -207,7 +207,7 @@ workbuddy-checkin/
 
 **Q：定时到点没签到？**
 看「每日定时」那行的系统状态，或执行 `--sched-status`（结果也写进 `checkin.log`）。
-逐步排查见 [docs/troubleshooting.md](docs/troubleshooting.md#定时不生效)。
+逐步排查见 [docs/troubleshooting.md](docs/troubleshooting.md#6-定时不生效)。
 
 **Q：exe 挪了目录后定时失效？**
 任务里记的是绝对路径。打开程序，重新点一次「应用到系统」。

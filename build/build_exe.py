@@ -16,12 +16,16 @@
 用法：
     python build/build_exe.py                    # 产出 dist/WorkBuddyCheckin.exe
     python build/build_exe.py --python <解释器>   # 指定解释器
+
+产物只有一个英文名：`dist/WorkBuddyCheckin.exe`（版本信息写进 exe 属性）。
+不再生成中文名副本 —— 中文名在命令行、计划任务、日志里都会被编码折腾。
 """
 from __future__ import annotations
 
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +34,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 ENTRY = ROOT / "build" / "entry.py"
+EXE_NAME = "WorkBuddyCheckin"
+
+# 旧版本曾额外产出中文名 exe，升级后要清掉，免得两版混在一起
+LEGACY_NAMES = ("WorkBuddy签到.exe",)
 
 # 运行时才用到的标准库（PyInstaller 静态分析有时漏掉，显式声明更稳）
 HIDDEN_IMPORTS = [
@@ -40,6 +48,49 @@ HIDDEN_IMPORTS = [
     "wb_config", "wb_notify", "wb_oauth", "wb_task", "win_quiet",
     "workbuddy_checkin", "checkin_gui",
 ]
+
+
+def app_version() -> str:
+    """版本号唯一来源：src/wb_config.py 的 VERSION。"""
+    if str(SRC) not in sys.path:
+        sys.path.insert(0, str(SRC))
+    try:
+        import wb_config  # noqa: WPS433（构建期临时导入，只为读版本）
+        return str(wb_config.VERSION)
+    except Exception as e:
+        raise SystemExit("读不到版本号（src/wb_config.py）：{}".format(e))
+
+
+def write_version_file(version: str) -> Path:
+    """生成 PyInstaller 的版本资源，右键属性里能看到版本、产品名。"""
+    nums = [int(n) for n in re.findall(r"\d+", version)][:4]
+    while len(nums) < 4:
+        nums.append(0)
+    nums = nums[:4]
+    path = ROOT / ".build" / "pyi" / "version_info.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "# UTF-8\n"
+        "VSVersionInfo(\n"
+        "  ffi=FixedFileInfo(\n"
+        "    filevers=({v}), prodvers=({v}),\n"
+        "    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0),\n"
+        "  kids=[\n"
+        "    StringFileInfo([\n"
+        "      StringTable('040904B0', [\n"
+        "        StringStruct('CompanyName', 'WorkBuddyCheckin'),\n"
+        "        StringStruct('FileDescription', 'WorkBuddy daily check-in'),\n"
+        "        StringStruct('FileVersion', '{version}'),\n"
+        "        StringStruct('InternalName', '{name}'),\n"
+        "        StringStruct('OriginalFilename', '{name}.exe'),\n"
+        "        StringStruct('ProductName', '{name}'),\n"
+        "        StringStruct('ProductVersion', '{version}')])]),\n"
+        "    VarFileInfo([VarStruct('Translation', [1033, 1200])])\n"
+        "  ]\n"
+        ")\n".format(v=", ".join(str(n) for n in nums), version=version,
+                     name=EXE_NAME),
+        encoding="utf-8")
+    return path
 
 
 def _has_tkinter(exe: str) -> bool:
@@ -90,16 +141,25 @@ def build_env() -> dict:
     return env
 
 
+def selftest_file() -> Path:
+    """exe 的自检结果写在哪：数据目录（用户缓存），不是 exe 旁边。"""
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+    root = Path(base) if base else (Path.home() / ".cache")
+    return root / EXE_NAME / "selftest.json"
+
+
 def verify_bundle(exe: Path) -> bool:
     """打包后校验：跑一次 --selftest，确认是冻结态且 tkinter 没缺。
 
     先删掉旧的自检产物再跑：文件存在不代表这次跑过，上一次留下的
     selftest.json 会让校验无条件通过（踩过）。所以除了退出码，还要看
     `frozen` 字段——源码态自检也会生成同样的文件。
+
+    v3.0 起数据目录是用户缓存，selftest.json 不再落在 exe 旁边。
     """
     if not exe.is_file():
         return False
-    stale = exe.parent / "selftest.json"
+    stale = selftest_file()
     try:
         stale.unlink()
     except OSError:
@@ -115,6 +175,7 @@ def verify_bundle(exe: Path) -> bool:
     if r.returncode != 0 or not stale.is_file():
         print("自检输出：{}".format(
             (r.stderr or r.stdout or b"").decode("utf-8", "replace")[:500]))
+        print("期望的自检结果：{}（存在={}）".format(stale, stale.is_file()))
         return False
     try:
         data = json.loads(stale.read_text(encoding="utf-8"))
@@ -138,6 +199,7 @@ def verify_bundle(exe: Path) -> bool:
 
 
 def main(argv: "list[str]") -> int:
+    version = app_version()
     if "--python" in argv:
         interpreter = argv[argv.index("--python") + 1]
         if not _has_tkinter(interpreter):
@@ -148,14 +210,19 @@ def main(argv: "list[str]") -> int:
 
     if interpreter != sys.executable:
         print("当前解释器不带 tkinter，自动改用：{}".format(interpreter))
+    print("版本：v{}".format(version))
     print("打包解释器：{}".format(interpreter))
     print("源码目录：{}".format(SRC))
     print("入口：{}".format(ENTRY))
 
+    version_file = write_version_file(version)
+    print("版本资源：{}".format(version_file))
+
     args = [
         interpreter, "-m", "PyInstaller",
         "--noconfirm", "--clean", "--onefile", "--windowed",
-        "--name", "WorkBuddyCheckin",
+        "--name", EXE_NAME,
+        "--version-file", str(version_file),
         "--paths", str(SRC),
         # 先出到 .build/out 再复制进 dist：dist 里的 exe 可能正在运行，
         # 直接往里写会 PermissionError（改时间戳/校验和那一步最容易踩）。
@@ -176,30 +243,34 @@ def main(argv: "list[str]") -> int:
         print("  <python> -m pip install --target .build/pylibs pyinstaller")
         return e.returncode
 
-    staged = ROOT / ".build" / "out" / "WorkBuddyCheckin.exe"
+    staged = ROOT / ".build" / "out" / (EXE_NAME + ".exe")
     if not staged.is_file():
         print("打包结束但没找到产物：{}".format(staged))
         return 3
-    exe = ROOT / "dist" / "WorkBuddyCheckin.exe"
+    exe = ROOT / "dist" / (EXE_NAME + ".exe")
     exe.parent.mkdir(parents=True, exist_ok=True)
     try:
         shutil.copy2(str(staged), str(exe))
     except OSError as e:
         print("复制到 dist 失败（exe 可能正在运行）：{}".format(e))
         return 4
+
+    # 清掉旧版本留下的中文名 exe：两个文件并存时，用户 / 计划任务
+    # 很容易打开的是那个不再更新的旧文件。
+    for legacy in LEGACY_NAMES:
+        old = exe.with_name(legacy)
+        if old.is_file():
+            try:
+                old.unlink()
+                print("已删除旧的中文名产物：{}".format(old))
+            except OSError as e:
+                print("旧产物删不掉（请手动删）：{} {}".format(old, e))
+
     print("\n完成：{}".format(exe))
     if not verify_bundle(exe):
         print("！！校验未通过：exe 里可能没有 tkinter，别发布这一版")
         return 5
-
-    # 中文名是真正发出去的文件名，打包时顺手复制一份，省掉手工改名
-    cn = exe.with_name("WorkBuddy签到.exe")
-    try:
-        shutil.copy2(str(exe), str(cn))
-        print("已生成中文名：{}".format(cn))
-    except OSError as e:
-        print("中文名复制失败（不影响主产物）：{}".format(e))
-    print("打包完成。")
+    print("打包完成：v{}".format(version))
     return 0
 
 

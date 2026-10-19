@@ -238,6 +238,9 @@ def push_auth_link(cfg: dict, qr_url: str, auth_url: str, channels: List[str],
     也不用在服务器上开端口把 PNG 暴露出去，更不用为"钉钉不能发图片"做降级。
     """
     minutes = max(1, wait_seconds // 60)
+    if not qr_url or qr_url == auth_url:
+        # 极端情况：页面上只截到图、没拿到公开链接 —— 退回推授权页链接
+        return push_url(cfg, auth_url, channels, wait_seconds)
     text = (
         "【WorkBuddy 签到】服务端需要重新授权\n"
         "① 点开二维码图片：\n"

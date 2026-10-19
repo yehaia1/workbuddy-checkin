@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""WorkBuddy 每日签到（WBIPC 宿主通道版，零依赖）
+"""WorkBuddy 每日签到（双通道版，零依赖）
 
-功能：
-  1. 通过 WorkBuddy 客户端自带的 WBIPC 宿主通道调用官方签到接口
-     （脚本只提交「方法+路径」，鉴权头由客户端注入，全程不接触令牌）
-  2. 支持 Windows 计划任务无人值守执行：
-     - 宿主未运行时自动拉起 WorkBuddy 客户端，等待就绪后签到
-     - 若客户端是本脚本拉起的，签到完成后自动关闭（原本已开的不动）
-  3. 结果推送到企业微信 / 钉钉群机器人（只填机器人 key，地址程序自动拼）
+两种登录方式（config.json 的 auth_mode 选择）：
+
+  wbipc（默认，推荐）
+    通过 WorkBuddy 客户端自带的 WBIPC 宿主通道调用官方签到接口
+    （脚本只提交「方法+路径」，鉴权头由客户端注入，全程不接触令牌）
+    未运行时自动拉起客户端，签到完成后按配置关闭。
+
+  oauth（账号直连）
+    不启动客户端：用 CodeBuddy CLI 的设备授权流程重新登录一次，
+    拿一份明文令牌后纯 HTTP 签到，支持自动续期（见 wb_oauth.py）。
+    一次性人工浏览器授权 → 之后每次运行零人工、零客户端。
 
 签到流程三步（幂等，重复执行安全）：
     1. POST /v2/billing/meter/checkin-activity-status   # 查：今天签了吗
@@ -20,9 +24,10 @@
   python workbuddy_checkin.py --check-only   # 只查状态，不领取
   python workbuddy_checkin.py --diagnose     # 环境自检
   python workbuddy_checkin.py --test-notify  # 发测试消息到已配置渠道
+  python workbuddy_checkin.py --login-oauth  # 走一次浏览器授权（账号直连模式用）
   以上均可加 --json 输出单行 JSON
 
-配置：同目录 config.json（推送机器人 key、自动拉起客户端等）。
+配置：同目录 config.json（推送机器人 key、登录方式、自动拉起客户端等）。
 
 参考：WBIPC 模块为客户端官方自带（skills/library/workbuddy_ipc），
 流程参考社区实践 https://cloud.tencent.com.cn/developer/article/2755383
@@ -42,6 +47,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import wb_oauth
 from win_quiet import quiet_kwargs
 
 
@@ -81,6 +87,11 @@ CLAIM_KEYS = ("credit", "credits", "today_credit", "streak_days",
               "total_credits", "message")
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    # 登录方式："wbipc" = 走客户端宿主通道（推荐，脚本不接触令牌）
+    #           "oauth" = 账号直连，不启动客户端（需先做一次浏览器授权）
+    "auth_mode": "wbipc",
+    "oauth_token_file": "",         # 留空 = 程序目录下 auth_oauth.json
+    "oauth_auth_timeout": 300,      # 浏览器授权等待上限（秒）
     # 推送：只填 key 即可，程序自动拼完整 webhook 地址；留空表示不推送
     "wecom_key": "",                # 企业微信机器人 key（webhook 链接 ?key= 后面的值）
     "dingtalk_key": "",             # 钉钉机器人 access_token（链接 access_token= 后面的值）
@@ -112,6 +123,10 @@ class CheckinError(RuntimeError):
         self.exit_code = exit_code
 
 
+# 两种通道的异常同构（都有 .result / .exit_code / str()），上层统一捕获。
+SESSION_ERRORS = (CheckinError, wb_oauth.OAuthError)
+
+
 # ---------------- 配置 ----------------
 
 def load_config() -> Dict[str, Any]:
@@ -125,6 +140,22 @@ def load_config() -> Dict[str, Any]:
         except (OSError, ValueError):
             pass  # 配置损坏时退回默认值
     return cfg
+
+
+def auth_mode_of(cfg: Optional[Dict[str, Any]] = None) -> str:
+    """当前登录方式：'wbipc'（默认）或 'oauth'。
+
+    容忍几种同义写法，避免手工改配置时因为拼写差异悄悄退回默认值。
+    """
+    raw = str((cfg or {}).get("auth_mode") or "wbipc").strip().lower()
+    if raw in ("oauth", "direct", "token", "直连"):
+        return "oauth"
+    return "wbipc"
+
+
+def oauth_token_path(cfg: Optional[Dict[str, Any]] = None) -> str:
+    """账号直连模式的令牌文件路径（默认与程序同目录）。"""
+    return wb_oauth.token_path(cfg or {}, base_dir=str(SCRIPT_DIR))
 
 
 # ---------------- 客户端定位（安装路径发现） ----------------
@@ -692,6 +723,26 @@ def connect_with_autolaunch(cfg: Dict[str, Any],
     raise err
 
 
+# ---------------- 会话建立（两种模式的分发点） ----------------
+
+def open_session(cfg: Dict[str, Any],
+                 progress: Optional[Any] = None) -> Tuple[Any, bool]:
+    """按 auth_mode 建立会话，返回 (session, launched)。
+
+    两种 session 的对外接口完全一致（fetch/close/上下文管理），
+    所以签到业务逻辑一份代码同时服务两条通道。
+
+    launched=True 只可能出现在 wbipc 模式，表示客户端是本次拉起的、
+    结束后应当关掉；账号直连模式永远不会启动客户端，恒为 False。
+    """
+    if auth_mode_of(cfg) == "oauth":
+        emit = progress or _progress
+        path = oauth_token_path(cfg)
+        emit("账号直连模式：不启动客户端，读取本机已授权令牌")
+        return wb_oauth.OAuthSession(path, emit=emit), False
+    return connect_with_autolaunch(cfg, progress=progress)
+
+
 # ---------------- 业务流程 ----------------
 
 def run(sess: Session, check_only: bool) -> Dict[str, Any]:
@@ -905,9 +956,30 @@ def build_message(result: Dict[str, Any]) -> str:
 
 def diagnose() -> Dict[str, Any]:
     cfg = load_config()
-    out: Dict[str, Any] = {}
+    mode = auth_mode_of(cfg)
+    out: Dict[str, Any] = {"auth_mode": mode}
     out["client_exe"] = find_workbuddy_exe(cfg) or None
     out["install_root"] = install_root(cfg) or None
+    out["notify_channels"] = configured_channels(cfg)
+
+    # 账号直连模式：不需要客户端，也不需要内置模块，只看令牌和接口
+    if mode == "oauth":
+        path = oauth_token_path(cfg)
+        out["oauth_token"] = wb_oauth.summary(path)
+        try:
+            with wb_oauth.OAuthSession(path) as sess:
+                out["connected"] = True
+                out["billing_base"] = wb_oauth.billing_base(sess.record)
+                status, body = sess.fetch("POST", STATUS_PATH)
+                out["status_api"] = {"http": status, "code": body.get("code")}
+        except SESSION_ERRORS as e:
+            out["connected"] = False
+            out["error"] = "{}: {}".format(e.result, e)
+        except Exception as e:
+            out["connected"] = False
+            out["error"] = str(e)
+        return out
+
     out["module_roots"] = probe_module_roots(cfg)
     try:
         ipc, path = load_ipc(cfg)
@@ -921,7 +993,6 @@ def diagnose() -> Dict[str, Any]:
     out["endpoint_file"] = endpoint
     out["endpoint_exists"] = bool(endpoint and os.path.exists(endpoint))
     out["workbuddy_running"] = workbuddy_process_running()
-    out["notify_channels"] = configured_channels(cfg)
     if not out["endpoint_exists"]:
         out["error"] = "wbipc endpoint.json 不存在（WorkBuddy 未运行？）"
         return out
@@ -939,6 +1010,39 @@ def diagnose() -> Dict[str, Any]:
         out["connected"] = False
         out["error"] = str(e)
     return out
+
+
+# ---------------- 账号直连授权 ----------------
+
+def login_oauth(cfg: Optional[Dict[str, Any]] = None,
+                progress: Optional[Any] = None) -> Dict[str, Any]:
+    """走一遍浏览器授权，把令牌落到本机（账号直连模式用）。"""
+    cfg = cfg or load_config()
+    emit = progress or _progress
+    path = oauth_token_path(cfg)
+    try:
+        rec = wb_oauth.login(
+            path, emit=emit,
+            timeout=int(cfg.get("oauth_auth_timeout", 300) or 300))
+    except wb_oauth.OAuthError as e:
+        result = {"result": e.result, "message": str(e),
+                  "exit_code": e.exit_code}
+        append_log(result)
+        return result
+    acct = rec.get("account") or {}
+    auth = rec.get("auth") or {}
+    result = {
+        "result": "AUTHORIZED",
+        "uid": acct.get("uid") or "",
+        "nickname": acct.get("nickname") or "",
+        "domain": auth.get("domain") or "",
+        "expires_at": auth.get("expiresAt") or 0,
+        "token_file": path,
+    }
+    append_log({"result": "AUTHORIZED",
+                "note": "uid={} domain={}".format(result["uid"],
+                                                  result["domain"])})
+    return result
 
 
 # ---------------- 统一执行入口（GUI / 命令行共用） ----------------
@@ -969,8 +1073,8 @@ def run_once(cfg: Optional[Dict[str, Any]] = None,
         return result
 
     try:
-        sess, launched = connect_with_autolaunch(cfg, progress=emit)
-    except CheckinError as e:
+        sess, launched = open_session(cfg, progress=emit)
+    except SESSION_ERRORS as e:
         result = {"result": e.result, "message": str(e),
                   "exit_code": e.exit_code}
         append_log(result)
@@ -981,7 +1085,7 @@ def run_once(cfg: Optional[Dict[str, Any]] = None,
     try:
         with sess:
             result = run(sess, check_only=check_only)
-    except CheckinError as e:
+    except SESSION_ERRORS as e:
         result = {"result": e.result, "message": str(e),
                   "exit_code": e.exit_code}
 
@@ -992,6 +1096,74 @@ def run_once(cfg: Optional[Dict[str, Any]] = None,
 
 
 # ---------------- 环境自检（存在 + 已登录） ----------------
+
+def _detect_env_oauth(cfg: Dict[str, Any], deep: bool = True) -> Dict[str, Any]:
+    """账号直连模式的自检：不检测客户端进程，只看授权是否有效。
+
+    这套判断跟 wbipc 完全不同——客户端装没装、开没开都不影响本模式，
+    所以不能复用 detect_env 的客户端分支，否则会给出误导性的"客户端未运行"。
+    """
+    out: Dict[str, Any] = {"code": "OK", "message": "", "steps": [],
+                           "auth_mode": "oauth"}
+    path = oauth_token_path(cfg)
+    info = wb_oauth.summary(path)
+    out["oauth_token"] = info
+    out["token_file"] = path
+
+    if not info.get("present"):
+        out["steps"].append(("账号授权", "未授权"))
+        out.update(code="OAUTH_NOT_AUTHORIZED",
+                   message="账号直连模式尚未授权，需要先完成一次浏览器登录。")
+        return out
+    if info.get("error"):
+        out["steps"].append(("账号授权", "令牌文件异常"))
+        out.update(code="OAUTH_TOKEN_BAD", message=str(info["error"]))
+        return out
+
+    who = info.get("nickname") or "未命名账号"
+    out["steps"].append(
+        ("账号授权", "{}（uid {}…）".format(who, str(info.get("uid") or "")[:8])))
+    days = info.get("days_left")
+    out["steps"].append(
+        ("令牌有效期", "{}（剩 {} 天）".format(info.get("expires_text") or "未知",
+                                         days if days is not None else "?")))
+    if info.get("disabled"):
+        out.update(code="OAUTH_SESSION_DEAD",
+                   message="登录会话已失效，请重新授权。")
+        return out
+    if not deep:
+        return out
+
+    try:
+        with wb_oauth.OAuthSession(path) as sess:
+            status, body = sess.fetch("POST", STATUS_PATH)
+    except SESSION_ERRORS as e:
+        if e.result in ("OAUTH_SESSION_DEAD",):
+            out.update(code="OAUTH_SESSION_DEAD", message=str(e))
+        elif e.result == "OAUTH_NETWORK":
+            out.update(code="OAUTH_NETWORK", message=str(e))
+        else:
+            out.update(code="OAUTH_FAIL",
+                       message="{}: {}".format(e.result, e))
+        return out
+
+    out["api_http"] = status
+    out["api_code"] = body.get("code")
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    out["status_data"] = {k: data[k] for k in STATUS_KEYS if k in data}
+    if status in (401, 403):
+        out.update(code="OAUTH_SESSION_DEAD",
+                   message="接口拒绝访问，授权已失效，请重新授权。")
+        return out
+    if status >= 400:
+        out.update(code="OAUTH_FAIL",
+                   message="状态接口返回 HTTP {} code={}".format(
+                       status, body.get("code")))
+        return out
+    out["steps"].append(
+        ("签到接口", "HTTP {} code={}".format(status, body.get("code"))))
+    return out
+
 
 def detect_env(deep: bool = True,
                cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1011,7 +1183,10 @@ def detect_env(deep: bool = True,
       NO_MODULE          找不到 workbuddy_ipc 模块
     """
     cfg = cfg or load_config()
-    out: Dict[str, Any] = {"code": "OK", "message": "", "steps": []}
+    if auth_mode_of(cfg) == "oauth":
+        return _detect_env_oauth(cfg, deep=deep)
+    out: Dict[str, Any] = {"code": "OK", "message": "", "steps": [],
+                           "auth_mode": "wbipc"}
 
     try:
         import wb_host
@@ -1141,16 +1316,27 @@ def render(result: Dict[str, Any], as_json: bool) -> None:
             result.get("streak_days", "?"), result.get("total_credits", "?")))
     elif code == "INACTIVE":
         print("当前没有进行中的签到活动")
+    elif code == "AUTHORIZED":
+        stamp = ""
+        if result.get("expires_at"):
+            stamp = time.strftime("%Y-%m-%d %H:%M",
+                                  time.localtime(int(result["expires_at"])))
+        print("✅ 授权成功：{}（uid {}），令牌有效期至 {}".format(
+            result.get("nickname") or "已登录账号",
+            result.get("uid") or "?", stamp or "未知"))
     else:
         print(json.dumps(result, ensure_ascii=False))
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="WorkBuddy 每日签到（WBIPC 宿主通道版）")
+    parser = argparse.ArgumentParser(
+        description="WorkBuddy 每日签到（客户端通道 / 账号直连）")
     parser.add_argument("--check-only", action="store_true", help="仅查询今日签到状态")
     parser.add_argument("--diagnose", action="store_true", help="环境自检")
     parser.add_argument("--test-notify", action="store_true",
                         help="发送测试消息到所有已配置渠道（企业微信 / 钉钉）")
+    parser.add_argument("--login-oauth", action="store_true",
+                        help="走一次浏览器授权（账号直连模式需要）")
     parser.add_argument("--json", action="store_true", help="输出单行 JSON")
     # 无界面签到入口：GUI/exe 被计划任务调起时用，行为与不带参数一致
     parser.add_argument("--run", action="store_true", help=argparse.SUPPRESS)
@@ -1182,6 +1368,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.diagnose:
         print(json.dumps(diagnose(), ensure_ascii=False, indent=2))
         return 0
+
+    if args.login_oauth:
+        result = login_oauth(cfg, progress=_progress)
+        render(result, args.json)
+        return int(result.get("exit_code", 0))
 
     # 走统一入口，和 GUI 完全同一条路径；只查状态时不推送，避免打扰
     result = run_once(cfg, check_only=args.check_only, progress=_progress,

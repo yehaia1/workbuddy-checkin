@@ -11,7 +11,12 @@ checkin.log
 selftest.json
 no_popup_check.json
 module_discovery_check.json
+oauth_mode_check.json
 *.log
+
+# 账号直连模式的令牌（明文 accessToken / refreshToken，绝不能提交）
+auth_oauth.json
+auth_oauth.json.tmp
 
 # ---------------- Python ----------------
 __pycache__/

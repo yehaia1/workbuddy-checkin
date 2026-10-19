@@ -32,10 +32,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import workbuddy_checkin as core
+import wb_oauth
 import wb_task
 
 APP_TITLE = "WorkBuddy 每日签到"
-VERSION = "1.6"
+VERSION = "1.7"
 
 # 界面缩放系数：物理像素 = 逻辑像素 × PX。由 apply_tk_scaling() 按 DPI 设置。
 # tkinter 的 padding/width 等参数都是物理像素，不跟着 tk scaling 走，
@@ -237,6 +238,197 @@ def short_time(iso: str) -> str:
 
 # ---------------- 设置窗口 ----------------
 
+class OAuthLoginDialog:
+    """账号直连授权：给出链接、轮询等待、成功后就地更新状态。
+
+    为什么要单独一个窗口而不是弹个浏览器就完事：
+    浏览器登录完成后用户会回到这里，需要看到"到底成功了没有"，
+    否则只能凭感觉再点一次签到去试——失败了也说不清是授权没完成还是别的问题。
+
+    线程模型：网络轮询在后台线程，结果通过队列回到主线程刷控件
+    （tkinter 不允许跨线程碰控件）。
+    """
+
+    def __init__(self, app: "App", cfg: dict, on_done=None):
+        self.app = app
+        self.cfg = dict(cfg or {})
+        self.on_done = on_done
+        self.stop = False
+        self.q = queue.Queue()
+        self.url = ""
+        self.done = False
+        self.started = time.time()
+        self.timeout = int(self.cfg.get("oauth_auth_timeout", 300) or 300)
+
+        top = self.top = tk.Toplevel(app.root)
+        top.title("账号授权")
+        top.configure(bg=C_BG)
+        top.resizable(False, False)
+        top.transient(app.root)
+        top.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        body = tk.Frame(top, bg=C_BG)
+        body.pack(fill="both", expand=True, padx=P(20), pady=P(16))
+
+        tk.Label(body, text="在浏览器里完成一次登录", font=UI_FONT_BOLD,
+                 bg=C_BG, fg=C_TEXT, anchor="w").pack(fill="x")
+        self.lbl_desc = tk.Label(
+            body, text="正在申请授权链接…", font=UI_FONT_SM, bg=C_BG,
+            fg=C_MUTED, anchor="w", justify="left", wraplength=P(460))
+        self.lbl_desc.pack(fill="x", pady=(P(6), P(10)))
+
+        self.var_url = tk.StringVar(value="")
+        ttk.Style(top).configure("Wb.TEntry", fieldbackground=C_INPUT_BG,
+                                 foreground=C_TEXT, font=UI_FONT_SM,
+                                 padding=P(3))
+        ttk.Entry(body, textvariable=self.var_url, style="Wb.TEntry",
+                  width=54, state="readonly").pack(fill="x", ipady=P(3))
+
+        row = tk.Frame(body, bg=C_BG)
+        row.pack(fill="x", pady=(P(8), 0))
+        self.btn_copy = self._btn(row, "复制链接", self._copy)
+        self.btn_open = self._btn(row, "重新打开浏览器", self._open)
+        self.btn_close = self._btn(row, "取消", self._cancel)
+
+        self.lbl_status = tk.Label(body, text="等待授权…", font=UI_FONT_SM,
+                                   bg=C_BG, fg=C_WARN, anchor="w",
+                                   justify="left", wraplength=P(460))
+        self.lbl_status.pack(fill="x", pady=(P(10), 0))
+
+        top.update_idletasks()
+        try:
+            w, h = top.winfo_reqwidth(), top.winfo_reqheight()
+            x = app.root.winfo_rootx() + max(0, (app.root.winfo_width() - w) // 2)
+            y = app.root.winfo_rooty() + max(0, (app.root.winfo_height() - h) // 3)
+            x = max(0, min(x, top.winfo_screenwidth() - w))
+            y = max(0, min(y, top.winfo_screenheight() - h))
+            top.geometry("{}x{}+{}+{}".format(w, h, x, y))
+        except Exception:
+            pass
+        top.grab_set()
+
+        threading.Thread(target=self._work, daemon=True).start()
+        top.after(200, self._drain)
+
+    # ----- 小工具 -----
+
+    def _btn(self, parent, text, cmd):
+        b = tk.Button(parent, text=text, command=cmd, font=UI_FONT_SM,
+                      bg=C_CARD, fg=C_TEXT, activebackground="#EDEFF3",
+                      relief="flat", bd=0, padx=P(12), pady=P(5),
+                      cursor="hand2", highlightbackground=C_BORDER,
+                      highlightthickness=1)
+        b.pack(side="left", padx=(0, P(8)))
+        return b
+
+    def _status(self, text, level="info"):
+        color = {"ok": C_OK, "bad": C_BAD, "warn": C_WARN}.get(level, C_MUTED)
+        self.lbl_status.configure(text=text, fg=color)
+
+    # ----- 后台任务 -----
+
+    def _work(self):
+        path = core.oauth_token_path(self.cfg)
+        try:
+            rec = wb_oauth.login(
+                path,
+                emit=lambda m: self.q.put(("msg", m)),
+                open_browser=True,
+                timeout=self.timeout,
+                should_stop=lambda: self.stop,
+                on_tick=lambda e, r: self.q.put(("tick", (e, r))),
+                on_url=lambda u: self.q.put(("url", u)))
+            self.q.put(("done", rec))
+        except wb_oauth.OAuthError as e:
+            self.q.put(("error", (e.result, str(e))))
+        except Exception as e:                       # 兜底，不让线程静默死掉
+            self.q.put(("error", ("UNEXPECTED", str(e))))
+
+    def _drain(self):
+        try:
+            while True:
+                kind, payload = self.q.get_nowait()
+                if kind == "url":
+                    self.url = payload
+                    self.var_url.set(payload)
+                    self.lbl_desc.configure(
+                        text="浏览器已打开授权页；若没反应，点「重新打开浏览器」"
+                             "或复制下方链接手动访问。登录完成后本窗口会自动关闭。")
+                elif kind == "tick":
+                    elapsed, remain = payload
+                    self._status("等待浏览器登录… {}s（剩余约 {}s）".format(
+                        elapsed, max(0, remain)), "warn")
+                elif kind == "msg":
+                    self._status(str(payload), "info")
+                elif kind == "done":
+                    self._finish(True, payload)
+                    return
+                elif kind == "error":
+                    self._finish(False, payload)
+                    return
+        except queue.Empty:
+            pass
+        if not self.done:
+            self.top.after(200, self._drain)
+
+    def _finish(self, ok, payload):
+        self.done = True
+        if ok:
+            acct = (payload or {}).get("account") or {}
+            who = acct.get("nickname") or "账号"
+            self._status("✅ 授权成功：{}。可以关闭本窗口了。".format(who), "ok")
+            self.btn_close.configure(text="完成")
+            try:
+                self.top.after(1200, self._close)
+            except Exception:
+                pass
+        else:
+            code, msg = payload
+            hint = {
+                "OAUTH_TIMEOUT": "超时了，重新点「立即授权」再试一次。",
+                "OAUTH_STATE_EXPIRED": "授权会话过期，请重新发起授权。",
+                "OAUTH_NETWORK": "网络不通，检查代理/防火墙后重试。",
+            }.get(code, "可重试；反复失败请改用客户端通道。")
+            self._status("❌ {}　{}".format(msg, hint), "bad")
+            self.btn_close.configure(text="关闭")
+        try:
+            self.top.grab_release()
+        except Exception:
+            pass
+        if self.on_done:
+            try:
+                self.on_done()
+            except Exception:
+                pass
+
+    # ----- 按钮 -----
+
+    def _copy(self):
+        if not self.url:
+            return
+        try:
+            self.top.clipboard_clear()
+            self.top.clipboard_append(self.url)
+            self._status("链接已复制。", "ok")
+        except Exception:
+            pass
+
+    def _open(self):
+        if self.url:
+            wb_oauth._open_browser(self.url)
+
+    def _cancel(self):
+        self.stop = True
+        self._close()
+
+    def _close(self):
+        self.done = True
+        try:
+            self.top.destroy()
+        except Exception:
+            pass
+
+
 class SettingsDialog:
     """把 config.json 里的可调项全部搬到界面上。"""
 
@@ -264,6 +456,11 @@ class SettingsDialog:
         style.map("Wb.TCheckbutton",
                   background=[("active", C_BG)],
                   foreground=[("disabled", C_MUTED)])
+        style.configure("Wb.TRadiobutton", background=C_BG, foreground=C_TEXT,
+                        font=UI_FONT_SM, focuscolor=C_BG)
+        style.map("Wb.TRadiobutton",
+                  background=[("active", C_BG)],
+                  foreground=[("disabled", C_MUTED)])
         style.configure("Wb.TEntry", fieldbackground=C_INPUT_BG,
                         foreground=C_TEXT, font=UI_FONT_SM, padding=P(3))
         style.configure("Wb.TCombobox", fieldbackground=C_INPUT_BG,
@@ -285,22 +482,56 @@ class SettingsDialog:
                          "（机器人安全设置用「自定义关键词」时需含「签到」二字）。"
                          "留空则不推送。")
 
+        # --- 登录方式 ---
+        # 放在客户端路径之前：它决定了下面这些客户端设置还有没有必要看。
+        # 两个选项并排、说明随选择变化——竖排时"哪行说明属于哪个选项"
+        # 在视觉上分不清，实测很容易看错。
+        self._section(body, "登录方式")
+        self.var_mode = tk.StringVar(
+            value="oauth" if core.auth_mode_of(self.cfg) == "oauth" else "wbipc")
+        mrow = tk.Frame(body, bg=C_BG)
+        mrow.pack(fill="x", padx=P(18), pady=(P(4), 0))
+        ttk.Radiobutton(mrow, text="客户端通道（推荐）", value="wbipc",
+                        variable=self.var_mode,
+                        style="Wb.TRadiobutton",
+                        command=self._refresh_mode_state).pack(side="left")
+        ttk.Radiobutton(mrow, text="账号直连", value="oauth",
+                        variable=self.var_mode,
+                        style="Wb.TRadiobutton",
+                        command=self._refresh_mode_state).pack(side="left",
+                                                              padx=(P(20), 0))
+        self.lbl_mode_hint = tk.Label(
+            body, text="", font=UI_FONT_SM, bg=C_BG, fg=C_MUTED, anchor="w",
+            justify="left", wraplength=P(520))
+        self.lbl_mode_hint.pack(fill="x", padx=P(18), pady=(P(3), 0))
+
+        arow = tk.Frame(body, bg=C_BG)
+        arow.pack(fill="x", padx=P(18), pady=(P(5), 0))
+        self.arow = arow
+        self.btn_auth = self._btn(arow, "立即授权", self._start_oauth)
+        self.lbl_oauth = tk.Label(arow, text="", font=UI_FONT_SM, bg=C_BG,
+                                  fg=C_MUTED, anchor="w")
+        self.lbl_oauth.pack(side="left", padx=(P(10), 0))
+        self._refresh_oauth_state()
+
         # --- 客户端路径 ---
         self._section(body, "WorkBuddy 客户端")
         row = tk.Frame(body, bg=C_BG)
         row.pack(fill="x", padx=P(18), pady=(P(4), 0))
         self.var_exe = tk.StringVar(
             value=str(self.cfg.get("workbuddy_exe") or ""))
-        ttk.Entry(row, textvariable=self.var_exe, style="Wb.TEntry",
-                  width=38).pack(side="left", ipady=P(3))
-        self._btn(row, "自动检测", self._detect_exe)
-        self._btn(row, "浏览…", self._browse_exe)
+        self.ent_exe = ttk.Entry(row, textvariable=self.var_exe,
+                                 style="Wb.TEntry", width=38)
+        self.ent_exe.pack(side="left", ipady=P(3))
+        self.btn_detect = self._btn(row, "自动检测", self._detect_exe)
+        self.btn_browse = self._btn(row, "浏览…", self._browse_exe)
 
         self.lbl_exe_state = tk.Label(
             body, text="", font=UI_FONT_SM, bg=C_BG, fg=C_MUTED,
             anchor="w", justify="left", wraplength=P(520))
         self.lbl_exe_state.pack(fill="x", padx=P(18), pady=(P(4), 0))
         self._refresh_exe_state()
+        self._refresh_mode_state()
 
         # 内置模块目录不出现在界面上：它是"自动探测失败时的最后一根救命
         # 稻草"，正常安装根本用不到，摆出来只会让使用者以为必须填。
@@ -460,6 +691,65 @@ class SettingsDialog:
                 ok, txt = False, "❌ 未找到 WorkBuddy.exe，请确认客户端已安装"
         self.lbl_exe_state.configure(text=txt, fg=C_OK if ok else C_BAD)
 
+    def _refresh_mode_state(self):
+        """账号直连模式下，客户端路径这些设置用不上，置灰避免误导。"""
+        oauth = self.var_mode.get() == "oauth"
+        state = "disabled" if oauth else "normal"
+        try:
+            self.ent_exe.configure(state=state)
+            self.btn_detect.configure(state=state)
+            self.btn_browse.configure(state=state)
+        except Exception:
+            pass
+        self.lbl_mode_hint.configure(
+            text="脚本不接触令牌，直接借客户端注入的鉴权；客户端没在运行时"
+                 "自动拉起。最安全，但要求本机装有客户端。"
+                 if not oauth else
+                 "不启动客户端：用一次浏览器授权换取登录态，之后纯网络请求"
+                 "完成签到。适合不想让客户端常驻的机器。")
+        if oauth:
+            self.lbl_exe_state.configure(
+                text="账号直连模式不使用客户端，此处路径可忽略。", fg=C_MUTED)
+            # 授权行只在直连模式下有意义，客户端模式下整行收起，
+            # 免得让人以为"不授权就不让签到"
+            try:
+                if not self.arow.winfo_manager():
+                    self.arow.pack(fill="x", padx=P(18), pady=(P(5), 0),
+                                   after=self.lbl_mode_hint)
+            except Exception:
+                pass
+        else:
+            try:
+                self.arow.pack_forget()
+            except Exception:
+                pass
+            self._refresh_exe_state()
+
+    def _refresh_oauth_state(self):
+        """刷新授权状态文案（只显示账号与剩余天数，不显示令牌）。"""
+        info = wb_oauth.summary(core.oauth_token_path(self.cfg))
+        if not info.get("present"):
+            txt, color = "未授权", C_MUTED
+        elif info.get("error"):
+            txt, color = "令牌异常：{}".format(info["error"]), C_BAD
+        elif info.get("disabled"):
+            txt, color = "会话已失效，需重新授权", C_BAD
+        elif info.get("expired"):
+            txt, color = "令牌已过期，需重新授权", C_BAD
+        else:
+            days = info.get("days_left")
+            who = info.get("nickname") or "已授权账号"
+            txt = "已授权：{}{}".format(
+                who, "（剩 {} 天）".format(days) if days is not None else "")
+            color = C_OK if (days is None or days > 3) else C_BAD
+        try:
+            self.lbl_oauth.configure(text=txt, fg=color)
+        except Exception:
+            pass
+
+    def _start_oauth(self):
+        OAuthLoginDialog(self.app, cfg=self.cfg, on_done=self._refresh_oauth_state)
+
     def _restore_defaults(self):
         if not messagebox.askyesno("恢复默认", "把所有设置恢复为默认值？",
                                    parent=self.top):
@@ -468,6 +758,7 @@ class SettingsDialog:
         self.var_wecom.set(d.get("wecom_key", ""))
         self.var_dingtalk.set(d.get("dingtalk_key", ""))
         self.var_exe.set(d.get("workbuddy_exe", ""))
+        self.var_mode.set("wbipc")
         self.var_auto_env.set(bool(d.get("auto_env_check", True)))
         self.var_launch.set(bool(d.get("launch_workbuddy", True)))
         self.var_hide.set(bool(d.get("hide_window", True)))
@@ -476,7 +767,7 @@ class SettingsDialog:
         self.var_t_hide.set(str(d.get("hide_window_timeout", 25)))
         self.var_t_close.set(str(d.get("close_timeout", 30)))
         self.var_scale.set(SCALE_CHOICES[0][0])
-        self._refresh_exe_state()
+        self._refresh_mode_state()
 
     def _collect(self) -> dict:
         def num(var, name, lo=1, hi=3600):
@@ -495,6 +786,7 @@ class SettingsDialog:
         scale = next((v for t, v in SCALE_CHOICES
                       if t == self.var_scale.get()), 0)
         return {
+            "auth_mode": "oauth" if self.var_mode.get() == "oauth" else "wbipc",
             "wecom_key": self.var_wecom.get().strip(),
             "dingtalk_key": self.var_dingtalk.get().strip(),
             # 迁移：统一改用 key 字段，清掉可能残留的完整链接，避免两处配置打架
@@ -1073,13 +1365,33 @@ class App:
     def report_config(self) -> None:
         c = self.cfg
         chans = core.configured_channels(c)
-        bits = [
-            "定时 {}".format(self._schedule_summary()),
-            "自动拉起 {}".format("开" if c.get("launch_workbuddy") else "关"),
-            "隐藏窗口 {}".format("开" if c.get("hide_window") else "关"),
-            "签到后关闭 {}".format("开" if c.get("close_after_checkin") else "关"),
-            "推送 {}".format("＋".join(chans) if chans else "关"),
-        ]
+        # 账号直连模式下"自动拉起/隐藏窗口/签到后关闭"三项都失效，
+        # 摆出来只会让人以为设置没生效，所以换成直连自己的状态。
+        if core.auth_mode_of(c) == "oauth":
+            tok = wb_oauth.summary(core.oauth_token_path(c))
+            if not tok.get("present"):
+                st = "未授权"
+            elif tok.get("disabled") or tok.get("expired"):
+                st = "授权已失效"
+            else:
+                days = tok.get("days_left")
+                st = "已授权" + ("（剩 {} 天）".format(days)
+                                if days is not None else "")
+            bits = [
+                "登录方式 账号直连（无需客户端）",
+                "账号授权 {}".format(st),
+                "定时 {}".format(self._schedule_summary()),
+                "推送 {}".format("＋".join(chans) if chans else "关"),
+            ]
+        else:
+            bits = [
+                "登录方式 客户端通道",
+                "定时 {}".format(self._schedule_summary()),
+                "自动拉起 {}".format("开" if c.get("launch_workbuddy") else "关"),
+                "隐藏窗口 {}".format("开" if c.get("hide_window") else "关"),
+                "签到后关闭 {}".format("开" if c.get("close_after_checkin") else "关"),
+                "推送 {}".format("＋".join(chans) if chans else "关"),
+            ]
         self.cfg_summary.configure(text="　·　".join(bits))
         self._schedule_fit()
 
@@ -1235,11 +1547,39 @@ class App:
         code = env.get("code")
         exe = env.get("exe_path") or ""
         if code == "OK":
-            acct = env.get("account") or {}
-            who = acct.get("nickname") or (acct.get("uid", "")[:8] + "…")
+            if env.get("auth_mode") == "oauth":
+                tok = env.get("oauth_token") or {}
+                who = tok.get("nickname") or "已授权账号"
+                days = tok.get("days_left")
+                self.set_banner(
+                    "ok", "环境正常：账号直连（不需要客户端）",
+                    "账号 {}{}　直接调接口签到，与客户端是否运行无关。".format(
+                        who, "　令牌剩 {} 天".format(days)
+                        if days is not None else ""))
+            else:
+                acct = env.get("account") or {}
+                who = acct.get("nickname") or (acct.get("uid", "")[:8] + "…")
+                self.set_banner(
+                    "ok", "环境正常：客户端已运行并已登录",
+                    "账号 {}　宿主通道可用，随时可以签到。".format(who))
+        elif code == "OAUTH_NOT_AUTHORIZED":
             self.set_banner(
-                "ok", "环境正常：客户端已运行并已登录",
-                "账号 {}　宿主通道可用，随时可以签到。".format(who))
+                "error", "账号直连尚未授权",
+                "这种方式不需要客户端，但要先完成一次浏览器登录换取令牌。"
+                "点下面按钮开始，登录完会自动关闭授权窗口。",
+                action="  立即授权  ", action_cmd=self._oauth_click)
+        elif code in ("OAUTH_SESSION_DEAD", "OAUTH_TOKEN_BAD"):
+            self.set_banner(
+                "error", "授权已失效",
+                "{}　重新授权一次即可恢复。".format(env.get("message", "")),
+                action="  重新授权  ", action_cmd=self._oauth_click)
+        elif code == "OAUTH_NETWORK":
+            self.set_banner(
+                "warn", "网络不通，暂时无法签到",
+                "{}　检查代理或防火墙后点「环境自检」重试。".format(
+                    env.get("message", "")),
+                action="  重新自检  ",
+                action_cmd=lambda: self.start_task(self.task_env_check))
         elif code == "CLIENT_NOT_RUNNING":
             self.set_banner(
                 "warn", "客户端已安装，但当前没有运行",
@@ -1400,6 +1740,13 @@ class App:
     def _open_client_click(self) -> None:
         self.start_task(self.task_open_client)
 
+    def _oauth_click(self) -> None:
+        """首页横幅上的「立即授权」：走完授权后顺手重做一次自检。"""
+        def done():
+            self.log("授权流程结束，重新自检…")
+            self.start_task(self.task_env_check)
+        OAuthLoginDialog(self, cfg=self.cfg, on_done=done)
+
     def task_open_client(self) -> None:
         self.log("正在打开 WorkBuddy 客户端…")
         ok, why = core.launch_workbuddy(self.cfg)
@@ -1479,16 +1826,21 @@ def selftest() -> int:
     out["frozen"] = bool(getattr(sys, "frozen", False))
     cfg = core.load_config()
     out["install_root"] = core.install_root(cfg) or None
-    # 候选目录逐条体检：哪条存在、哪条真的含 workbuddy_ipc 包，
-    # 是"找不到模块"这类问题唯一能一眼看明白的证据。
-    out["module_roots"] = core.probe_module_roots(cfg)
-    try:
-        ipc, root = core.load_ipc(cfg)
-        out["ipc_module_ok"] = root
-    except Exception as e:
-        out["ipc_module_error"] = "{}: {}".format(type(e).__name__, e)
-    out["ipc_import_errors"] = list(core.IPC_IMPORT_ERRORS)
-    out["ipc_search_trace"] = list(core.IPC_SEARCH_TRACE)
+    out["auth_mode"] = core.auth_mode_of(cfg)
+    if out["auth_mode"] == "oauth":
+        # 直连模式跟内置模块无关，硬去扫盘只会浪费时间并制造误判线索
+        out["oauth_token"] = wb_oauth.summary(core.oauth_token_path(cfg))
+    else:
+        # 候选目录逐条体检：哪条存在、哪条真的含 workbuddy_ipc 包，
+        # 是"找不到模块"这类问题唯一能一眼看明白的证据。
+        out["module_roots"] = core.probe_module_roots(cfg)
+        try:
+            ipc, root = core.load_ipc(cfg)
+            out["ipc_module_ok"] = root
+        except Exception as e:
+            out["ipc_module_error"] = "{}: {}".format(type(e).__name__, e)
+        out["ipc_import_errors"] = list(core.IPC_IMPORT_ERRORS)
+        out["ipc_search_trace"] = list(core.IPC_SEARCH_TRACE)
     try:
         (core.SCRIPT_DIR / "selftest.json").write_text(
             json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1498,7 +1850,8 @@ def selftest() -> int:
 
 
 # 这些参数表示「无界面执行」，绝不能创建窗口
-HEADLESS_FLAGS = ("--run", "--check-only", "--diagnose", "--test-notify")
+HEADLESS_FLAGS = ("--run", "--check-only", "--diagnose", "--test-notify",
+                  "--login-oauth")
 
 
 def _redirect_output() -> None:

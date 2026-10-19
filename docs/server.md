@@ -10,22 +10,35 @@
 
 ## 1. 部署
 
-服务器上要的只是几个 `.py` 和一个 `config.json`，**全部在 `src/` 里**：
-
-```
-wb_server.py          入口
-workbuddy_checkin.py  签到流程
-wb_oauth.py           设备授权 / 续期
-wb_notify.py          推送
-wb_config.py          配置与路径
-config.json           配置（自己生成）
-```
+**不要拷整个 `src/`**。`src/` 里混着 exe 版的东西（`checkin_gui.py` 是 tkinter
+界面、`wb_task.py` 是 Windows 计划任务、`win_quiet.py` 是弹窗抑制），服务器上
+用不到。正确做法是打一个服务端包：
 
 ```bash
-# 1) 拷目录（也可以只拷上面这几个文件）
-scp -r src/ server:/opt/wbcheckin
+python3 build/make_server_bundle.py      # 产出 dist/server/
+```
 
-# 2) 生成配置模板
+它是按 `wb_server.py` 的 **import 闭包**自动收集的，不多带也不漏带，产物就这些：
+
+```
+dist/server/
+  wb_server.py          入口
+  workbuddy_checkin.py  签到流程（服务端复用它的核心，不启动界面）
+  wb_oauth.py           设备授权 / 续期
+  wb_notify.py          推送
+  wb_config.py          配置与路径
+  config.example.json   配置模板（不含任何 key）
+  README.txt            三步部署说明
+  _bundle.json          清单，下次打包据此清理旧文件
+```
+
+整个 `dist/server/` 拷到服务器就是一个完整可运行的服务端：
+
+```bash
+# 1) 拷过去
+scp -r dist/server/ server:/opt/wbcheckin
+
+# 2) 生成配置
 cd /opt/wbcheckin
 python3 wb_server.py --init-config
 
@@ -41,6 +54,7 @@ python3 wb_server.py --check
 
 **配置跟着脚本走**：默认读脚本同目录的 `config.json`，日志
 `checkin.log`、令牌 `auth_oauth.json` 也写在同一层。整个目录拷走就能换机器。
+平铺目录里 `--version` 显示「脚本运行」，数据目录就是脚本目录（不会写到父目录）。
 
 ---
 

@@ -78,7 +78,51 @@ build/entry.py  PyInstaller 的入口（冻结态启动 + 设数据目录）
 先出到 `.build/out` 再复制，是为了避开 dist 里的 exe 正在运行时的
 `PermissionError`。
 
-## 4. 打包后的自动校验
+---
+
+## 4. 打服务端包
+
+服务端版是脚本，不是 exe，但**也不能把整个 `src/` 拷过去**——里面混着
+`checkin_gui.py`（tkinter 界面）、`wb_task.py`（Windows 计划任务）、
+`win_quiet.py`（弹窗抑制），服务器上一概用不到。
+
+```bash
+python build/make_server_bundle.py            # 产出 dist/server/
+python build/make_server_bundle.py --out /tmp/wb   # 换输出目录
+```
+
+它从 `wb_server.py` 出发做 **import 闭包**（AST 静态解析，只看模块级导入），
+自动决定要带哪几个文件：
+
+```
+wb_server.py          入口
+workbuddy_checkin.py  签到流程
+wb_oauth.py           设备授权 / 续期
+wb_notify.py          推送
+wb_config.py          配置与路径
+config.example.json   配置模板（复用 wb_config.DEFAULT_CONFIG，键名不会写歪）
+README.txt            三步部署说明
+_bundle.json          清单，下次打包据此清理旧文件
+```
+
+几条设计约束：
+
+- **闭包里出现 `checkin_gui` / `wb_task` / `win_quiet` 就直接失败**，
+  提示把那处导入改成函数内惰性导入。这条拦住过一次真实回归：
+  `workbuddy_checkin.diagnose()` 里 `import wb_task` 查计划任务，
+  虽然被 try 包着不会崩，但静态闭包会把它算进依赖。
+- 只清理**上一次由自己放进去的 `.py`**（读 `_bundle.json`），
+  不碰 `config.json` / `auth_oauth.json` / `checkin.log`——那可能是线上数据。
+- 打完自动在产物目录跑一次 `wb_server.py --version`，闭包缺文件会立刻暴露。
+- 产物里的 `.py` 统一写成 LF；`__pycache__` 用 `-B` 避免生成。
+
+> 服务端目录是**平铺**的，`wb_config.is_repo_layout()` 靠 `run.py` / `.git` /
+> `build/` 判断是不是在开发仓库里：不是就认为数据目录 = 脚本目录，
+> 而不是脚本的父目录。`--version` 会显示「脚本运行」以区分。
+
+---
+
+## 5. 打包后的自动校验
 
 `build_exe.py` 打完会立刻运行一次 `dist/WorkBuddyCheckin.exe --selftest`，
 只有同时满足下面条件才算成功：
@@ -106,19 +150,23 @@ build/entry.py  PyInstaller 的入口（冻结态启动 + 设数据目录）
 }
 ```
 
-## 5. 发布前检查清单
+## 6. 发布前检查清单
 
-- [ ] `python tools/oauth_mode_check.py` 全绿（67 项）
+- [ ] `python tools/oauth_mode_check.py` 全绿（77 项）
 - [ ] `dist/WorkBuddyCheckin.exe --version` 版本号正确
 - [ ] `--selftest` 退出码 0，`frozen=true`，`data_origin=用户缓存目录`
 - [ ] 把 exe 拷到**另一个目录**再运行，确认仍能读到配置（数据目录不在 exe 旁）
 - [ ] `--sched-status` 不弹控制台黑框
 - [ ] `--run` 退出码 0（**测之前先清空 `push_channels`**，别真发消息）
 - [ ] 未授权时打开界面，除「立即授权」外按钮全灰
+- [ ] `python build/make_server_bundle.py` 成功，`dist/server/` 里**没有**
+      `checkin_gui.py` / `wb_task.py` / `win_quiet.py`
+- [ ] 服务端包拷到仓库外的空目录后 `python3 wb_server.py --version` 正常
+      （输出「脚本运行」，数据目录就是该目录）
 - [ ] 没有把 `config.json` / `auth_oauth.json` / `*.log` 打进发布包
 - [ ] README 截图与当前界面一致
 
-## 6. 踩过的坑
+## 7. 踩过的坑
 
 **用不带 tkinter 的解释器打包**：PyInstaller 不报错，只是悄悄少收集
 `_tkinter.pyd` 和 tcl/tk 运行时，产物一启动就 `ModuleNotFoundError: tkinter`。

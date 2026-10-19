@@ -34,19 +34,27 @@
 ### 服务端版
 
 ```bash
-# 1) 把 src/ 整个目录拷到服务器，比如 /opt/wbcheckin
+# 1) 打一个服务端包（只含该带的 5 个 .py，不带 GUI / Windows 模块）
+python3 build/make_server_bundle.py     # 产出 dist/server/
+
+# 2) 拷到服务器，比如 /opt/wbcheckin
+scp -r dist/server/ server:/opt/wbcheckin
 cd /opt/wbcheckin
 
-# 2) 生成配置模板，填机器人 key
+# 3) 生成配置模板，填机器人 key
 python3 wb_server.py --init-config
 python3 wb_server.py --check          # 体检：渠道、key、授权状态
 
-# 3) 先手工跑一次（会推授权链接到手机，等 3 分钟）
+# 4) 先手工跑一次（会推授权链接到手机，等 3 分钟）
 python3 wb_server.py
 
-# 4) 交给 cron
+# 5) 交给 cron
 30 9 * * * cd /opt/wbcheckin && python3 wb_server.py >> checkin.log 2>&1
 ```
+
+别把整个 `src/` 拷到服务器：`checkin_gui.py`（tkinter 界面）、`wb_task.py`
+（Windows 计划任务）、`win_quiet.py`（弹窗抑制）只在 exe 版用。服务端包是按
+`wb_server.py` 的 import 闭包自动收集的，以后改了导入关系也不会漏文件。
 
 `wb_server.py` 每次运行的顺序是固定的：
 
@@ -183,9 +191,11 @@ src/                业务逻辑
   wb_task.py          Windows 计划任务
   wb_server.py        服务端入口（cron 用）
   wb_config.py        配置与路径（唯一版本号来源）
-build/              构建：entry.py（冻结入口）+ build_exe.py（打包）
+  win_quiet.py        子进程不弹黑框（仅 Windows）
+build/              构建：entry.py（冻结入口）+ build_exe.py（打 exe）
+                    + make_server_bundle.py（打服务端包）
 tools/              回归检查（不参与发布）
-dist/               产物：WorkBuddyCheckin.exe + 界面截图
+dist/               产物：WorkBuddyCheckin.exe、server/（服务端包）、界面截图
 docs/               使用 / 构建 / 架构 / 排障 / 服务端
 ```
 

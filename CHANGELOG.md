@@ -37,7 +37,20 @@
 - `wb_server.py --auth-only` / `--checkin-only` / `--version`
 - `--check` 增加授权状态一行（未授权时说明下次运行会自动发起授权）
 - `docs/server.md` 按"cron 日常入口"重写：退避时间线、cron 示例、干净环境验证
-- 回归从 52 项扩到 **67 项**：新增版本与数据目录、迁移、服务端参数断言
+- 回归从 52 项扩到 **77 项**：新增版本与数据目录、迁移、服务端参数、
+  服务端打包闭包与平铺目录断言
+
+### 新增
+
+- **服务端打包脚本 `build/make_server_bundle.py`**：服务端部署不再需要
+  "把整个 `src/` 拷过去"。脚本从 `wb_server.py` 出发按 import 闭包（AST
+  静态解析模块级导入）自动收集，产出 `dist/server/`：
+  `wb_server.py`、`workbuddy_checkin.py`、`wb_oauth.py`、`wb_notify.py`、
+  `wb_config.py` + `config.example.json` + `README.txt` + `_bundle.json`。
+  `checkin_gui.py`（tkinter 界面）、`wb_task.py`（Windows 计划任务）、
+  `win_quiet.py`（弹窗抑制）不会被带上；万一以后被 import 进来，脚本直接报错。
+  只清理自己上次放进去的文件，不碰 `config.json` / `auth_oauth.json` /
+  `checkin.log`，打完自动跑一次 `--version` 冒烟。
 
 ### 删除
 
@@ -51,6 +64,11 @@
 
 - 服务端单独调用内部函数时，令牌可能写到当前工作目录而不是配置目录
   （现在每个入口都先绑定数据目录）
+- **服务端平铺目录的数据目录不再是"父目录"**：`default_data_dir()` 之前假定
+  "源码运行 = 仓库"，把 `src/` 的上一级当数据目录；服务端把 5 个脚本平铺在
+  `/opt/wbcheckin` 时，配置会被写到 `/opt/`。现在用 `is_repo_layout()` 判据
+  （`run.py` / `.git` / `build/`）区分，平铺目录的数据目录就是脚本目录，
+  `--version` 显示「脚本运行」以示区别
 - 界面"每日定时"的路径校验改看"命令 + 参数"，之前只比程序路径
 
 ## [2.2] - 2026-10-19

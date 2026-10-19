@@ -421,6 +421,51 @@ def main():
         finally:
             wb_config.install_dir = real_install
             wb_config.set_data_dir(Path(ROOT))
+
+        # 14) 服务端打包：只带该带的模块，数据落脚本目录
+        check("仓库布局识别正确", wb_config.is_repo_layout() is True)
+        build_dir = os.path.join(str(ROOT), "build")
+        bundle = None
+        sys.path.insert(0, build_dir)
+        try:
+            import make_server_bundle as bundle
+            mods = bundle.collect()
+            check("服务端闭包是 5 个模块", len(mods) == 5, mods)
+            check("闭包不含 GUI / Windows 模块",
+                  not (set(mods) & set(bundle.FORBIDDEN)), mods)
+            check("闭包含入口与签到核心",
+                  {"wb_server", "workbuddy_checkin"} <= set(mods), mods)
+            check("闭包不含 win_quiet（tk/计划任务专用）",
+                  "win_quiet" not in mods, mods)
+        except Exception as e:  # noqa: BLE001
+            check("服务端打包脚本可用", False, repr(e))
+        finally:
+            sys.path.remove(build_dir)
+
+        pkg = Path(ROOT) / "dist" / "server"
+        if pkg.is_dir() and bundle is not None:
+            names = sorted(p.name for p in pkg.glob("*.py"))
+            check("dist/server 里没有 GUI / Windows 模块",
+                  not ({"{}.py".format(f) for f in bundle.FORBIDDEN}
+                       & set(names)), names)
+            check("dist/server 自带配置模板",
+                  (pkg / "config.example.json").is_file())
+
+        # 平铺目录（服务器上的样子）数据必须落脚本目录，不能落父目录
+        flat = Path(tmpdir) / "flat"
+        flat.mkdir(exist_ok=True)
+        real_src = wb_config.SRC_DIR
+        wb_config.SRC_DIR = flat
+        try:
+            check("平铺目录不算仓库布局", wb_config.is_repo_layout() is False)
+            check("服务端数据目录=脚本目录",
+                  wb_config.default_data_dir() == flat,
+                  str(wb_config.default_data_dir()))
+            check("服务端版本行写「脚本运行」",
+                  "脚本运行" in wb_config.version_text(),
+                  wb_config.version_text())
+        finally:
+            wb_config.SRC_DIR = real_src
     finally:
         srv.shutdown()
         shutil.rmtree(tmpdir, ignore_errors=True)

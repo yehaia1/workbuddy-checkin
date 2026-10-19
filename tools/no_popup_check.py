@@ -106,8 +106,8 @@ def main(argv: list) -> int:
     ap.add_argument("--exe", help="要检查的可执行文件（默认在 dist/ 下自动找）")
     ap.add_argument("--timeout", type=float, default=180.0,
                     help="等待目标程序结束的最长秒数（默认 180）")
-    ap.add_argument("--out", default="no_popup_check.json",
-                    help="结果 JSON 写入路径（默认 no_popup_check.json）")
+    ap.add_argument("--out", default=".build/no_popup_check.json",
+                    help="结果 JSON 写入路径（默认 .build/no_popup_check.json）")
     ap.add_argument("target_args", nargs="*",
                     help="传给目标程序的参数（建议放在 -- 之后）")
     args = ap.parse_args(argv)
@@ -168,6 +168,7 @@ def main(argv: list) -> int:
     out = Path(args.out)
     if not out.is_absolute():
         out = ROOT / out
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, ensure_ascii=False, indent=2),
                    encoding="utf-8")
 

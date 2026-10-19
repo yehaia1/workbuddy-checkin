@@ -1,5 +1,6 @@
 # ---------------- 构建产物 ----------------
 # 注意：build/ 是打包脚本目录，**必须入库**；PyInstaller 的中间产物都丢在 .build/
+# 回归检查（oauth_mode_check / no_popup_check）的结果也写在 .build/ 里
 .build/
 dist/
 *.spec
@@ -9,8 +10,6 @@ dist/
 config.json
 checkin.log
 selftest.json
-no_popup_check.json
-oauth_mode_check.json
 *.log
 
 # 账号直连模式的令牌（明文 accessToken / refreshToken，绝不能提交）

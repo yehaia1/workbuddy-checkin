@@ -8,9 +8,11 @@
   3. refreshToken 轮换：刷新后必须落盘，否则下次就被判会话失效；
   4. 401 自动续期重试：第一次 401、刷新后第二次成功，业务层应当无感；
   5. 12153 会话失效：标记 disabled 并提示"重新授权"，而不是含糊的网络错误；
-  6. 导入码：服务端导出的码必须能原样导入，坏码必须明确报错；
+  6. 导入码：导出的码必须能原样导入，坏码必须明确报错；
   7. 到期提醒：剩余天数 <= expiry_warn_days 才提醒，阈值设 0 等于关闭；
-  8. 推送：只推选中的渠道，没填 key 的渠道不参与。
+  8. 推送：只推选中的渠道，没填 key 的渠道不参与；
+  9. 版本与数据目录：版本号格式、exe 写缓存目录、旧版数据一次性迁移；
+ 10. 服务端脚本：能不依赖 tkinter 导入，授权参数取自配置。
 
 用法：
     python tools/oauth_mode_check.py
@@ -20,19 +22,24 @@
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
+import wb_config                                                  # noqa: E402
 import wb_notify                                                  # noqa: E402
 import wb_oauth                                                   # noqa: E402
 import workbuddy_checkin as core                                  # noqa: E402
@@ -263,7 +270,7 @@ def main():
                 check("坏导入码被拒绝({!r})".format(bad),
                       e.result == "OAUTH_IMPORT_BAD", e.result)
 
-        # 7b) 从文件导入 —— 服务端 --save-token 导出的就是一份 auth_oauth.json，
+        # 7b) 从文件导入 —— 跨机器搬令牌时给的就是一份 auth_oauth.json，
         #     它必须是 JSON 而不是导入码，两种都得认。
         server_file = os.path.join(tmpdir, "from_server.json")
         with open(server_file, "w", encoding="utf-8") as fh:
@@ -323,24 +330,42 @@ def main():
         check("授权文案含链接", "https://example.invalid/login?state=x" in msg, msg)
         check("授权文案含有效期", "10 分钟" in msg, msg)
 
-        # 11) 服务端脚本必须能导入（服务器上没有 tkinter / 没有 wb_task）
+        # 11) 服务端脚本：服务器上没有 tkinter / 没有 wb_task，必须能裸导入
         try:
-            import wb_auth_server
-            chans = wb_auth_server.resolve_channels(cfg, "")
+            import wb_server
+            chans = wb_server.resolve_channels(cfg, "")
             check("服务端脚本可导入并解析渠道", chans == ["wecom"], chans)
-            forced = wb_auth_server.resolve_channels(cfg2, "dingtalk")
+            forced = wb_server.resolve_channels(cfg2, "dingtalk")
             check("服务端可强制指定渠道", forced == ["dingtalk"], forced)
-            rows = {r["name"]: r for r in wb_auth_server.channel_rows(cfg2)}
+            rows = {r["name"]: r for r in wb_server.channel_rows(cfg2)}
             check("体检：勾选且填了 key 才算可用",
                   rows["wecom"]["usable"] and rows["dingtalk"]["usable"], rows)
             rows = {r["name"]: r
-                    for r in wb_auth_server.channel_rows(
+                    for r in wb_server.channel_rows(
                         dict(cfg2, wecom_key=""))}
             check("体检：没填 key 不算可用", not rows["wecom"]["usable"], rows)
             check("体检结果不含 key 本身",
                   "WECOM-KEY" not in json.dumps(rows, ensure_ascii=False))
+            check("服务端不依赖 wb_task", not hasattr(wb_server, "wb_task"))
+            check("授权参数默认 180 秒 / 3 轮",
+                  (wb_server._int_opt(None, {}, "auth_wait_seconds", 180, 30),
+                   wb_server._int_opt(None, {}, "auth_attempts", 3, 1))
+                  == (180, 3))
+            check("授权参数可被配置覆盖",
+                  wb_server._int_opt(None, {"auth_wait_seconds": 240},
+                                     "auth_wait_seconds", 180, 30) == 240)
+            check("指数退避：60/120/240",
+                  [60 * 2 ** i for i in range(3)] == [60, 120, 240])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = wb_server.main(["--version"])
+            check("服务端 --version", rc == 0 and wb_config.VERSION in buf.getvalue(),
+                  buf.getvalue()[:60])
         except Exception as e:
             check("服务端脚本可导入并解析渠道", False, repr(e))
+        finally:
+            # 上面 --version 会把数据目录切到脚本目录，恢复回测试前的状态
+            wb_config.set_data_dir(Path(ROOT))
 
         # 12) 请求头：鉴权与身份头都要带齐
         with wb_oauth.OAuthSession(token_file) as sess:
@@ -354,6 +379,48 @@ def main():
         check("UA 为 CLI 身份",
               "CodeBuddy" in str(low.get("user-agent", "")),
               low.get("user-agent"))
+
+        # 13) 版本与数据目录：exe 写缓存、源码写仓库根、旧数据只能搬一次
+        check("版本号是 x.y.z",
+              bool(re.match(r"^\d+\.\d+\.\d+$", wb_config.VERSION)),
+              wb_config.VERSION)
+        check("版本行带程序名",
+              wb_config.APP_ID in wb_config.version_text(),
+              wb_config.version_text())
+        check("产物是英文名", wb_config.APP_ID.isascii(), wb_config.APP_ID)
+        check("源码运行默认写仓库根目录",
+              wb_config.default_data_dir() == Path(ROOT),
+              str(wb_config.default_data_dir()))
+        local = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        check("缓存目录在用户目录下（不碰程序目录）",
+              str(wb_config.cache_dir()).startswith(local or str(Path.home())),
+              str(wb_config.cache_dir()))
+
+        inst, data = (os.path.join(tmpdir, "install"),
+                      os.path.join(tmpdir, "cache"))
+        os.makedirs(inst, exist_ok=True)
+        for name in ("config.json", wb_config.TOKEN_FILE_NAME):
+            with open(os.path.join(inst, name), "w", encoding="utf-8") as fh:
+                fh.write('{"legacy": 1}')
+        real_install = wb_config.install_dir
+        wb_config.install_dir = lambda: Path(inst)
+        try:
+            wb_config.set_data_dir(Path(data))
+            moved = wb_config.migrate_legacy()
+            check("旧版配置与令牌都会迁到数据目录",
+                  sorted(moved) == ["auth_oauth.json", "config.json"], moved)
+            check("迁移后目标文件确实存在",
+                  os.path.isfile(os.path.join(data, "config.json")))
+            check("迁移保留源文件（不擅自删用户数据）",
+                  os.path.isfile(os.path.join(inst, "config.json")))
+            check("已有配置不会被覆盖", wb_config.migrate_legacy() == [],
+                  wb_config.migrate_legacy())
+            wb_config.set_data_dir(Path(inst))
+            check("数据目录=程序目录时不做迁移",
+                  wb_config.migrate_legacy() == [])
+        finally:
+            wb_config.install_dir = real_install
+            wb_config.set_data_dir(Path(ROOT))
     finally:
         srv.shutdown()
         shutil.rmtree(tmpdir, ignore_errors=True)

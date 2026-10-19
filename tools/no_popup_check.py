@@ -25,7 +25,7 @@ Windows 找不到可继承的控制台，就会给子进程**新建一个控制�
 用法
 ----
     # 检查打包后的 exe（推荐）
-    pythonw tools/no_popup_check.py --exe "dist\\WorkBuddy签到.exe" -- --sched-status
+    pythonw tools/no_popup_check.py --exe "dist\\WorkBuddyCheckin.exe" -- --sched-status
 
     # 不指定 --exe 时，自动在 dist/ 下找
     pythonw tools/no_popup_check.py -- --selftest
@@ -93,7 +93,7 @@ def find_exe(explicit: str | None) -> Path | None:
     if explicit:
         p = Path(explicit)
         return p if p.is_absolute() else (ROOT / p)
-    for name in ("WorkBuddy签到.exe", "WorkBuddyCheckin.exe"):
+    for name in ("WorkBuddyCheckin.exe",):
         p = ROOT / "dist" / name
         if p.is_file():
             return p

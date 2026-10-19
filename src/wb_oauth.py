@@ -8,8 +8,8 @@ WorkBuddy 客户端进程，也不解密客户端的本地登录态。
 
 设备授权的两个端点都是公共 HTTP 接口，`state` 只是一段服务端会话 id，
 所以「在 A 机器生成链接、在 B 机器轮询拿令牌」在协议上是成立的——
-服务端脚本（wb_auth_server.py）就是靠这一点工作的，见文件末尾的
-「导入码」一节。
+服务端版没有浏览器，就是靠这一点：先推链接到手机，再在服务器上轮询
+（见 wb_server.py）。
 
 授权流程
 --------
@@ -171,11 +171,11 @@ def refresh_url(record: Dict[str, Any]) -> str:
 
 def token_path(cfg: Optional[Dict[str, Any]] = None,
                base_dir: Optional[str] = None) -> str:
-    """令牌文件路径：配置项 oauth_token_file 优先，否则放程序目录。"""
+    """令牌文件路径：配置项 oauth_token_file 优先，否则放数据目录。"""
     custom = str((cfg or {}).get("oauth_token_file") or "").strip()
     if custom:
         return os.path.abspath(os.path.expandvars(custom))
-    return os.path.join(base_dir or str(wb_config.SCRIPT_DIR), TOKEN_FILE_NAME)
+    return os.path.join(str(base_dir or wb_config.data_dir()), TOKEN_FILE_NAME)
 
 
 def build_record(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -283,16 +283,16 @@ def summary(path: str) -> Dict[str, Any]:
     return out
 
 
-# ---- 导入码（服务端授权 -> 本机导入） -------------------------------------
-#
-# 服务端脚本拿到令牌后，用一段「导入码」把它交给 Windows 端：
+# ---- 导入码（把一份令牌搬到另一台机器） -----------------------------------
 #
 #     WBAT1.<base64url(令牌 JSON)>
 #
-# 为什么是这种土办法：令牌是一次性凭证，必须**只落在真正执行签到的那台
-# 机器上**。refreshToken 每次刷新都会轮换，两台机器各持一份就会互相踢掉
-# （服务端返回 12153）。所以服务端拿完令牌**不落盘**，只把这串码交给运维，
-# 由 Windows 端导入后独占。
+# 现在两条运行线各自授权、各存一份，正常情况下用不到它。留着是因为还有一种
+# 真实场景：Windows 那台的浏览器流程走不通（企业策略、代理拦截），可以先用
+# 命令行在别处授权，再把这一段粘过来（--import-token）。
+#
+# 前提是**不能两台各存一份同时用**：refreshToken 每次刷新都会轮换，
+# 两边都跑签到就会互相踢掉（服务端返回 12153）。迁移完就把旧的那份删掉。
 #
 # ⚠️ 导入码等同于令牌本身（只是 base64，不是加密）。别贴到群里、别进日志。
 

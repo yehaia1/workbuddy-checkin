@@ -63,6 +63,23 @@ python -m playwright install --with-deps chromium
 pip install playwright
 ```
 
+**只 `pip install playwright` 不算装好**：库在，但浏览器没下载，启动时会报
+`Chromium distribution 'chrome' is not found at /opt/google/chrome/chrome`。
+脚本会按 chrome → msedge → 系统 chromium/chrome 路径 → playwright 自带
+chromium 的顺序找，**有一处能起就行**：
+
+```bash
+export WB_BROWSER_PATH=/usr/bin/chromium        # 复用系统已有的浏览器
+export PLAYWRIGHT_BROWSERS_PATH=/home/xxx/.cache/ms-playwright   # 浏览器在别的用户下
+```
+
+都没找到时脚本打一份「4 种来源分别为什么失败 + 该敲哪条命令」的报告，
+然后**立即退出（退出码 2）**，不会去空等授权。
+
+> cron 常以 root 运行，而 playwright 是装在你自己的用户下的 ——
+> `~/.cache/ms-playwright` 按用户区分，这就是「手工跑正常、cron 里起不来」
+> 的典型原因。用同一个用户跑，或指 `PLAYWRIGHT_BROWSERS_PATH`。
+
 要求：Python 3.8+，**日常签到零第三方依赖**，Linux / Windows 都能跑
 （不 import tkinter，也不碰 Windows 计划任务）。也可以直接 `./wb_server.pyz`
 执行（文件带 shebang）。
@@ -205,8 +222,8 @@ env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin \
 | 现象 | 原因 / 处理 |
 |---|---|
 | `✗ 没有可用的推送渠道` | `push_channels` 勾了但 key 没填对。跑 `--check` 看是哪一种 |
-| `二维码授权：不可用` | 没装 playwright。`pip install playwright`（Linux 再加 `python -m playwright install --with-deps chromium`）。**这时脚本会直接退出（退出码 2），不会等待** |
-| `✗ 取二维码失败：起不了浏览器` | 服务器上没有可用浏览器（缺系统依赖 / 权限）。装 chromium 后重跑；同样直接退出，不重试 |
+| `二维码授权：不可用` | 没装 playwright 或没装浏览器。`pip install playwright && python -m playwright install --with-deps chromium`（或 `WB_BROWSER_PATH=/usr/bin/chromium`）。**这时脚本会直接退出（退出码 2），不会等待** |
+| `✗ 取二维码失败 —— 起不了浏览器` | 会在下面列出 4 种来源各自的原因、浏览器目录、当前用户和修复命令。照第 1 条装 chromium 即可；`cron 起不来、手工正常` 见上面 root/用户那段 |
 | 二维码链接点开是空白 | 过期了（约 5 分钟）。重跑脚本会重新申请 |
 | 3 轮都超时 | 人没在 3 分钟内扫码。加大 `--wait 300`，或先 `--auth-only` 单独授权 |
 | `12153 Offline user session not found` | 令牌被别处刷新过（两台机器都在跑）。只留一处 |

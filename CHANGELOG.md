@@ -3,6 +3,35 @@
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)，
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [3.2.2] - 2026-10-19
+
+**修「起不了浏览器」：多找几种来源，并把话说清楚。**
+
+Linux 服务器上只 `pip install playwright` 是不够的（库在、浏览器没下载），
+启动时只有一串
+
+```
+chrome: ... Chromium distribution 'chrome' is not found at /opt/google/chrome/chrome
+msedge: ... not found at /opt/microsoft/msedge/msedge
+bundled: ... Target page, context or browser has been closed
+```
+
+看不出该干什么。现在：
+
+- **四种来源依次试**：`chrome` channel → `msedge` channel → 系统可执行文件
+  （`WB_BROWSER_PATH`、`/usr/bin/chromium`、`/usr/bin/google-chrome`、
+  `/snap/bin/chromium`、`/opt/google/chrome/chrome` …）→ playwright 自带
+  chromium。**有一处能起就行**，不必非得跑 `playwright install`；
+- **启动前先探**：`browser_ready()` 只看文件存不存在，不启浏览器；一个都没有
+  就打印结论直接退出，不再打四条 playwright 原始报错；
+- **失败报告可照做**：逐条列出每种来源为什么失败，附 playwright 浏览器目录、
+  `WB_BROWSER_PATH`、当前用户，以及三条修复路径（装 chromium / 指系统浏览器 /
+  换 `PLAYWRIGHT_BROWSERS_PATH`），并点明「cron 是 root、浏览器装在别的用户下」
+  这个最常见的原因；
+- `--check` 的「二维码授权」现在区分库与浏览器两层，可用时会显示实际用的是哪个
+  （`复用系统浏览器：/usr/bin/chromium` / `playwright 自带：chromium-1148`）；
+- 行为不变：判断失败仍然**立即退出（退出码 2），不推链接、不等待、不重试**。
+
 ## [3.2.1] - 2026-10-19
 
 **缺二维码能力时服务端直接退出，不再空等。**

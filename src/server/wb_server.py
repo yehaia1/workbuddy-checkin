@@ -157,8 +157,13 @@ def do_check(cfg: dict, config_file: str) -> int:
 
     qr_ok, qr_reason = wb_qrlogin.available()
     if qr_ok:
-        say("二维码授权：可用（服务端自己开无头浏览器取微信二维码）")
-    else:
+        b_ok, b_how = wb_qrlogin.browser_ready()
+        if b_ok:
+            say("二维码授权：可用（{}）".format(b_how))
+        else:
+            # 库装了但浏览器没装：同样授权不了，别再报「可用」骗人
+            qr_ok, qr_reason = False, b_how
+    if not qr_ok:
         say("二维码授权：不可用 —— {}".format(qr_reason))
         say("  装上之后才能扫码授权（手机打开链接登录拿不到令牌）：")
         say("    " + wb_qrlogin.install_hint())
@@ -306,6 +311,18 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
             say("  确实只想推授权页链接（得在桌面浏览器里打开）：加 --no-qr")
             return {"ok": False, "attempts": 0, "fatal": True,
                     "message": "二维码授权不可用：{}".format(reason)}
+        # 库在、浏览器没装：launch 一定失败，提前拦下来给一句人话，
+        # 省得打四条 playwright 的原始报错（这是 Linux 上最常见的情况）。
+        browser_ok, browser_how = wb_qrlogin.browser_ready()
+        if not browser_ok:
+            say("✗ 没有可用的浏览器：{}".format(browser_how))
+            say("  playwright 库装了，但没装 Chromium —— 生成不了二维码，"
+                "授权不可能完成，直接退出，不等待。")
+            say("  装一个再跑：")
+            say("    " + wb_qrlogin.install_hint())
+            return {"ok": False, "attempts": 0, "fatal": True,
+                    "message": "没有可用的浏览器：{}".format(browser_how)}
+        say("   浏览器：{}".format(browser_how))
 
     last = ""
     for i in range(1, attempts + 1):
@@ -335,14 +352,14 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
                         session = wb_qrlogin.QRSession(url).open()
                     except wb_qrlogin.QRError as e:
                         # 拿不到二维码 = 没法扫码 = 本轮等下去也是空等。
-                        # 重试大概率还是同一个原因（缺浏览器依赖 / 沙箱权限），
+                        # 重试大概率还是同一个原因（缺浏览器 / 沙箱权限），
                         # 所以同样直接退出，让人去修环境，而不是退避 3 轮。
-                        say("✗ 取二维码失败：{}".format(e))
-                        say("  没有二维码就没法完成授权，直接退出，不空等。")
-                        say("  常见原因是浏览器依赖没装齐，重跑前先执行：")
-                        say("    " + wb_qrlogin.install_hint())
+                        text = str(e)
+                        say("✗ 取二维码失败 —— 直接退出，不等待、不重试：")
+                        say(text)
+                        first = (text.strip().splitlines() or ["取二维码失败"])[0]
                         return {"ok": False, "attempts": i, "fatal": True,
-                                "message": "取二维码失败：{}".format(e)}
+                                "message": first}
                     else:
                         say("   ✓ 二维码链接：{}".format(session.qr_url or "（只有截图）"))
                         if session.png:

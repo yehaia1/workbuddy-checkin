@@ -61,8 +61,10 @@ python -m playwright install --with-deps chromium   # Linux 服务器
 ```
 
 Windows / macOS 上装了 Chrome 或 Edge 的，只 `pip install playwright` 即可，
-不用下 chromium。**没装就直接退出**（退出码 `2`，打印安装命令）：生成不了
-二维码就扫不了码，等下去也拿不到授权，脚本不会在那儿空等。
+不用下 chromium。脚本会依次找 chrome / msedge / 系统 chromium / playwright
+自带 chromium，也可以 `WB_BROWSER_PATH=/usr/bin/chromium` 直接指过去。
+**一个都找不到就直接退出**（退出码 `2`，打印该敲的命令）：生成不了二维码就
+扫不了码，等下去也拿不到授权，脚本不会在那儿空等。
 
 服务器上**只有这一个文件**。配置、日志、令牌都由它生成在同目录，
 `--init-config` 写 `config.json`，不需要另拷模板或依赖目录。

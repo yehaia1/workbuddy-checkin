@@ -197,19 +197,33 @@ python3 wb_server.pyz --check
 - 扫完还是不动时，看控制台打印的轮询码：
   `code=11217` 说明还没扫成功，`12153` 说明会话已失效（本轮作废）。
 
-`--check` 里「二维码授权：不可用」= 没装 playwright：
+`--check` 里「二维码授权：不可用」= 库或浏览器缺一个：
 
 ```bash
 pip install playwright
 python -m playwright install --with-deps chromium    # Linux
 ```
 
-装完再跑 `--check` 应显示「可用」。
+**只装库不够**：库在、浏览器没下，启动时会报
+`Chromium distribution 'chrome' is not found at /opt/google/chrome/chrome`。
+脚本按 chrome → msedge → 系统 chromium/chrome → playwright 自带 chromium
+的顺序找，有一处能起就行；也可以用环境变量直接指过去：
 
-**没装就直接退出**：缺 playwright 或浏览器起不来时，脚本打一行原因 +
-安装命令，立刻以退出码 `2` 结束（约 1 秒），**不推链接、不等待、不重试**。
-因为没有二维码就扫不了码，等下去也永远到不了 `code=0`，白占十几分钟。
-cron 里看到 `2` 就是环境没准备好，装完再跑即可。
+```bash
+export WB_BROWSER_PATH=/usr/bin/chromium
+export PLAYWRIGHT_BROWSERS_PATH=/home/xxx/.cache/ms-playwright
+```
+
+装完再跑 `--check` 应显示「可用（复用系统浏览器：…）」或「可用（playwright 自带：chromium-xxxx）」。
+
+**装不上就直接退出**：缺 playwright、缺浏览器、浏览器起不来时，脚本列出
+每种来源失败的原因 + 该敲的命令，立刻以退出码 `2` 结束（约 1 秒），
+**不推链接、不等待、不重试**。因为没有二维码就扫不了码，等下去也永远到不了
+`code=0`，白占十几分钟。cron 里看到 `2` 就是环境没准备好。
+
+> `cron 里起不来、手工跑正常`：cron 多半是 root，而浏览器装在你自己用户下。
+> `~/.cache/ms-playwright` 是按用户分的，两边要一致，或指
+> `PLAYWRIGHT_BROWSERS_PATH`。
 
 实在跑不起浏览器时，可以用 `--no-qr` 退回推授权页链接
 （只有桌面浏览器打开能完成登录）。

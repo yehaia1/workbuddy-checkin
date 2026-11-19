@@ -59,13 +59,18 @@ _DATA_DIR: Optional[Path] = None
 _DATA_ORIGIN = ""
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    # ---- 多账号 ----
+    # 每条 = 一个账号：{"uid": ..., "token_file": ..., "nickname": ...}
+    # 归属由授权结果的 uid 决定（见 wb_accounts）；空数组 = 还没授权过。
+    # 旧配置没有这个键时，wb_accounts.ensure() 会把那份唯一令牌挂成第一个账号。
+    "accounts": [],
     # ---- 推送 ----
     # 只推送选中的渠道；留空 = 不推送。key 留空的渠道会被自动跳过。
     "push_channels": ["wecom"],
     "wecom_key": "",                # 企业微信机器人：webhook 链接里 key= 后面那段
     "dingtalk_key": "",             # 钉钉机器人：链接里 access_token= 后面那段
     # ---- 授权 ----
-    "oauth_token_file": "",         # 留空 = 数据目录下 auth_oauth.json
+    "oauth_token_file": "",         # 已废弃（多账号改用 accounts[].token_file）
     "oauth_auth_timeout": 300,      # 授权等待上限（秒），手机操作也够用
     # 服务端自动授权：等多久（秒）/ 最多几轮 / 轮次间的退避基数（秒，指数增长）
     "auth_wait_seconds": 180,
@@ -74,6 +79,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # 服务端授权时自己开无头浏览器取微信二维码（需要 playwright）。
     # 设 false = 只推授权链接——手机点开登录拿不到令牌，仅排障用。
     "auth_qr": True,
+    # 服务端多账号：整批自动授权的总预算（秒）。多个账号同时缺授权时，
+    # 二维码只能一个一个推；用完这个预算后剩下的账号本次直接跳过
+    # （标记「未尝试授权」，退出码 2），留给下一次运行再处理。
+    "auth_total_budget_seconds": 900,
     # 令牌剩余天数 <= 该值时，每次签到后额外推一条续期提醒（界面不暴露，
     # 需要改就改 config.json；设 0 = 关闭提醒）
     "expiry_warn_days": 2,
@@ -92,6 +101,10 @@ LEGACY_KEYS = (
     "close_after_checkin", "close_timeout", "close_force",
     "auto_env_check", "ui_scale", "wecom_webhook", "dingtalk_webhook",
 )
+
+# 多账号改造后失效的键：读配置时还要用（迁移第一个账号要认它指过的路径），
+# 但下一次写配置就从文件里剔掉，免得留着一个已经没人读的路径。
+DEPRECATED_KEYS = ("oauth_token_file",)
 
 
 # ---------------- 路径 ----------------
@@ -286,6 +299,9 @@ def load(path: Optional[str] = None) -> Dict[str, Any]:
     cfg = dict(DEFAULT_CONFIG)
     cfg["schedule_times"] = list(DEFAULT_CONFIG["schedule_times"])
     cfg["push_channels"] = list(DEFAULT_CONFIG["push_channels"])
+    # 只有配置文件里真的写了 accounts 才算数：缺这个键 = 旧版单账号配置，
+    # 由 wb_accounts.ensure() 把那份唯一令牌挂成第一个账号。
+    cfg.pop("accounts", None)
     p = config_path(path)
     try:
         user = json.loads(p.read_text(encoding="utf-8"))
@@ -308,6 +324,9 @@ def load(path: Optional[str] = None) -> Dict[str, Any]:
     if isinstance(times, str):
         times = times.replace("，", ",").split(",")
     cfg["schedule_times"] = [str(t).strip() for t in (times or []) if str(t).strip()]
+    # accounts 结构坏了也当成“还没迁移”，交给 wb_accounts.ensure() 重建
+    if not isinstance(cfg.get("accounts"), list):
+        cfg.pop("accounts", None)
     return cfg
 
 
@@ -320,7 +339,7 @@ def save_patch(patch: Dict[str, Any], path: Optional[str] = None) -> Path:
             cur = {}
     except (OSError, ValueError):
         cur = {}
-    for k in LEGACY_KEYS:
+    for k in LEGACY_KEYS + DEPRECATED_KEYS:
         cur.pop(k, None)
     cur.update({k: v for k, v in (patch or {}).items() if k in DEFAULT_CONFIG})
     p.parent.mkdir(parents=True, exist_ok=True)

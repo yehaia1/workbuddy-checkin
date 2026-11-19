@@ -48,7 +48,7 @@ HIDDEN_IMPORTS = [
     "threading", "urllib.parse", "urllib.request", "urllib.error",
     "http.server", "http.client", "email", "email.utils",
     "_socket", "_ssl", "tkinter", "tkinter.ttk",
-    "wb_config", "wb_notify", "wb_oauth", "wb_task", "win_quiet",
+    "wb_config", "wb_notify", "wb_oauth", "wb_accounts", "wb_task", "win_quiet",
     "workbuddy_checkin", "checkin_gui",
 ]
 

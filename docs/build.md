@@ -100,6 +100,7 @@ python build/make_server.py --out /tmp/wb.pyz      # 换输出路径
 wb_server            入口
 workbuddy_checkin    签到流程
 wb_oauth             设备授权 / 续期
+wb_accounts          多账号列表 / 授权结果合并
 wb_notify            推送
 wb_config            配置与路径
 ```
@@ -155,7 +156,7 @@ wb_config            配置与路径
 
 ## 6. 发布前检查清单
 
-- [ ] `python tools/oauth_mode_check.py` 全绿（77 项）
+- [ ] `python tools/oauth_mode_check.py` 全绿（114 项）
 - [ ] `dist/WorkBuddyCheckin.exe --version` 版本号正确
 - [ ] `--selftest` 退出码 0，`frozen=true`，`data_origin=用户缓存目录`
 - [ ] 把 exe 拷到**另一个目录**再运行，确认仍能读到配置（数据目录不在 exe 旁）

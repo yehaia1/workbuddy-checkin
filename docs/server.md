@@ -4,8 +4,12 @@
 交给 cron 定时调用即可。缺授权时它自己开一个**无头浏览器**取微信二维码链接
 推给你扫；有授权就完全不启动浏览器。
 
-和 Windows 版是**两套部署，选一个用**。两边同时定时会因为 `refreshToken`
-轮换而互相踢掉（服务端返回 `12153`）。
+和 Windows 版是**两套部署，选一个用**。同一个账号在两边同时定时会因为
+`refreshToken` 轮换而互相踢掉（服务端返回 `12153`）；不同账号可以各跑各的。
+
+同机多账号：`config.json` 的 `accounts` 列表里一条一个账号，一个账号一份
+令牌文件（`auth_<uid>.json`）。每次运行会逐账号检查授权、缺的逐个推二维码，
+再逐账号签到，一条推送消息对应一个账号。
 
 ---
 
@@ -25,6 +29,7 @@ scp dist/server/wb_server.pyz server:/opt/wbcheckin/
 wb_server            入口
 workbuddy_checkin    签到流程（不含界面）
 wb_oauth             设备授权 / 续期
+wb_accounts          多账号列表 / 授权结果合并
 wb_qrlogin           无头浏览器取二维码（只在授权时用，playwright 惰性导入）
 wb_notify            推送
 wb_config            配置与路径
@@ -48,7 +53,7 @@ vi config.json
 # 3) 体检：不联网，只看配置、授权状态、二维码能力
 python3 wb_server.pyz --check
 
-# 4) 先手工跑一次：缺授权时会推一条二维码链接，扫码即可，等 3 分钟
+# 4) 先手工跑一次：缺授权时会逐个推二维码链接，扫码即可
 python3 wb_server.pyz
 ```
 
@@ -84,8 +89,9 @@ export PLAYWRIGHT_BROWSERS_PATH=/home/xxx/.cache/ms-playwright   # 浏览器在�
 （不 import tkinter，也不碰 Windows 计划任务）。也可以直接 `./wb_server.pyz`
 执行（文件带 shebang）。
 
-**配置跟着脚本走**：`config.json`、`checkin.log`、`auth_oauth.json` 都写在
-`wb_server.pyz` 所在目录。`wb_config` 认得出自己在 zip 里，会退到
+**配置跟着脚本走**：`config.json`、`checkin.log`、各账号的令牌文件都写在
+`wb_server.pyz` 所在目录（单账号升级上来的旧文件仍叫 `auth_oauth.json`，
+多账号新授权的是 `auth_<uid>.json`）。`wb_config` 认得出自己在 zip 里，会退到
 `sys.argv[0]` 的目录，不会往父目录或 zip 内部写。
 `--version` 显示「脚本运行」，与源码运行区分。
 
@@ -98,24 +104,26 @@ python3 wb_server.pyz
 ```
 
 ```
-① 检查授权
-   有效      → 直接进入 ②（不启动浏览器）
-   未授权 / 损坏 / 会话失效 → 进入授权流程
-   网络不通  → 退出码 3（重试授权没有意义）
+① 逐账号检查授权（令牌取自各自的账号条目）
+     OK          → 跳过，看下一个账号
+     未授权 / 损坏 / 会话失效 → 进入下面的扫码循环
+     网络不通    → 跳过该账号，退出码 3（重试授权没有意义）
 
-   授权流程（最多 3 轮，指数退避）
+   扫码循环（一次只推一个账号的二维码，扫完再推下一个）
+     每账号最多 2 轮（显式 --attempts 时以它为准）
      轮 1：申请会话 → 起无头浏览器取二维码链接 → 推给用户 → 等 180 秒
      轮 2：（隔 60 秒）新的会话 → 二维码 → 推 → 等 180 秒
-     轮 3：（隔 120 秒）同上
-   拿到令牌立刻关掉浏览器；最坏耗时约 12 分钟
+     拿到令牌立刻关掉浏览器；该账号失败不影响后面的账号
 
-   没装 playwright / 浏览器起不来 → 打一行原因 + 安装命令，
+   整批预算 auth_total_budget_seconds（默认 900 秒）
+     用完 → 剩余账号标记「跳过（未尝试授权）」，计入退出码 2
+     没装 playwright / 浏览器起不来 → 打一行原因 + 安装命令，
                                     **立即退出码 2，不推链接、不等待、不重试**
                                    （没有二维码就扫不了码，等下去也是白等）
 
-② 执行签到：查 → 领 → 复核
+② 逐账号签到：查 → 领 → 复核（单账号失败不中断，跑完汇总）
 
-③ 推送结果到同一批渠道（含授权到期提醒）
+③ 每个账号推一条结果到同一批渠道（含授权到期提醒）
 ```
 
 推给你的是**二维码图片链接**，不是授权页链接：
@@ -138,18 +146,21 @@ python3 wb_server.pyz
 
 关键点：
 
-- **每轮都重新读 `config.json`**。等待的 3 分钟里，你完全可以回去把机器人
+- **每轮都重新读 `config.json`**。等待的那几分钟里，你完全可以回去把机器人
   key 补上、把渠道勾上——下一轮就推得出去了。
 - 每轮都重新申请授权会话（`state` 一次性，用完就换新的）。
-- 3 轮都没成：推一条失败通知，退出码 `2`，本次跳过签到。
+- 该账号 2 轮都没成：继续下一个账号；全部跑完后汇总，有失败/跳过就是退出码 `2`。
+- 整批预算用完时，剩下的账号**不会**被尝试授权（日志里写「跳过（未尝试授权）」），
+  留给下一次 cron 再处理。
 
 时间参数（配置文件，也可命令行覆盖）：
 
 | 键 | 默认 | 命令行 | 说明 |
 |---|---|---|---|
 | `auth_wait_seconds` | `180` | `--wait` | 每轮等多久 |
-| `auth_attempts` | `3` | `--attempts` | 最多几轮 |
+| `auth_attempts` | `3` | `--attempts` | 最多几轮（多账号默认每账号封顶 2 轮） |
 | `auth_backoff_seconds` | `60` | `--backoff` | 退避基数，按 1x/2x 增长 |
+| `auth_total_budget_seconds` | `900` | — | 整批自动授权的总预算；用完剩余账号本次跳过 |
 | `auth_qr` | `true` | `--no-qr` | 是否用二维码授权（关掉只会推授权页链接，仅排障） |
 
 ---
@@ -184,7 +195,7 @@ env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin \
 | `python3 wb_server.pyz` | 日常：该授权就授权，然后签到 |
 | `--check` | 体检配置与授权状态（不联网、不签到） |
 | `--init-config [PATH]` | 生成配置模板（`--force` 才覆盖） |
-| `--auth-only` | 只授权，不签到（首次部署时先跑这个） |
+| `--auth-only` | 只授权，不签到（逐个补齐缺授权的账号，首次部署时先跑这个） |
 | `--checkin-only` | 只签到，不检查授权 |
 | `--channel wecom` | 强制只用一个渠道 |
 | `--no-qr` | 不生成二维码，只推授权页链接（仅排障） |
@@ -206,8 +217,8 @@ env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin \
 
 ## 5. 安全性
 
-- `auth_oauth.json` 是**明文令牌**，等同于登录状态：权限收紧（脚本会尝试
-  `chmod 600`），不要进 git、不要打进镜像层。
+- 令牌文件（`auth_oauth.json` / `auth_<uid>.json`）是**明文令牌**，等同于登录状态：
+  权限收紧（脚本会尝试 `chmod 600`），不要进 git、不要打进镜像层。
 - `config.json` 里有机器人 key：同样不要提交。本仓库的 `.gitignore` 已经
   挡住 `config.json`、`auth_oauth.json`、`*.log`。
 - 授权二维码等于一次登录机会，约 5 分钟内有效；不要把控制台输出整段贴到群里。
@@ -225,7 +236,8 @@ env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin \
 | `二维码授权：不可用` | 没装 playwright 或没装浏览器。`pip install playwright && python -m playwright install --with-deps chromium`（或 `WB_BROWSER_PATH=/usr/bin/chromium`）。**这时脚本会直接退出（退出码 2），不会等待** |
 | `✗ 取二维码失败 —— 起不了浏览器` | 会在下面列出 4 种来源各自的原因、浏览器目录、当前用户和修复命令。照第 1 条装 chromium 即可；`cron 起不来、手工正常` 见上面 root/用户那段 |
 | 二维码链接点开是空白 | 过期了（约 5 分钟）。重跑脚本会重新申请 |
-| 3 轮都超时 | 人没在 3 分钟内扫码。加大 `--wait 300`，或先 `--auth-only` 单独授权 |
+| 某个账号扫码超时 | 每账号最多 2 轮、每轮 `auth_wait_seconds`。加大 `--wait 300`，或先 `--auth-only` 单独授权 |
+| `跳过（未尝试授权）` | 整批预算 `auth_total_budget_seconds` 用完。调大预算，或分几次 `--auth-only` 处理 |
 | `12153 Offline user session not found` | 令牌被别处刷新过（两台机器都在跑）。只留一处 |
 | `OAUTH_NETWORK` | 服务器出不了网 / 被墙。检查代理与出站白名单 |
 | cron 里不跑，手工跑正常 | cron 环境变量少、没 `cd`、python 路径不同。用上面的 `env -i` 验证 |

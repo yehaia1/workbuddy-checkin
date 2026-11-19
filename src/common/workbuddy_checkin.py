@@ -38,6 +38,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import wb_accounts
 import wb_config
 import wb_notify
 import wb_oauth
@@ -71,8 +72,17 @@ def load_config(path: Optional[str] = None) -> Dict[str, Any]:
     return wb_config.load(path)
 
 
-def oauth_token_path(cfg: Optional[Dict[str, Any]] = None) -> str:
-    return wb_oauth.token_path(cfg or {}, base_dir=str(wb_config.data_dir()))
+def oauth_token_path(cfg: Optional[Dict[str, Any]] = None,
+                     account: str = "") -> str:
+    """当前要用的令牌文件：指定账号用它，否则用列表里的第一个。
+
+    多账号下“第一个”只是给还没改造的调用方（签到 / 体检 / 推送文案）
+    留的默认值；遍历全部账号是下一步。
+    """
+    cfg = cfg if cfg is not None else load_config()
+    acct = (wb_accounts.resolve(account, cfg) if str(account or "").strip()
+            else (wb_accounts.list_accounts(cfg) or [None])[0])
+    return wb_accounts.token_file_of(acct)
 
 
 # ---------------- 进度与日志 ----------------
@@ -248,16 +258,31 @@ def build_expiry_message(days: int, expires_text: str = "",
                         expires_text or "未知", action))
 
 
+def account_name(acct: Optional[Dict[str, Any]]) -> str:
+    """账号在日志 / 推送里的显示名：「昵称（uid 1234abcd…）」。
+
+    昵称取自授权时记在 accounts 里的快照，令牌损坏时也能认出是谁。
+    """
+    acct = acct or {}
+    nick = str(acct.get("nickname") or "").strip()
+    uid = str(acct.get("uid") or "").strip()
+    short = uid[:8] + ("…" if len(uid) > 8 else "") if uid else ""
+    if nick and short:
+        return "{}（uid {}）".format(nick, short)
+    return nick or ("uid " + short if short else "")
+
+
 def check_expiry_notice(cfg: Optional[Dict[str, Any]] = None,
                         progress: Optional[Any] = None,
-                        notify: bool = True) -> Optional[Dict[str, Any]]:
+                        notify: bool = True,
+                        token_file: str = "") -> Optional[Dict[str, Any]]:
     """令牌快到期就推一条提醒；不需要提醒时返回 None。
 
     挂在**每次签到之后**：签到每天本来就会跑一次，顺手看一眼不增加任何调度；
     而且令牌真挂了下次签到就会失败，这条提醒只是提前一步。
 
     只认「有令牌但不健康」这一种情况——没令牌属于未授权，由界面横幅报，
-    不必再往群里推一条。
+    不必再往群里推一条。token_file 留空时看列表里的第一个账号。
     """
     cfg = cfg or load_config()
     emit = progress or _progress
@@ -267,7 +292,7 @@ def check_expiry_notice(cfg: Optional[Dict[str, Any]] = None,
         days_warn = EXPIRY_WARN_DAYS
     if days_warn <= 0:
         return None
-    info = wb_oauth.summary(oauth_token_path(cfg))
+    info = wb_oauth.summary(token_file or oauth_token_path(cfg))
     if not info.get("present") or info.get("error") or info.get("disabled"):
         return None
     days = info.get("days_left")
@@ -288,13 +313,14 @@ def check_expiry_notice(cfg: Optional[Dict[str, Any]] = None,
 
 
 def notify_result(cfg: Dict[str, Any], result: Dict[str, Any],
-                  emit: Callable[[str], None]) -> List[Tuple[str, bool, str]]:
+                  emit: Callable[[str], None],
+                  account: str = "") -> List[Tuple[str, bool, str]]:
     """把结果推到所有已选渠道，并把每个渠道的成败写进日志。
 
-    文案里的账号从**本机/本服务端那份令牌**里读（`account_label`），
-    桌面版和服务端版因此显示同一行「账号：…」，不用各自维护。
+    文案里的账号优先用调用方传进来的（多账号时就是当前这个账号），
+    留空才回退去读列表里第一个账号的令牌——桌面版和服务端版共用这套逻辑。
     """
-    text = build_message(result, account_label(cfg))
+    text = build_message(result, account or account_label(cfg))
     pushed = wb_notify.push(cfg, text)
     for name, ok, detail in pushed:
         emit("{}：{}".format(name, detail))
@@ -306,54 +332,147 @@ def notify_result(cfg: Dict[str, Any], result: Dict[str, Any],
 
 # ---------------- 统一执行入口（GUI / 命令行共用） ----------------
 
+# 汇总退出码的优先级：2（未授权/配置）> 3（网络）> 4（接口异常）> 1（推送）。
+# cron 只看退出码，所以“需要人工处理”的必须先被看到。
+EXIT_PRIORITY = (2, 3, 4, 1)
+
+
+def _worst_exit_code(codes: List[int]) -> int:
+    """多账号：取最严重的那个非 0 退出码（全成功返回 0）。"""
+    present = {int(c or 0) for c in codes}
+    for code in EXIT_PRIORITY:
+        if code in present:
+            return code
+    rest = sorted(c for c in present if c)
+    return rest[0] if rest else 0
+
+
+def _run_one_account(cfg: Dict[str, Any], acct: Dict[str, Any],
+                     check_only: bool, emit: Callable[[str], None],
+                     notify: bool) -> Dict[str, Any]:
+    """对**一个**账号完整跑一次：连 → 查 → 领 → 复核 → 推送 → 到期检查。
+
+    结果里额外带 uid / account 两个字段：日志、推送、界面都靠它们区分账号，
+    不用再从某一份令牌里反查“刚才跑的是谁”。
+    """
+    path = wb_accounts.token_file_of(acct)
+    who = account_name(acct)
+    emit("—— 账号：{} ——".format(who or "?"))
+    try:
+        sess = wb_oauth.OAuthSession(path, emit=emit)
+    except SESSION_ERRORS as e:
+        res: Dict[str, Any] = {"result": e.result, "message": str(e),
+                               "exit_code": e.exit_code}
+    else:
+        try:
+            with sess:
+                res = run(sess, check_only=check_only)
+        except SESSION_ERRORS as e:
+            res = {"result": e.result, "message": str(e),
+                   "exit_code": e.exit_code}
+
+    res["uid"] = acct.get("uid") or ""
+    res["account"] = who
+    append_log(res)
+    if notify:
+        notify_result(cfg, res, emit, account=who)
+        notice = check_expiry_notice(cfg, emit, notify=True, token_file=path)
+        if notice:
+            res["expiry_notice"] = notice
+    return res
+
+
+def run_accounts(cfg: Optional[Dict[str, Any]] = None,
+                 check_only: bool = False,
+                 progress: Optional[Any] = None,
+                 notify: bool = True,
+                 account: str = "") -> Dict[str, Any]:
+    """对账号列表逐个执行（串行），返回汇总结果。
+
+    account 非空时只跑那一个账号（`--account`）。
+    汇总结构：{"result": "SUMMARY", "items": [...], "total", "ok",
+              "failed", "exit_code"}
+    """
+    cfg = cfg if cfg is not None else load_config()
+    emit = progress or _progress
+    if str(account or "").strip():
+        acct = wb_accounts.resolve(account, cfg)
+        if acct is None:
+            res = {"result": "OAUTH_ACCOUNT_NOT_FOUND",
+                   "message": "找不到账号：{}".format(account),
+                   "exit_code": 2}
+            append_log(res)
+            return {"result": "SUMMARY", "items": [res], "total": 1,
+                    "ok": 0, "failed": 1, "exit_code": 2}
+        accounts = [acct]
+    else:
+        accounts = wb_accounts.list_accounts(cfg)
+
+    if not accounts:
+        # 没有任何账号：给出明确结论，别让计划任务"成功但不做事"
+        res = {"result": "OAUTH_NOT_LOGGED_IN",
+               "message": "尚未完成账号授权。请先点「立即授权」完成一次授权。",
+               "exit_code": 2}
+        append_log(res)
+        return {"result": "SUMMARY", "items": [res], "total": 0,
+                "ok": 0, "failed": 1, "exit_code": 2}
+
+    items = [_run_one_account(cfg, acct, check_only, emit, notify)
+             for acct in accounts]
+    failed = [i for i in items if int(i.get("exit_code") or 0)]
+    return {
+        "result": "SUMMARY",
+        "items": items,
+        "total": len(items),
+        "ok": len(items) - len(failed),
+        "failed": len(failed),
+        "exit_code": _worst_exit_code([i.get("exit_code") or 0 for i in items]),
+    }
+
+
 def run_once(cfg: Optional[Dict[str, Any]] = None,
              check_only: bool = False,
              progress: Optional[Any] = None,
-             notify: bool = True) -> Dict[str, Any]:
-    """完整跑一次：连 → 查 → 领 → 复核 → 推送 → 到期检查。
+             notify: bool = True,
+             account: str = "") -> Dict[str, Any]:
+    """完整跑一次（多账号时逐个跑）。
 
-    GUI 和命令行走同一条路径，避免两套实现慢慢走偏。
+    只有一个账号时返回**单条结果**（保持脚本解析 / 老调用方的结构不变），
+    有多个账号时才返回 SUMMARY 汇总。
     """
-    cfg = cfg or load_config()
-    emit = progress or _progress
-
-    def finish(res: Dict[str, Any]) -> Dict[str, Any]:
-        append_log(res)
-        if notify:
-            notify_result(cfg, res, emit)
-            notice = check_expiry_notice(cfg, emit, notify=True)
-            if notice:
-                res["expiry_notice"] = notice
-        return res
-
-    try:
-        sess = open_session(cfg, progress=emit)
-    except SESSION_ERRORS as e:
-        return finish({"result": e.result, "message": str(e),
-                       "exit_code": e.exit_code})
-
-    try:
-        with sess:
-            result = run(sess, check_only=check_only)
-    except SESSION_ERRORS as e:
-        result = {"result": e.result, "message": str(e),
-                  "exit_code": e.exit_code}
-    return finish(result)
+    summary = run_accounts(cfg, check_only=check_only, progress=progress,
+                           notify=notify, account=account)
+    items = summary.get("items") or []
+    return items[0] if len(items) == 1 else summary
 
 
 # ---------------- 授权 ----------------
+
+def _discard(path: str) -> None:
+    """删掉授权用的临时令牌文件（不存在 / 删不掉都不影响主流程）。"""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
 
 def login_oauth(cfg: Optional[Dict[str, Any]] = None,
                 progress: Optional[Any] = None,
                 timeout: Optional[int] = None,
                 on_url: Optional[Callable[[str], None]] = None,
                 should_stop: Optional[Callable[[], bool]] = None,
-                open_browser: bool = True
+                open_browser: bool = True,
+                account: str = ""
                 ) -> Dict[str, Any]:
-    """走一遍设备授权，把令牌落到本机。
+    """走一遍设备授权，把令牌并入账号列表。
 
     链接给谁打开都行：本机浏览器、手机、另一台电脑。令牌始终由**发起方自己**
     用 `state` 轮询回来（见 wb_oauth.poll_token），不需要对方回传。
+
+    account 是 `--account` 的目标（uid 或序号）：只做“扫错号”的校验，
+    归属仍由授权结果里的 uid 决定（详见 wb_accounts.merge_authorized）。
+    授权结果先落**临时文件**再合并——直接写目标文件会在扫错号时
+    先把原令牌覆盖掉，等于把用户踢下线。
 
     open_browser=False 时不在本机弹浏览器，只把链接交给 on_url / 日志，
     适合"复制到手机授权"（界面默认）或无图形环境（`--auth --no-browser`）。
@@ -361,40 +480,51 @@ def login_oauth(cfg: Optional[Dict[str, Any]] = None,
     on_url(url)   拿到链接的瞬间回调（界面靠它立刻把链接显示出来）
     should_stop() 返回 True 时中断等待（用户点了取消）
     """
-    cfg = cfg or load_config()
+    cfg = cfg if cfg is not None else load_config()
     emit = progress or _progress
-    path = oauth_token_path(cfg)
     timeout = int(timeout or cfg.get("oauth_auth_timeout", 300) or 300)
+    pending = os.path.join(str(wb_config.data_dir()),
+                           "auth_pending_{}.json".format(os.getpid()))
 
     try:
-        rec = wb_oauth.login(path, emit=emit, open_browser=bool(open_browser),
+        rec = wb_oauth.login(pending, emit=emit,
+                             open_browser=bool(open_browser),
                              timeout=timeout, on_url=on_url,
                              should_stop=should_stop)
+        info = wb_accounts.merge_authorized(rec, target=account, cfg=cfg)
     except wb_oauth.OAuthError as e:
         result = {"result": e.result, "message": str(e),
                   "exit_code": e.exit_code}
         append_log(result)
         return result
+    finally:
+        _discard(pending)
 
     acct = rec.get("account") or {}
     auth = rec.get("auth") or {}
     result = {
         "result": "AUTHORIZED",
-        "uid": acct.get("uid") or "",
-        "nickname": acct.get("nickname") or "",
+        "uid": info["uid"],
+        "nickname": info["nickname"] or acct.get("nickname") or "",
         "domain": auth.get("domain") or "",
         "expires_at": auth.get("expiresAt") or 0,
-        "token_file": path,
+        "token_file": info["token_file"],
+        "action": info["action"],
     }
     append_log({"result": "AUTHORIZED",
-                "note": "uid={} domain={}".format(result["uid"],
-                                                  result["domain"])})
+                "note": "{} uid={} domain={}".format(
+                    result["action"], result["uid"], result["domain"])})
     return result
 
 
 def import_token(code_or_file: str,
-                 cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """导入一份已有令牌（导入码或令牌文件路径）。"""
+                 cfg: Optional[Dict[str, Any]] = None,
+                 account: str = "") -> Dict[str, Any]:
+    """导入一份已有令牌（导入码或令牌文件路径）。
+
+    归属与 --auth 一致：令牌里的 uid 决定新增还是覆盖，
+    account 只用于校验“导入的是不是想更新的那个号”。
+    """
     cfg = cfg or load_config()
     raw = str(code_or_file or "").strip()
     if os.path.isfile(raw):
@@ -418,24 +548,28 @@ def import_token(code_or_file: str,
             record = wb_oauth.decode_code(text)
     else:
         record = wb_oauth.decode_code(raw)
-    path = oauth_token_path(cfg)
-    wb_oauth.save(record, path)
-    acct = record.get("account") or {}
+    info = wb_accounts.merge_authorized(record, target=account, cfg=cfg)
     result = {
         "result": "IMPORTED",
-        "uid": acct.get("uid") or "",
-        "nickname": acct.get("nickname") or "",
-        "token_file": path,
+        "uid": info["uid"],
+        "nickname": info["nickname"],
+        "token_file": info["token_file"],
+        "action": info["action"],
     }
-    append_log({"result": "IMPORTED", "note": "uid={}".format(result["uid"])})
+    append_log({"result": "IMPORTED",
+                "note": "{} uid={}".format(result["action"], result["uid"])})
     return result
 
 
 # ---------------- 环境自检 ----------------
 
 def detect_env(deep: bool = True,
-               cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+               cfg: Optional[Dict[str, Any]] = None,
+               token_file: str = "") -> Dict[str, Any]:
     """检查授权状态；deep=True 会真调一次状态接口。
+
+    token_file 指定要检查哪份令牌（服务端逐账号检查时用）；
+    留空则沿用旧行为——看账号列表里的第一个。
 
     返回的 code：
       OK                  授权有效、接口可用
@@ -447,7 +581,7 @@ def detect_env(deep: bool = True,
     """
     cfg = cfg or load_config()
     out: Dict[str, Any] = {"code": "OK", "message": "", "steps": []}
-    path = oauth_token_path(cfg)
+    path = token_file or oauth_token_path(cfg)
     info = wb_oauth.summary(path)
     out["oauth_token"] = info
     out["token_file"] = path
@@ -550,6 +684,15 @@ def render(result: Dict[str, Any], as_json: bool) -> None:
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         return
     code = result.get("result")
+    if code == "SUMMARY":
+        # 多账号：每个账号一段，最后一行汇总；单账号不会走到这里
+        for item in result.get("items") or []:
+            print("【{}】".format(item.get("account") or "账号"))
+            render(item, False)
+        print("—— 共 {} 个账号：成功 {}，失败 {} ——".format(
+            result.get("total", 0), result.get("ok", 0),
+            result.get("failed", 0)))
+        return
     if code == "CLAIMED":
         amount = result.get("credit", result.get("credits",
                        result.get("today_credit", "?")))
@@ -570,11 +713,15 @@ def render(result: Dict[str, Any], as_json: bool) -> None:
         if result.get("expires_at"):
             stamp = time.strftime("%Y-%m-%d %H:%M",
                                   time.localtime(int(result["expires_at"])))
-        print("✅ {}：{}（uid {}）{}".format(
+        # 多账号下必须能看出这次是新增了一条，还是更新了已有那条
+        action = {"created": "，新增账号",
+                  "updated": "，更新已有账号"}.get(result.get("action"), "")
+        print("✅ {}：{}（uid {}）{}{}".format(
             "授权成功" if code == "AUTHORIZED" else "授权已导入",
             result.get("nickname") or "已登录账号",
             result.get("uid") or "?",
-            "，令牌有效期至 " + stamp if stamp else ""))
+            "，令牌有效期至 " + stamp if stamp else "",
+            action))
     else:
         print(json.dumps(result, ensure_ascii=False))
 
@@ -588,6 +735,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="发送测试消息到已选推送渠道")
     parser.add_argument("--auth", action="store_true",
                         help="发起设备授权：打印授权链接并等待完成")
+    parser.add_argument("--account", metavar="UID_OR_INDEX", default="",
+                        help="配合 --auth / --import-token：指定要更新的已有账号"
+                             "（完整 uid 或列表序号）；不填则按授权结果的 uid "
+                             "自动新增或覆盖")
     parser.add_argument("--no-browser", action="store_true",
                         help="配合 --auth：不自动打开本机浏览器，只打印链接")
     parser.add_argument("--import-token", metavar="CODE_OR_FILE",
@@ -613,6 +764,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     cfg = load_config()
+    # 旧版单账号数据在这里落成 accounts[0]（只做一次；已有 accounts 直接返回）
+    wb_accounts.ensure(cfg)
 
     if args.test_notify:
         pushed = wb_notify.push(
@@ -638,13 +791,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.auth:
         result = login_oauth(cfg, progress=_progress,
-                             open_browser=not args.no_browser)
+                             open_browser=not args.no_browser,
+                             account=args.account)
         render(result, args.json)
         return int(result.get("exit_code", 0))
 
     if args.import_token:
         try:
-            result = import_token(args.import_token, cfg)
+            result = import_token(args.import_token, cfg, account=args.account)
         except SESSION_ERRORS as e:
             result = {"result": e.result, "message": str(e),
                       "exit_code": e.exit_code}
@@ -654,7 +808,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 走统一入口，和 GUI 完全同一条路径；只查状态时不推送，避免打扰
     result = run_once(cfg, check_only=args.check_only, progress=_progress,
-                      notify=not args.check_only)
+                      notify=not args.check_only, account=args.account)
     render(result, args.json)
     return int(result.get("exit_code", 0))
 

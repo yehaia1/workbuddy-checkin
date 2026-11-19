@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import contextlib
+import base64
 import inspect
 import io
 import json
@@ -45,6 +46,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _sub in ("common", "server", "desktop"):
     sys.path.insert(0, os.path.join(ROOT, "src", _sub))
 
+import wb_accounts                                               # noqa: E402
 import wb_config                                                  # noqa: E402
 import wb_notify                                                  # noqa: E402
 import wb_oauth                                                   # noqa: E402
@@ -52,6 +54,19 @@ import wb_qrlogin                                                 # noqa: E402
 import workbuddy_checkin as core                                  # noqa: E402
 
 RESULTS = []
+
+
+def fake_jwt(payload):
+    """造一个只有载荷有意义的 JWT：签名不校验，只用来取 uid / 昵称。"""
+    body = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return "eyJhbGciOiJub25lIn0." + body + ".sig"
+
+
+# 授权接口返回的 accessToken 必须是带 uid 的 JWT，否则无法确定账号归属
+STUB_ACCESS = fake_jwt({"uid": "stub-uid-0001", "nickname": "测试账号",
+                        "enterpriseId": "ent-1"})
 
 
 def check(name, cond, detail=""):
@@ -91,7 +106,7 @@ class Stub:
             if self.state_polls < 2:
                 return 200, {"code": 11217, "msg": "pending"}
             return 200, {"code": 0, "data": {
-                "access_token": "AAA.BBB.CCC",
+                "access_token": STUB_ACCESS,
                 "refresh_token": "REFRESH-1",
                 "expires_in": 28 * 24 * 3600,
                 "domain": self.domain}}
@@ -176,6 +191,9 @@ def main():
     srv, port = serve(stub)
     host = point_at(stub, port)
     tmpdir = tempfile.mkdtemp(prefix="wb_oauth_check_")
+    # 多账号改造后授权会写 config.json 的 accounts：数据目录必须隔离到临时目录，
+    # 否则回归检查会把账号写进仓库根的配置里。
+    wb_config.set_data_dir(Path(tmpdir))
     token_file = os.path.join(tmpdir, "auth_oauth.json")
     cfg = dict(core.DEFAULT_CONFIG)
     cfg["oauth_token_file"] = token_file
@@ -317,6 +335,57 @@ def main():
         check("文件导入后令牌可读",
               wb_oauth.load(token_file)["auth"]["accessToken"]
               == fresh["auth"]["accessToken"])
+
+        # 7c) 多账号归属：uid 决定新增/更新，--account 只做“扫错号”校验
+        store = wb_config.load()
+        check("导入后写入了 accounts",
+              [a.get("uid") for a in store.get("accounts") or []]
+              == ["stub-uid-0001"], store.get("accounts"))
+        before_txt = Path(token_file).read_text(encoding="utf-8")
+        wrong = json.loads(json.dumps(fresh))
+        wrong["account"] = {"uid": "another-uid", "nickname": "另一个号"}
+        try:
+            wb_accounts.merge_authorized(wrong, target="1", cfg=store)
+            check("扫错号被拒绝", False, "没有抛异常")
+        except wb_oauth.OAuthError as e:
+            check("扫错号被拒绝", e.result == "OAUTH_WRONG_ACCOUNT", e.result)
+        check("扫错号不动原令牌",
+              Path(token_file).read_text(encoding="utf-8") == before_txt)
+        second = json.loads(json.dumps(fresh))
+        second["account"] = {"uid": "stub-uid-0002", "nickname": "二号"}
+        added = wb_accounts.merge_authorized(second, cfg=store)
+        check("新 uid 走新增", added.get("action") == "created", added)
+        check("新账号令牌按 uid 命名",
+              Path(added["token_file"]).name == "auth_stub-uid-0002.json",
+              added["token_file"])
+        again = wb_accounts.merge_authorized(second, cfg=store)
+        check("同 uid 再授权走覆盖", again.get("action") == "updated", again)
+        check("账号列表按授权顺序排列",
+              [a.get("uid") for a in wb_accounts.list_accounts(store)]
+              == ["stub-uid-0001", "stub-uid-0002"],
+              wb_accounts.list_accounts(store))
+        check("按序号能定位账号",
+              (wb_accounts.resolve("2", store) or {}).get("uid")
+              == "stub-uid-0002")
+        no_uid = json.loads(json.dumps(fresh))
+        no_uid["account"] = {}
+        try:
+            wb_accounts.merge_authorized(no_uid, cfg=store)
+            check("已有账号时拒绝无 uid 授权", False, "没有抛异常")
+        except wb_oauth.OAuthError as e:
+            check("已有账号时拒绝无 uid 授权", e.result == "OAUTH_NO_UID", e.result)
+
+        # 7d) 多账号执行：退出码取最严重的那个；没有账号时不能“成功但不做事”
+        check("退出码取最严重", core._worst_exit_code([4, 0, 3]) == 3,
+              core._worst_exit_code([4, 0, 3]))
+        check("未授权优先于网络错误", core._worst_exit_code([3, 2]) == 2,
+              core._worst_exit_code([3, 2]))
+        check("全成功退出码为 0", core._worst_exit_code([0, 0]) == 0)
+        empty = core.run_accounts({"accounts": []}, notify=False,
+                                  progress=lambda _m: None)
+        check("没有账号时退出码为 2",
+              empty.get("exit_code") == 2
+              and empty["items"][0]["result"] == "OAUTH_NOT_LOGGED_IN", empty)
 
         # 8) 到期提醒：只在剩余天数 <= expiry_warn_days 时触发，且不碰真实渠道
         quiet = dict(cfg, push_channels=[])          # 没有渠道 = 不真发
@@ -466,11 +535,12 @@ def main():
         try:
             import make_server as pkgtool
             mods = pkgtool.collect()
-            check("服务端闭包是 6 个模块", len(mods) == 6, mods)
+            check("服务端闭包是 7 个模块", len(mods) == 7, mods)
             check("闭包不含 GUI / Windows 模块",
                   not (set(mods) & set(pkgtool.FORBIDDEN)), mods)
             check("闭包含入口与签到核心",
                   {"wb_server", "workbuddy_checkin"} <= set(mods), mods)
+            check("闭包含账号模块", "wb_accounts" in mods, mods)
             check("闭包含二维码模块", "wb_qrlogin" in mods, mods)
             check("闭包不含 win_quiet（tk/计划任务专用）",
                   "win_quiet" not in mods, mods)

@@ -32,6 +32,7 @@ for _p in (str(_HERE), str(_HERE.parent / "common")):
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 
+import wb_accounts
 import wb_config
 import wb_notify
 import wb_oauth
@@ -256,10 +257,11 @@ class AuthDialog:
     线程模型：网络轮询在后台线程，结果通过队列回主线程刷控件。
     """
 
-    def __init__(self, app: "App", on_done=None):
+    def __init__(self, app: "App", on_done=None, account: str = ""):
         self.app = app
         self.cfg = dict(app.cfg)
         self.on_done = on_done
+        self.account = account      # 空 = 添加账号；非空 = 重新授权指定账号
         self.stop = False
         self.q: "queue.Queue[tuple]" = queue.Queue()
         self.url = ""
@@ -268,7 +270,7 @@ class AuthDialog:
         self.timeout = int(self.cfg.get("oauth_auth_timeout", 300) or 300)
 
         top = self.top = tk.Toplevel(app.root)
-        top.title("账号授权")
+        top.title("重新授权" if account else "添加账号")
         top.configure(bg=C_BG)
         top.resizable(False, False)
         top.transient(app.root)
@@ -340,7 +342,8 @@ class AuthDialog:
                 timeout=self.timeout,
                 on_url=lambda u: self.q.put(("url", u)),
                 should_stop=lambda: self.stop,
-                open_browser=False)     # 默认不弹本机浏览器，链接拿去手机用
+                open_browser=False,      # 默认不弹本机浏览器，链接拿去手机用
+                account=self.account)    # 重授权时校验扫的是不是同一个号
             if rec.get("result") == "AUTHORIZED":
                 self.q.put(("done", rec))
             else:
@@ -375,8 +378,17 @@ class AuthDialog:
     def _finish(self, ok, payload):
         self.done = True
         if ok:
+            # 授权结果已经并入 config.json 的 accounts：重新读一遍，
+            # 否则界面还拿着进入授权窗口前的旧列表（首次授权会一直显示“未授权”）。
+            try:
+                self.app.cfg = core.load_config()
+            except Exception:
+                pass
             who = (payload or {}).get("nickname") or "账号"
-            self._status("✅ 授权成功：{}。可以关闭本窗口了。".format(who), "ok")
+            action = {"created": "已添加", "updated": "已更新"}.get(
+                (payload or {}).get("action"), "已保存")
+            self._status("✅ 授权成功：{}（{}）。可以关闭本窗口了。".format(
+                who, action), "ok")
             self.btn_close.configure(text="完成")
             try:
                 self.top.after(1500, self._close)
@@ -868,8 +880,9 @@ class Section:
 
     def __init__(self, app: "App", parent, index: int, title: str):
         self.app = app
-        wrap = tk.Frame(parent, bg=C_CARD, highlightbackground=C_BORDER,
-                        highlightthickness=1)
+        wrap = self.wrap = tk.Frame(parent, bg=C_CARD,
+                                    highlightbackground=C_BORDER,
+                                    highlightthickness=1)
         wrap.pack(fill="x", padx=P(14), pady=(P(10), 0))
         head = tk.Frame(wrap, bg=C_CARD)
         head.pack(fill="x", padx=P(14), pady=(P(10), 0))
@@ -893,6 +906,12 @@ class Section:
         self.buttons.append(b)
         return b
 
+    def add_area(self):
+        """在状态行和按钮行之间插一块自定义区域（账号列表用）。"""
+        area = tk.Frame(self.wrap, bg=C_CARD)
+        area.pack(fill="x", padx=P(14), pady=(P(6), 0), before=self.btn_row)
+        return area
+
     def set_enabled(self, enabled: bool) -> None:
         """整块按钮可用性（未授权时除了授权那一块，其余全都要灰掉）。"""
         self.enabled = bool(enabled)
@@ -910,9 +929,13 @@ class App:
         self.q: "queue.Queue[tuple]" = queue.Queue()
         self.busy = False
         self.cfg = core.load_config()
+        # 旧版单账号数据落成 accounts[0]（只做一次）；授权窗口也按账号归属落盘
+        wb_accounts.ensure(self.cfg)
         self.sched_state = None
-        self.auth_info = {}
-        self.authorized = False       # 授权门禁：未授权时除「立即授权」全灰
+        self.authorized = False       # 至少有一个账号可用，其它按钮才可点
+        self.account_infos = []       # [(账号条目, 令牌概况), ...]
+        self.selected_uid = ""        # 卡片跟随的账号
+        self.cards_by_uid = {}        # uid -> 最近一次查询/签到结果
         self._fit_size = None
 
         root.title(APP_TITLE)
@@ -1029,9 +1052,10 @@ class App:
         holder.pack(fill="x")
 
         self.sec_auth = Section(self, holder, 1, "账号授权")
-        # 授权入口永远可用：未授权时其它按钮全灰，只剩它能点，
-        # 否则就成了"要授权才能授权"的死锁。
-        self.sec_auth.add("立即授权", self.open_auth, primary=True)
+        # 账号列表插在状态与按钮之间；「添加账号」永远可用，
+        # 否则未授权时就成了"要授权才能授权"的死锁。
+        self.acct_rows = self.sec_auth.add_area()
+        self.sec_auth.add("添加账号", self.open_auth, primary=True)
 
         self.sec_sched = Section(self, holder, 2, "每日定时")
         self.sec_sched.add("设置定时", self.open_schedule, primary=True)
@@ -1066,49 +1090,138 @@ class App:
         self.refresh_schedule_state()
 
     def refresh_auth(self) -> None:
-        """刷新授权区块，并据此开关其余按钮。
+        """刷新账号列表，并据此开关其余按钮。
 
-        **未授权 = 什么都做不了**：签到、定时、推送的按钮全部灰掉，
-        只留「立即授权」。这样用户不会看到一堆点了就报错的按钮，
-        也不会误以为"已经配好了"。
+        每个账号独立判断状态：只要还有**一个**可用，签到/定时/推送就可用；
+        失效的账号在列表里单独标红，不会因为一个坏号把整个界面锁死。
         """
-        info = wb_oauth.summary(core.oauth_token_path(self.cfg))
-        self.auth_info = info
-        self.authorized = bool(
-            info.get("present") and not info.get("error")
-            and not info.get("disabled") and not info.get("expired"))
+        accounts = wb_accounts.list_accounts(self.cfg)
+        self.account_infos = [
+            (acct, wb_oauth.summary(wb_accounts.token_file_of(acct)))
+            for acct in accounts
+        ]
+        self.authorized = any(self._acct_ok(info)
+                              for _acct, info in self.account_infos)
 
-        if not info.get("present"):
+        uids = [acct.get("uid") for acct, _info in self.account_infos]
+        if self.selected_uid not in uids:
+            self.selected_uid = uids[0] if uids else ""
+        self._render_account_rows()
+
+        if not accounts:
             self.sec_auth.set("● 未授权",
-                              "还没有登录过。点「立即授权」拿到链接，用手机完成授权；"
+                              "还没有账号。点「添加账号」拿到链接，用手机完成授权；"
                               "授权前其它操作都不可用。", C_BAD)
-        elif info.get("error"):
-            self.sec_auth.set("● 令牌异常",
-                              "{}　重新授权一次即可。".format(info["error"]),
-                              C_BAD)
-        elif info.get("disabled") or info.get("expired"):
-            self.sec_auth.set("● 已失效", "登录会话过期了，重新授权一次即可。",
-                              C_BAD)
         else:
-            who = info.get("nickname") or "已授权账号"
-            uid = str(info.get("uid") or "")
-            days = info.get("days_left")
-            expire = info.get("expires_text") or ""
-            detail = "{}{}".format(
-                who, "（uid {}…）".format(uid[:8]) if uid else "")
-            if expire:
-                detail += "　令牌有效期至 {}（剩 {} 天，到期前自动续期）".format(
-                    expire, days if days is not None else "?")
-            warn_days = self._expiry_warn_days()
-            near = (days is not None and days <= warn_days)
-            if near:
-                # 状态列直接写"快到期"，别在详情里再挤一句长文案（会折行）
+            bad = sum(1 for _a, i in self.account_infos
+                      if not self._acct_ok(i))
+            if bad:
                 self.sec_auth.set(
-                    "● 快到期（剩 {} 天）".format(days),
-                    detail + "　自动续期没成功，建议现在重新授权一次。", C_WARN)
+                    "● {} 个账号，{} 个需要处理".format(len(accounts), bad),
+                    "逐个账号的状态见上方列表。失效的账号当天会漏签，"
+                    "点它右侧的「重新授权」即可恢复。", C_WARN)
             else:
-                self.sec_auth.set("● 已授权", detail, C_OK)
+                self.sec_auth.set(
+                    "● {} 个账号均可用".format(len(accounts)),
+                    "「立即签到」会按顺序把每个账号都跑一遍，结果分开发送。",
+                    C_OK)
         self._sync_controls()
+        self._show_cards_for(self.selected_uid)
+
+    @staticmethod
+    def _acct_ok(info: dict) -> bool:
+        """这个账号现在能直接签到吗（有令牌、没损坏、没失效、没过期）。"""
+        return bool(info.get("present") and not info.get("error")
+                    and not info.get("disabled") and not info.get("expired"))
+
+    def _render_account_rows(self) -> None:
+        """重建账号列表（账号数量少，整块重建比增量更新更不容易出错）。"""
+        for w in self.acct_rows.winfo_children():
+            w.destroy()
+        if not self.account_infos:
+            tk.Label(self.acct_rows, text="还没有添加账号", font=UI_FONT_SM,
+                     bg=C_CARD, fg=C_MUTED).pack(fill="x", pady=(0, P(2)))
+            return
+        for idx, (acct, info) in enumerate(self.account_infos, 1):
+            self._account_row(idx, acct, info)
+
+    def _account_row(self, idx: int, acct: dict, info: dict) -> None:
+        """一行一个账号：昵称 / uid / 状态 / 有效期 + 重新授权、删除。"""
+        uid = str(acct.get("uid") or "")
+        selected = uid and uid == self.selected_uid
+        bg = C_BG if selected else C_CARD      # 选中行用底色区分，不加边框
+        row = tk.Frame(self.acct_rows, bg=bg)
+        row.pack(fill="x", pady=(0, P(3)))
+
+        box = tk.Frame(row, bg=bg)
+        box.pack(side="left", fill="x", expand=True)
+
+        name = "{}{}. {}（uid {}）".format("▸" if selected else "　", idx,
+                                          acct.get("nickname") or "未命名账号",
+                                          (uid[:8] + "…") if len(uid) > 8 else uid)
+        lbl = tk.Label(box, text=name, font=UI_FONT_BOLD, bg=bg,
+                       fg=C_TEXT, anchor="w", cursor="hand2")
+        lbl.pack(fill="x")
+        lbl.bind("<Button-1>", lambda _e, u=uid: self._select_account(u))
+
+        state, color = self._acct_state(info)
+        expire = info.get("expires_text") or ""
+        detail = state + ("　有效期至 {}".format(expire) if expire else "")
+        sub = tk.Label(box, text=detail, font=UI_FONT_SM, bg=bg,
+                       fg=color, anchor="w")
+        sub.pack(fill="x")
+        sub.bind("<Button-1>", lambda _e, u=uid: self._select_account(u))
+
+        btn = tk.Frame(row, bg=bg)
+        btn.pack(side="right")
+        flat_button(btn, "重新授权",
+                    lambda u=uid: self.open_auth(u)).pack(side="left",
+                                                          padx=(0, P(4)))
+        flat_button(btn, "删除",
+                    lambda u=uid, n=name: self.remove_account(u, n)).pack(
+                        side="left")
+
+    def _acct_state(self, info: dict):
+        """账号状态的一行文案 + 颜色（列表与横幅共用同一套判断）。"""
+        if not info.get("present"):
+            return "未授权", C_BAD
+        if info.get("error"):
+            return "令牌异常，需重新授权", C_BAD
+        if info.get("disabled") or info.get("expired"):
+            return "登录会话已失效，需重新授权", C_BAD
+        days = info.get("days_left")
+        if days is not None and days <= self._expiry_warn_days():
+            return "快到期（剩 {} 天）".format(days), C_WARN
+        return "有效（剩 {} 天）".format(days if days is not None else "?"), C_OK
+
+    def _select_account(self, uid: str) -> None:
+        """点某一行：卡片切到那个账号（数据来自上一次查询的缓存）。"""
+        if not uid or uid == self.selected_uid:
+            return
+        self.selected_uid = uid
+        self._render_account_rows()
+        self._show_cards_for(uid)
+
+    def remove_account(self, uid: str, who: str = "") -> None:
+        """删掉一个账号（二次确认；令牌文件只在数据目录内才会被删）。"""
+        if self.busy:
+            self.log("任务进行中，稍后再删账号。")
+            return
+        if not messagebox.askyesno(
+                "删除账号",
+                "确定移除「{}」？\n"
+                "本机保存的令牌会被删除，之后需要重新授权才能签到。".format(
+                    who.strip("▸　 ") or uid)):
+            return
+        try:
+            gone = wb_accounts.remove(uid, cfg=self.cfg)
+        except Exception as e:
+            messagebox.showerror("删除失败", str(e))
+            return
+        self.cards_by_uid.pop(uid, None)
+        self.cfg = core.load_config()
+        self.log("已删除账号：{}".format(gone.get("nickname") or uid))
+        self.refresh_all()
 
     def _expiry_warn_days(self) -> int:
         try:
@@ -1237,7 +1350,9 @@ class App:
                 elif kind == "banner":
                     self.set_banner(*payload)
                 elif kind == "cards":
-                    self._apply_cards(payload)
+                    uid, card = (payload if isinstance(payload, tuple)
+                                 else ("", payload))
+                    self._apply_cards(card, uid)
                 elif kind == "refresh":
                     self.refresh_all()
                 elif kind == "busy":
@@ -1260,8 +1375,19 @@ class App:
         self.logbox.see("end")
         self.logbox.configure(state="disabled")
 
-    def _apply_cards(self, res: dict) -> None:
-        if not isinstance(res, dict):
+    def _apply_cards(self, res: dict, uid: str = "") -> None:
+        """把某个账号的结果写进缓存；只有它仍是选中账号时才刷卡片。
+
+        多账号串行跑完后每张卡片只展示**当前选中**账号的数据，
+        切换账号时直接用缓存重绘，不再发请求。
+        """
+        if uid and isinstance(res, dict) and res:
+            self.cards_by_uid[uid] = res
+        if uid and uid != self.selected_uid:
+            return
+        if not isinstance(res, dict) or not res:
+            for v in self.card_values.values():
+                v.configure(text="—", fg=C_MUTED)
             return
         code = res.get("result")
         if code == "INACTIVE":
@@ -1281,6 +1407,10 @@ class App:
                 text=self._fmt_end(str(res["end_time"])))
         self.header_right.configure(
             text="v{}　最后更新 {}".format(VERSION, time.strftime("%H:%M:%S")))
+
+    def _show_cards_for(self, uid: str) -> None:
+        """按选中账号重绘卡片（没有数据就显示 —）。"""
+        self._apply_cards(self.cards_by_uid.get(uid) or {}, "")
 
     @staticmethod
     def _fmt_end(raw: str) -> str:
@@ -1303,95 +1433,152 @@ class App:
         # tkinter 不允许跨线程碰控件，横幅必须挪回主线程刷
         self.post("call", lambda: self._apply_env(env))
         if env.get("status_data"):
-            self.post("cards", {"result": "STATUS", **env["status_data"]})
+            uid = (self.account_infos[0][0].get("uid")
+                   if self.account_infos else "")
+            self.post("cards", (uid, {"result": "STATUS", **env["status_data"]}))
         self.post("refresh")
 
     def _apply_env(self, env: dict) -> None:
+        """按账号列表给横幅结论（detect_env 只探了第一个账号的接口）。"""
         code = env.get("code")
-        tok = env.get("oauth_token") or {}
-        if code == "OK":
-            who = tok.get("nickname") or "已授权账号"
-            days = tok.get("days_left")
-            if days is not None and days <= self._expiry_warn_days():
-                self.set_banner(
-                    "warn", "账号 {}　⚠ 令牌只剩 {} 天　到期后签到会失败，"
-                            "现在重新授权一次最稳。".format(who, days),
-                    "  重新授权  ", self.open_auth)
-            else:
-                self.set_banner(
-                    "ok", "环境正常　账号 {}{}　可以直接签到。".format(
-                        who, "，令牌剩 {} 天".format(days)
-                        if days is not None else ""))
-        elif code == "OAUTH_NOT_AUTHORIZED":
+        if not self.account_infos:
             self.set_banner(
-                "error", "尚未授权　先点「立即授权」用手机完成授权，授权前其它操作都不可用。",
-                "  立即授权  ", self.open_auth)
-        elif code in ("OAUTH_SESSION_DEAD", "OAUTH_TOKEN_BAD"):
+                "error", "尚未授权　先点「添加账号」用手机完成授权，"
+                         "授权前其它操作都不可用。", "  添加账号  ", self.open_auth)
+            return
+
+        bad = [(a, i) for a, i in self.account_infos if not self._acct_ok(i)]
+        if bad:
+            names = "、".join((a.get("nickname") or a.get("uid") or "账号")
+                             for a, _i in bad)
             self.set_banner(
-                "error", "授权已失效　{}　重新授权一次即可恢复。".format(
-                    env.get("message", "")),
-                "  重新授权  ", self.open_auth)
-        elif code == "OAUTH_NETWORK":
+                "error", "{} 个账号需要重新授权：{}　失效的账号当天会漏签。"
+                .format(len(bad), names), "  重新授权  ", self.open_auth)
+            return
+        if code == "OAUTH_NETWORK":
             self.set_banner(
                 "warn", "网络不通　{}　检查代理或防火墙后重试。".format(
                     env.get("message", "")),
                 "  重新自检  ", lambda: self.start_task(self.task_env_check))
-        else:
+            return
+        if code not in ("OK", "OAUTH_NOT_AUTHORIZED"):
             self.set_banner(
                 "error", "检测异常：{}　{}".format(code, env.get("message", "")),
                 "  重新自检  ", lambda: self.start_task(self.task_env_check))
+            return
+
+        near = [(a, i) for a, i in self.account_infos
+                if i.get("days_left") is not None
+                and i["days_left"] <= self._expiry_warn_days()]
+        if near:
+            self.set_banner(
+                "warn", "{} 个账号的令牌快到期（最少剩 {} 天）　到期后签到会失败，"
+                        "建议现在重新授权一次。".format(
+                            len(near), min(i["days_left"] for _a, i in near)),
+                "  重新授权  ", self.open_auth)
+            return
+        self.set_banner(
+            "ok", "环境正常　{} 个账号可以直接签到。".format(
+                len(self.account_infos)), "", None)
+
+    @staticmethod
+    def _result_items(res: dict) -> list:
+        """把 run_once 的单条结果 / SUMMARY 汇总统一成账号列表。"""
+        if not isinstance(res, dict):
+            return []
+        if res.get("result") == "SUMMARY":
+            return list(res.get("items") or [])
+        return [res]
 
     def task_status(self) -> None:
         self.log("查询今日签到状态…")
-        res = core.run_once(self.cfg, check_only=True,
-                            progress=self.log, notify=False)
-        self.log("结果：{}".format(json.dumps(res, ensure_ascii=False)))
-        self.post("cards", res)
-        if res.get("result") in ("STATUS", "ALREADY_CLAIMED", "INACTIVE"):
+        res = core.run_once(self.cfg, check_only=True, progress=self.log,
+                            notify=False)
+        items = self._result_items(res)
+        for item in items:
+            self.log("{}：{}".format(item.get("account") or "账号",
+                                     json.dumps(item, ensure_ascii=False)))
+            self.post("cards", (item.get("uid") or "", item))
+        failed = [i for i in items if int(i.get("exit_code") or 0)]
+        if failed:
+            self._report_failure(res, failed)
+            return
+        first = items[0] if items else {}
+        if res.get("result") == "SUMMARY":
+            self.post("banner", ("ok", "状态查询完成　{} 个账号均可签到。".format(
+                res.get("total")), "", None))
+            return
+        if first.get("result") in ("STATUS", "ALREADY_CLAIMED", "INACTIVE"):
             self.post("banner", ("ok", "状态查询完成　连续 {} 天，本期累计 {} 积分。"
-                                 .format(res.get("streak_days", "?"),
-                                         res.get("total_credits", "?")), "", None))
+                                 .format(first.get("streak_days", "?"),
+                                         first.get("total_credits", "?")), "", None))
         else:
-            self._report_failure(res)
+            self._report_failure(res, items)
 
     def task_checkin(self) -> None:
         self.log("开始签到…")
         self.post("banner", ("checking", "正在签到…", "", None))
         res = core.run_once(self.cfg, check_only=False, progress=self.log)
-        self.log("结果：{}".format(json.dumps(res, ensure_ascii=False)))
-        self.post("cards", res)
-        code = res.get("result")
+        items = self._result_items(res)
+        for item in items:
+            self.log("{}：{}".format(item.get("account") or "账号",
+                                     json.dumps(item, ensure_ascii=False)))
+            self.post("cards", (item.get("uid") or "", item))
+            notice = item.get("expiry_notice")
+            if notice:
+                self.log("{} 的授权只剩 {} 天，已发送续期提醒".format(
+                    item.get("account") or "账号", notice.get("days_left")))
+        failed = [i for i in items if int(i.get("exit_code") or 0)]
+
+        if res.get("result") == "SUMMARY":
+            if failed:
+                self._report_failure(res, failed)
+            else:
+                self.post("banner", ("ok", "{} 个账号已全部签到完成　"
+                                     "每个账号的结果已分别推送。".format(
+                                         res.get("total")), "", None))
+            return
+
+        first = items[0] if items else {}
+        code = first.get("result")
         if code == "CLAIMED":
-            amount = res.get("credit", res.get("credits",
-                           res.get("today_credit", "?")))
+            amount = first.get("credit", first.get("credits",
+                              first.get("today_credit", "?")))
             self.post("banner", ("ok", "✅ 签到成功，+{} 积分　连续 {} 天，"
                                  "本期累计 {} 积分。".format(
-                                     amount, res.get("streak_days", "?"),
-                                     res.get("total_credits", "?")), "", None))
+                                     amount, first.get("streak_days", "?"),
+                                     first.get("total_credits", "?")), "", None))
         elif code == "ALREADY_CLAIMED":
             self.post("banner", ("ok", "今天已经签过了　连续 {} 天，"
                                  "本期累计 {} 积分。".format(
-                                     res.get("streak_days", "?"),
-                                     res.get("total_credits", "?")), "", None))
+                                     first.get("streak_days", "?"),
+                                     first.get("total_credits", "?")), "", None))
         elif code == "INACTIVE":
             self.post("banner", ("warn", "当前没有进行中的签到活动", "", None))
         else:
-            self._report_failure(res)
-        notice = res.get("expiry_notice")
-        if notice:
-            self.log("授权只剩 {} 天（{}），已发送续期提醒".format(
-                notice.get("days_left"), notice.get("expires_text") or "?"))
+            self._report_failure(res, items)
 
-    def _report_failure(self, res: dict) -> None:
-        code = res.get("result")
+    def _report_failure(self, res: dict, items: list = None) -> None:
+        """失败横幅：单账号给原始原因，多账号给“几个失败 + 是哪些账号”。"""
+        items = items if items is not None else self._result_items(res)
+        failed = [i for i in items if int(i.get("exit_code") or 0)] or items
+        if len(items) > 1:
+            names = "、".join((i.get("account") or "账号").split("（")[0]
+                             for i in failed)
+            self.post("banner", ("error", "{} 个账号签到失败：{}　详情见日志。"
+                                 .format(len(failed), names), "  重新自检  ",
+                                 lambda: self.start_task(self.task_env_check)))
+            return
+        one = failed[0] if failed else {}
+        code = one.get("result")
         auth_like = code in ("OAUTH_NOT_LOGGED_IN", "OAUTH_SESSION_DEAD",
                              "OAUTH_TOKEN_BAD", "OAUTH_NO_REFRESH")
         if auth_like:
             self.post("banner", ("error", "签到失败：授权无效　{}".format(
-                res.get("message", "")), "  重新授权  ", self.open_auth))
+                one.get("message", "")), "  重新授权  ", self.open_auth))
         else:
             self.post("banner", ("error", "签到失败：{}　{}".format(
-                code, res.get("message", "")), "  重新自检  ",
+                code, one.get("message", "")), "  重新自检  ",
                 lambda: self.start_task(self.task_env_check)))
 
     def task_test_notify(self) -> None:
@@ -1416,11 +1603,20 @@ class App:
 
     # ---------------- 弹窗 ----------------
 
-    def open_auth(self) -> None:
+    def open_auth(self, account: str = "") -> None:
+        """打开授权窗口：account 空 = 添加账号，非空 = 重新授权那一行。"""
         try:
-            AuthDialog(self, on_done=self.refresh_all)
+            AuthDialog(self, on_done=self._after_auth, account=account)
         except Exception:
             self.log("打开授权窗口失败：\n" + traceback.format_exc())
+
+    def _after_auth(self) -> None:
+        """授权完成后重读配置：账号列表与令牌都在磁盘上。"""
+        try:
+            self.cfg = core.load_config()
+        except Exception:
+            pass
+        self.refresh_all()
 
     def open_schedule(self) -> None:
         try:

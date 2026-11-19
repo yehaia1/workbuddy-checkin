@@ -67,6 +67,7 @@ for _p in (str(Path(__file__).resolve().parent),
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import wb_accounts
 import wb_config
 import wb_notify
 import wb_oauth
@@ -132,21 +133,34 @@ def do_check(cfg: dict, config_file: str) -> int:
     bind_data_dir(config_file)
     say("配置文件：{}".format(config_file))
     say("数据目录：{}".format(wb_config.data_dir()))
-    say("令牌文件：{}".format(core.oauth_token_path(cfg)))
     say("")
 
-    info = wb_oauth.summary(core.oauth_token_path(cfg))
-    if not info.get("present"):
-        auth_text = "未授权（下次运行会自动发起授权）"
-    elif info.get("error"):
-        auth_text = "令牌异常：{}".format(info.get("error"))
-    elif info.get("disabled") or info.get("expired"):
-        auth_text = "已失效（下次运行会自动重新授权）"
+    # 逐个账号看令牌状态：多账号下只看第一份令牌会漏掉后面失效的账号。
+    accounts = wb_accounts.list_accounts(cfg)
+    need_auth = False
+    if not accounts:
+        say("授权：未授权（下次运行会自动发起授权）")
+        need_auth = True
     else:
-        auth_text = "{}，有效期至 {}（剩 {} 天）".format(
-            info.get("nickname") or "已授权",
-            info.get("expires_text") or "?", info.get("days_left"))
-    say("授权：{}".format(auth_text))
+        say("授权：共 {} 个账号".format(len(accounts)))
+        for acct in accounts:
+            path = wb_accounts.token_file_of(acct)
+            info = wb_oauth.summary(path)
+            if not info.get("present"):
+                text = "未授权（下次运行会自动发起授权）"
+                need_auth = True
+            elif info.get("error"):
+                text = "令牌异常：{}".format(info.get("error"))
+                need_auth = True
+            elif info.get("disabled") or info.get("expired"):
+                text = "已失效（下次运行会自动重新授权）"
+                need_auth = True
+            else:
+                text = "{}，有效期至 {}（剩 {} 天）".format(
+                    info.get("nickname") or "已授权",
+                    info.get("expires_text") or "?", info.get("days_left"))
+            say("  {}：{}".format(core.account_name(acct) or "?", text))
+            say("    令牌：{}".format(path))
     say("")
 
     rows = channel_rows(cfg)
@@ -176,16 +190,16 @@ def do_check(cfg: dict, config_file: str) -> int:
         return 2
     say("✅ 可用渠道：{}".format("、".join(wb_notify.label(c) for c in usable)))
 
-    if not info.get("present") or info.get("disabled") or info.get("expired"):
+    if need_auth:
         if not qr_ok:
             say("✗ 这套环境目前授权不了：没有二维码能力，而手机打开授权页链接"
                 "拿不到令牌。")
             say("  按上面的命令装好 playwright / 浏览器依赖，再跑一次 --check。")
             return 2
-        say("⚠ 目前没有可用授权：下次运行会先生成二维码推给你扫，等 {} 秒，".format(
-            int(cfg.get("auth_wait_seconds") or 180)))
-        say("  失败则指数退避重试（最多 {} 轮）。".format(
-            int(cfg.get("auth_attempts") or 3)))
+        say("⚠ 有账号没有可用授权：下次运行会逐个生成二维码推给你扫，")
+        say("  每个账号最多等 {} 秒、最多 2 轮；整批预算 {} 秒。".format(
+            int(cfg.get("auth_wait_seconds") or 180),
+            int(cfg.get("auth_total_budget_seconds") or 900)))
     else:
         say("下一步：python3 wb_server.py    # 直接签到")
     return 0
@@ -281,7 +295,10 @@ def _int_opt(cli_value: Optional[int], cfg: dict, key: str, fallback: int,
     return max(minimum, value)
 
 
-def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
+def authorize(cfg_file: str, opts: argparse.Namespace,
+              account: str = "",
+              max_attempts: Optional[int] = None,
+              deadline: Optional[float] = None) -> Dict[str, Any]:
     """取二维码链接 → 推给用户扫 → 等授权完成 → 失败则指数退避重试。
 
     每轮都重新读一遍 config.json：用户很可能就是在等待的这几分钟里，
@@ -289,12 +306,23 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
 
     二维码靠本机无头浏览器生成（wb_qrlogin）。**浏览器必须一直开着**：
     扫码结果是那个页面跳转之后才生效的，提前关掉就白等了。
+
+    account      账号显示名，只影响日志（多账号时一眼看出在给谁授权）
+    max_attempts 覆盖配置里的 auth_attempts（多账号时每账号封顶）
+    deadline     time.monotonic() 表示的整批截止点：到点不再开新一轮，
+                 单轮等待也不会越过它（剩余预算不足就缩短本轮等待）
     """
     bind_data_dir(cfg_file)
     base = wb_config.load(cfg_file)
     attempts = _int_opt(opts.attempts, base, "auth_attempts", 3, 1)
+    if max_attempts is not None:
+        attempts = max(1, int(max_attempts))
     wait = _int_opt(opts.wait, base, "auth_wait_seconds", 180, 30)
     backoff = _int_opt(opts.backoff, base, "auth_backoff_seconds", 60)
+
+    if account:
+        say("")
+        say("──────── 授权账号：{} ────────".format(account))
 
     use_qr = (not getattr(opts, "no_qr", False)) and bool(base.get("auth_qr", True))
     if use_qr:
@@ -326,6 +354,21 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
 
     last = ""
     for i in range(1, attempts + 1):
+        wait_round = wait
+        if deadline is not None:
+            remain = int(deadline - time.monotonic())
+            if remain <= 0:
+                # 整批预算用完：不再开新一轮，把账号交回给调用方标记「跳过」
+                say("")
+                say("✗ 整批授权预算已用完，不再为{}等待。".format(
+                    account or "该账号"))
+                return {"ok": False, "attempts": i - 1,
+                        "budget_exhausted": True,
+                        "message": last or "整批授权预算已用完"}
+            if remain < wait:
+                wait_round = remain
+                say("  （整批预算只剩 {} 秒，本轮等待缩短到 {} 秒）".format(
+                    remain, wait_round))
         cfg = wb_config.load(cfg_file)
         channels = resolve_channels(cfg, opts.channel)
         say("")
@@ -380,7 +423,7 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
                         say(label + "…")
                         if channels:
                             if not push_auth_link(cfg, session.qr_url, url,
-                                                  channels, wait):
+                                                  channels, wait_round):
                                 say("  ⚠ 所有渠道都推送失败，只能手动打开："
                                     "{}".format(session.qr_url or url))
                         else:
@@ -388,20 +431,20 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
                                 "二维码链接：{}".format(session.qr_url or url))
                         say("")
                         say("④ 等待扫码（最多 {} 秒）；这期间可以改 {}".format(
-                            wait, cfg_file))
+                            wait_round, cfg_file))
                         say("   补配置，下一轮会自动重读。")
                     else:
                         if channels:
                             say("③ 推送到 {}…".format(
                                 "、".join(wb_notify.label(c) for c in channels)))
-                            if not push_url(cfg, url, channels, wait):
+                            if not push_url(cfg, url, channels, wait_round):
                                 say("⚠ 所有渠道都推送失败，只能手动转发上面的链接。")
                         else:
                             say("⚠ 没有可用的推送渠道（检查 config.json 的"
                                 "push_channels 与 key），请手动转发上面的链接。")
                         say("")
                         say("④ 等待完成授权（最多 {} 秒）；这期间可以改 {}".format(
-                            wait, cfg_file))
+                            wait_round, cfg_file))
                         say("   补配置，下一轮会自动重读。")
 
                     last_code = "-"
@@ -421,7 +464,7 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
                             printed[0] = 1.0
                             say("   轮询返回 {}（每 3 秒一次）".format(last_code))
 
-                    def on_tick(elapsed, remain, _wait=wait):
+                    def on_tick(elapsed, remain, _wait=wait_round):
                         # 用「距上次打印超过 N 秒」而不是取模：轮询隔 3 秒，
                         # elapsed 未必正好落在 15/30 上，取模会一整天不打印。
                         step = 30 if _wait > 120 else 10
@@ -431,7 +474,7 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
                                 elapsed, max(0, remain), last_code))
 
                     payload = wb_oauth.poll_token(
-                        info["state"], timeout=wait, on_tick=on_tick,
+                        info["state"], timeout=wait_round, on_tick=on_tick,
                         on_poll=on_poll)
                 except wb_oauth.OAuthError as e:
                     last = "{}: {}".format(e.result, e)
@@ -442,18 +485,26 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
                         last = "授权响应里没有 accessToken"
                         say("✗ {}".format(last))
                     else:
-                        path = core.oauth_token_path(cfg)
-                        wb_oauth.save(record, path)
-                        acct = record.get("account") or {}
-                        say("")
-                        say("⑤ ✅ 授权成功：{}（uid {}）".format(
-                            acct.get("nickname") or "已登录账号",
-                            acct.get("uid") or "?"))
-                        say("   令牌已保存：{}".format(path))
-                        return {"ok": True, "attempt": i,
-                                "uid": acct.get("uid") or "",
-                                "nickname": acct.get("nickname") or "",
-                                "token_file": path}
+                        # 归属按授权结果里的 uid 合并（旧单账号配置会落成第一个账号）；
+                        # 与命令行 / 界面共用同一套规则，避免两条运行线语义分叉。
+                        try:
+                            info = wb_accounts.merge_authorized(record, cfg=cfg)
+                        except wb_oauth.OAuthError as e:
+                            last = "{}: {}".format(e.result, e)
+                            say("✗ {}".format(last))
+                        else:
+                            say("")
+                            say("⑤ ✅ 授权成功：{}（uid {}，{}）".format(
+                                info.get("nickname") or "已登录账号",
+                                info.get("uid") or "?",
+                                "新增账号" if info.get("action") == "created"
+                                else "更新账号"))
+                            say("   令牌已保存：{}".format(info["token_file"]))
+                            return {"ok": True, "attempt": i,
+                                    "uid": info.get("uid") or "",
+                                    "nickname": info.get("nickname") or "",
+                                    "token_file": info["token_file"],
+                                    "action": info.get("action") or ""}
                 finally:
                     # 浏览器一定要收掉：成功要收，失败/异常更要收，
                     # 否则下一轮会再开一个，进程退出前就是好几个 Chromium。
@@ -462,11 +513,139 @@ def authorize(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
 
         if i < attempts:
             delay = backoff * (2 ** (i - 1))
+            if deadline is not None:
+                remain = int(deadline - time.monotonic())
+                if remain <= 0:
+                    break
+                delay = min(delay, remain)
             say("")
             say("→ 第 {} 轮失败（{}）。{} 秒后重试…".format(i, last, delay))
             if delay:
                 time.sleep(delay)
     return {"ok": False, "attempts": attempts, "message": last}
+
+
+# 多账号时每个账号最多授权几轮（用户没显式给 --attempts 时）：
+# 1 轮扫码等待 + 一次退避后再试 1 轮。不能沿用单账号的 auth_attempts=3，
+# 否则前几个账号就能把整批预算吃完，后面的账号连二维码都推不出去。
+AUTH_ATTEMPTS_PER_ACCOUNT = 2
+
+
+def _account_env(cfg: dict, acct: dict) -> Dict[str, Any]:
+    """按账号检查授权状态。
+
+    令牌路径取自账号条目，而不是列表里的第一个——这是多账号下
+    「逐个检查」与旧单账号逻辑的唯一区别。
+    """
+    return core.detect_env(deep=True, cfg=cfg,
+                           token_file=wb_accounts.token_file_of(acct))
+
+
+def authorize_all(cfg_file: str, opts: argparse.Namespace) -> Dict[str, Any]:
+    """把所有缺授权的账号逐个（串行）授权，一次只推一个二维码。
+
+    为什么串行：二维码是给人扫的，同时推好几张会分不清哪张是哪个号；
+    扫完一个、拿到令牌，再推下一个。
+
+    预算分两层：
+      * 每账号最多 AUTH_ATTEMPTS_PER_ACCOUNT 轮（显式 --attempts 时以它为准）
+      * 整批受 auth_total_budget_seconds 约束；用完后剩下的账号标记
+        「跳过（未尝试授权）」，按退出码 2 处理，留给下一次运行
+    环境缺 playwright / 浏览器是全局问题（第一个账号就会暴露），
+    此时 fatal=True，调用方直接退出，不再挨个白等。
+
+    返回 {"ok", "fatal", "message", "accounts", "authorized", "failed",
+          "skipped", "exit_code"}；failed 是 [(账号名, 原因)]。
+    """
+    bind_data_dir(cfg_file)
+    cfg = wb_config.load(cfg_file)
+    accounts = wb_accounts.ensure(cfg)
+    total_budget = _int_opt(None, cfg, "auth_total_budget_seconds", 900, 60)
+    deadline = time.monotonic() + total_budget
+    # 用户显式指定 --attempts 时尊重它；否则多账号统一封顶
+    cap = None if getattr(opts, "attempts", None) is not None \
+        else AUTH_ATTEMPTS_PER_ACCOUNT
+
+    report: Dict[str, Any] = {
+        "ok": True, "fatal": False, "message": "",
+        "accounts": accounts, "authorized": [], "failed": [], "skipped": [],
+        "exit_code": 0,
+    }
+    codes: List[int] = []
+
+    def _fail(label: str, message: str, code: int = 2) -> None:
+        """记一个授权没成功的账号（不中断整批，最后汇总退出码）。"""
+        report["ok"] = False
+        report["failed"].append((label, message))
+        codes.append(code)
+
+    if not accounts:
+        # 本机还没有任何账号：推一次二维码，扫到哪个号就按 uid 新增哪个
+        say("   本机还没有账号，开始添加第一个账号。")
+        res = authorize(cfg_file, opts, account="（新增账号）",
+                        max_attempts=cap, deadline=deadline)
+        if res.get("ok"):
+            report["authorized"].append(res.get("uid") or "")
+            report["accounts"] = wb_accounts.list_accounts(
+                wb_config.load(cfg_file))
+            return report
+        report["message"] = res.get("message") or "授权失败"
+        _fail("（新增账号）", report["message"])
+        report["fatal"] = bool(res.get("fatal"))
+        report["exit_code"] = 2
+        return report
+
+    say("   共 {} 个账号，整批授权预算 {} 秒。".format(
+        len(accounts), total_budget))
+    for acct in accounts:
+        who = core.account_name(acct) or "?"
+        env = _account_env(cfg, acct)
+        code = env.get("code")
+        say("")
+        say("   · {}：{}　{}".format(
+            who, ENV_TEXT.get(code, code), env.get("message") or "—"))
+
+        if code == "OK":
+            continue
+        if code not in AUTH_BROKEN:
+            # 网络不通 / 接口异常：重新授权解决不了，跳过这个账号继续下一个
+            detail = "{}：{}".format(ENV_TEXT.get(code, code),
+                                    env.get("message") or "")
+            say("     跳过（{}），不重新授权。".format(
+                ENV_TEXT.get(code, code)))
+            _fail(who, detail, 3)
+            continue
+        if time.monotonic() >= deadline:
+            say("     跳过（未尝试授权）：整批授权预算 {} 秒已用完。".format(
+                total_budget))
+            report["skipped"].append(who)
+            report["ok"] = False
+            codes.append(2)
+            continue
+
+        say("     需要授权，开始推送二维码…")
+        res = authorize(cfg_file, opts, account=who,
+                        max_attempts=cap, deadline=deadline)
+        if res.get("ok"):
+            report["authorized"].append(res.get("uid") or "")
+            # 重新读配置：新令牌、新账号、可能刚被改过的推送渠道都在里面
+            cfg = wb_config.load(cfg_file)
+            continue
+        if res.get("fatal"):
+            # 环境层面的问题：后面每个账号都会同样失败，直接停
+            report["fatal"] = True
+            report["message"] = res.get("message") or "授权无法进行"
+            _fail(who, report["message"])
+            report["exit_code"] = 2
+            return report
+        _fail(who, res.get("message") or "授权失败")
+        if res.get("budget_exhausted"):
+            # 预算在等待中途用完：后面的账号在循环开头会自然被标记跳过
+            say("     整批预算已用完，后续账号本次不再尝试授权。")
+
+    report["accounts"] = wb_accounts.list_accounts(wb_config.load(cfg_file))
+    report["exit_code"] = core._worst_exit_code(codes) if codes else 0
+    return report
 
 
 # ---------------- 主流程 ----------------
@@ -485,57 +664,67 @@ def run_checkin(cfg_file: str, opts: argparse.Namespace,
     cfg = existing if existing is not None else wb_config.load(cfg_file)
     result = core.run_once(cfg, notify=True, progress=lambda m: say("· " + m))
     say("")
-    say("结果：{}".format(result.get("result")))
+    items = result.get("items") if result.get("result") == "SUMMARY" else [result]
+    for item in items:
+        say("结果：{}　{}".format(item.get("account") or "账号",
+                                 item.get("result")))
+    if result.get("result") == "SUMMARY":
+        say("汇总：共 {} 个账号，成功 {}，失败 {}".format(
+            result.get("total"), result.get("ok"), result.get("failed")))
     if opts.json:
         say(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     return int(result.get("exit_code", 0))
 
 
 def run_daily(cfg_file: str, opts: argparse.Namespace) -> int:
+    """日常入口：先补齐所有缺授权的账号，再逐账号签到。
+
+    授权阶段不单独推「失败通知」——每个账号的签到结果本身就会各推一条；
+    只有「一个账号都没有、首次授权也没成功」时才补一条，否则用户
+    什么都收不到。
+    """
     bind_data_dir(cfg_file)
     cfg = wb_config.load(cfg_file)
     say("配置：{}".format(cfg_file))
     say("数据目录：{}".format(wb_config.data_dir()))
-    say("① 检查授权…")
+    say("① 检查授权（缺授权的账号逐个推送二维码）…")
 
-    env = core.detect_env(deep=True, cfg=cfg)
-    code = env.get("code")
-    say("   授权状态：{}（{}）".format(
-        ENV_TEXT.get(code, code), env.get("message") or "—"))
+    report = authorize_all(cfg_file, opts)
+    if report.get("fatal"):
+        # 环境缺 playwright / 浏览器：等和重试都不解决问题，直接退出；
+        # 上面 authorize() 已经把原因和修复命令打出来了。
+        say("")
+        say("✗ 授权无法进行：{}".format(report.get("message")))
+        say("  签到已跳过（没有等待，也没有重试）。")
+        return 2
 
-    if code in AUTH_BROKEN:
-        say("   需要先完成授权。")
-        res = authorize(cfg_file, opts)
-        if not res.get("ok"):
-            cfg = wb_config.load(cfg_file)
-            if res.get("fatal"):
-                # 环境缺东西，等和重试都不解决问题：不推失败通知、直接退出，
-                # 上面 authorize() 已经把原因和修复命令打出来了。
-                say("")
-                say("✗ 授权无法进行：{}".format(res.get("message")))
-                say("  签到已跳过（没有等待，也没有重试）。")
-                return 2
-            notify_failure(
-                cfg,
-                "【WorkBuddy 签到】❌ 服务端授权未完成\n"
-                "已重试 {} 轮（指数退避），最后一次：{}\n"
-                "签到已跳过。排查：python3 wb_server.py --check".format(
-                    res.get("attempts"), res.get("message")),
-                resolve_channels(cfg, opts.channel))
-            say("")
-            say("✗ 授权最终失败：{}".format(res.get("message")))
-            return 2
-        cfg = wb_config.load(cfg_file)
-    elif code == "OAUTH_NETWORK":
-        say("✗ 网络不通，未执行签到：{}".format(env.get("message")))
-        return 3
-    elif code != "OK":
-        say("✗ 接口异常，未执行签到：{}".format(env.get("message")))
-        return 3
+    cfg = wb_config.load(cfg_file)
+    if not report.get("accounts"):
+        # 首次使用，授权又没成功：没有可签到的账号，补一条失败通知
+        notify_failure(
+            cfg,
+            "【WorkBuddy 签到】❌ 服务端授权未完成\n"
+            "{}\n"
+            "签到已跳过。排查：python3 wb_server.py --check".format(
+                report.get("message") or "授权未完成"),
+            resolve_channels(cfg, opts.channel))
+        say("")
+        say("✗ 授权最终失败：{}".format(report.get("message") or "授权未完成"))
+        return 2
+
+    auth_code = int(report.get("exit_code") or 0)
+    if report.get("failed") or report.get("skipped"):
+        say("")
+        say("⚠ 有账号没就绪：授权失败 {} 个，跳过 {} 个；"
+            "签到会照常跑完其余账号。".format(
+                len(report.get("failed") or []),
+                len(report.get("skipped") or [])))
 
     say("")
     say("② 执行签到…")
-    return run_checkin(cfg_file, opts, existing=cfg)
+    check_code = run_checkin(cfg_file, opts, existing=cfg)
+    # 授权阶段的问题也要算进退出码：被跳过的账号不能因为“没跑”就报成功
+    return core._worst_exit_code([auth_code, check_code])
 
 
 def main(argv=None) -> int:
@@ -596,6 +785,8 @@ def main(argv=None) -> int:
         return do_init_config(args.init_config, args.force)
 
     cfg = wb_config.load(cfg_file)
+    # 旧版单账号配置落成 accounts[0]（只做一次），后面的授权/签到都按账号走
+    wb_accounts.ensure(cfg)
     if args.check:
         return do_check(cfg, cfg_file)
 
@@ -615,12 +806,18 @@ def main(argv=None) -> int:
 
     try:
         if args.auth_only:
-            res = authorize(cfg_file, args)
-            if not res.get("ok"):
-                say("✗ {}：{}".format(
-                    "授权无法进行" if res.get("fatal") else "授权失败",
-                    res.get("message")))
+            report = authorize_all(cfg_file, args)
+            if report.get("fatal"):
+                say("✗ 授权无法进行：{}".format(report.get("message")))
                 return 2
+            for label, msg in report.get("failed") or []:
+                say("✗ {}：{}".format(label, msg))
+            for label in report.get("skipped") or []:
+                say("⚠ {}：跳过（未尝试授权，整批预算已用完）".format(label))
+            if report.get("failed") or report.get("skipped"):
+                return int(report.get("exit_code") or 2)
+            if not report.get("authorized"):
+                say("✅ 所有账号的授权都有效，无需重新授权。")
             return 0
         if args.checkin_only:
             return run_checkin(cfg_file, args)

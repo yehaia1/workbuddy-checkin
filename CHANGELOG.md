@@ -1,13 +1,34 @@
 # 更新日志
 
-本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)，
+本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)，  
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
+
+## [3.3.0] - 2026-11-19
+
+**支持同机多账号：一个程序挂多个号，签到串行跑完，一条消息对应一个账号。**
+
+账号列表存在 `config.json` 的 `accounts` 里，一条一个账号（uid + 令牌文件 +
+昵称）。归属只看授权结果里的 uid：同一个 uid 再授权就是覆盖，扫了另一个号
+只会新增一行，不会把原来的令牌冲掉。
+
+- 新增 `wb_accounts`：账号列表的唯一读写入口；旧版单账号配置首次运行自动  
+  迁移成第一个账号，令牌文件不复制、不改名（避免 `refreshToken` 两份互踢）；
+- 桌面端：「立即授权」改为「添加账号」，列表显示昵称 / uid / 状态 / 到期时间，  
+  支持逐账号重新授权、删除；单个账号失效只标红那一行，不再锁死整个界面；
+- 服务端：逐账号检查授权，缺授权的**逐个推二维码**（一次一个，扫完再推下一个）；  
+  每个账号封顶 2 轮，整批受 `auth_total_budget_seconds`（默认 900 秒）约束，  
+  用完后剩余账号标记「跳过（未尝试授权）」并计入退出码 `2`；
+- 签到对全部账号串行执行，单账号失败不中断；退出码取最严重的那个  
+  （`2` 未授权 > `3` 网络 > `4` 接口 > `1` 推送）；
+- 推送一条消息对应一个账号，文案里的账号行来自各自的令牌；
+- 构建与体检同步：`wb_accounts` 进 exe 隐藏导入与 pyz 闭包，  
+  `oauth_mode_check.py` 扩到 114 项。
 
 ## [3.2.3] - 2026-10-19
 
 **推送文案加上「账号」，桌面版与服务端版完全一致。**
 
-之前推出来的只有积分、连签、时间，看不出是哪个账号签的 —— 服务端尤其需要
+之前推出来的只有积分、连签、时间，看不出是哪个账号签的 —— 服务端尤其需要  
 （一个群里可能挂好几台机器/好几个号）。现在第一行下面固定多一行：
 
 ```
@@ -18,19 +39,19 @@
 时间：2026-10-19 16:50
 ```
 
-- 新增 `account_label()`：从**各自的令牌**（`auth_oauth.json`）里读昵称 + uid
+- 新增 `account_label()`：从**各自的令牌**（`auth_oauth.json`）里读昵称 + uid  
   前 8 位，不抄进配置，因此不会出现两台机器写错昵称；
-- `build_message(result, account)` 统一加账号行，签到成功 / 今日已签到 /
+- `build_message(result, account)` 统一加账号行，签到成功 / 今日已签到 /  
   活动已结束 / 执行失败四种文案都带；
 - 令牌缺失或损坏时取不到昵称，**整行省略**，不留一个空的「账号：」；
-- 文案只在 `common/workbuddy_checkin.py` 一处，exe 和服务端调的是同一个函数，
+- 文案只在 `common/workbuddy_checkin.py` 一处，exe 和服务端调的是同一个函数，  
   两边格式不会再走偏。
 
 ## [3.2.2] - 2026-10-19
 
 **修「起不了浏览器」：多找几种来源，并把话说清楚。**
 
-Linux 服务器上只 `pip install playwright` 是不够的（库在、浏览器没下载），
+Linux 服务器上只 `pip install playwright` 是不够的（库在、浏览器没下载），  
 启动时只有一串
 
 ```
@@ -41,17 +62,17 @@ bundled: ... Target page, context or browser has been closed
 
 看不出该干什么。现在：
 
-- **四种来源依次试**：`chrome` channel → `msedge` channel → 系统可执行文件
-  （`WB_BROWSER_PATH`、`/usr/bin/chromium`、`/usr/bin/google-chrome`、
-  `/snap/bin/chromium`、`/opt/google/chrome/chrome` …）→ playwright 自带
+- **四种来源依次试**：`chrome` channel → `msedge` channel → 系统可执行文件  
+  （`WB_BROWSER_PATH`、`/usr/bin/chromium`、`/usr/bin/google-chrome`、  
+  `/snap/bin/chromium`、`/opt/google/chrome/chrome` …）→ playwright 自带  
   chromium。**有一处能起就行**，不必非得跑 `playwright install`；
-- **启动前先探**：`browser_ready()` 只看文件存不存在，不启浏览器；一个都没有
+- **启动前先探**：`browser_ready()` 只看文件存不存在，不启浏览器；一个都没有  
   就打印结论直接退出，不再打四条 playwright 原始报错；
-- **失败报告可照做**：逐条列出每种来源为什么失败，附 playwright 浏览器目录、
-  `WB_BROWSER_PATH`、当前用户，以及三条修复路径（装 chromium / 指系统浏览器 /
-  换 `PLAYWRIGHT_BROWSERS_PATH`），并点明「cron 是 root、浏览器装在别的用户下」
+- **失败报告可照做**：逐条列出每种来源为什么失败，附 playwright 浏览器目录、  
+  `WB_BROWSER_PATH`、当前用户，以及三条修复路径（装 chromium / 指系统浏览器 /  
+  换 `PLAYWRIGHT_BROWSERS_PATH`），并点明「cron 是 root、浏览器装在别的用户下」  
   这个最常见的原因；
-- `--check` 的「二维码授权」现在区分库与浏览器两层，可用时会显示实际用的是哪个
+- `--check` 的「二维码授权」现在区分库与浏览器两层，可用时会显示实际用的是哪个  
   （`复用系统浏览器：/usr/bin/chromium` / `playwright 自带：chromium-1148`）；
 - 行为不变：判断失败仍然**立即退出（退出码 2），不推链接、不等待、不重试**。
 
@@ -59,11 +80,11 @@ bundled: ... Target page, context or browser has been closed
 
 **缺二维码能力时服务端直接退出，不再空等。**
 
-没有 playwright、或浏览器起不来时，服务端根本生成不了二维码；而推授权页
-链接给手机是拿不到令牌的。之前的实现是"退回推链接然后等 180 秒 × 3 轮"，
+没有 playwright、或浏览器起不来时，服务端根本生成不了二维码；而推授权页  
+链接给手机是拿不到令牌的。之前的实现是"退回推链接然后等 180 秒 × 3 轮"，  
 结果就是每天白占十几分钟、日志里还写着"授权失败"，误导性很强。
 
-现在改成打一行原因 + 安装命令后**立即退出（退出码 2）**，约 1 秒结束，
+现在改成打一行原因 + 安装命令后**立即退出（退出码 2）**，约 1 秒结束，  
 不推链接、不等待、不重试：
 
 - 缺 playwright → 启动前就判断，直接退出（`--auth-only` 与日常入口一致）；
@@ -75,175 +96,175 @@ bundled: ... Target page, context or browser has been closed
 
 ## [3.2.0] - 2026-10-19
 
-**服务端授权打通：现在由服务器自己开无头浏览器取微信二维码，把二维码链接
+**服务端授权打通：现在由服务器自己开无头浏览器取微信二维码，把二维码链接  
 推送给你扫，扫完令牌直接落在服务器上。**
 
-之前服务端只能把授权页链接转发到手机。那条路走不通：登录成功后是**页面
-自己**回调 `/console/auth/login` 把 `state` 标记完成，登录态落在打开它的
-浏览器里，服务端轮询只会一直返回 `11217`。现在改成服务端自己开浏览器，
+之前服务端只能把授权页链接转发到手机。那条路走不通：登录成功后是**页面  
+自己**回调 `/console/auth/login` 把 `state` 标记完成，登录态落在打开它的  
+浏览器里，服务端轮询只会一直返回 `11217`。现在改成服务端自己开浏览器，  
 让登录发生在我们可控的浏览器里——实测扫码后 100 秒内拿到 `code=0`。
 
 ### 新增
 
 - **`src/common/wb_qrlogin.py`**：无头浏览器取二维码。
-  - `QRSession(auth_url).open()` → 打开授权页、轮询页面上
-    `/connect/qrcode/` 那张图；`qr_url` 是**公网图片链接**，
+  - `QRSession(auth_url).open()` → 打开授权页、轮询页面上  
+    `/connect/qrcode/` 那张图；`qr_url` 是**公网图片链接**，  
     `png` 是本地备份图。
-  - 依次借系统 Chrome / Edge / playwright 自带 chromium（`channel=`），
+  - 依次借系统 Chrome / Edge / playwright 自带 chromium（`channel=`），  
     Windows 上不用额外下载浏览器。
-  - `playwright` **只在函数内惰性导入**：没装不影响 `import wb_qrlogin`，
+  - `playwright` **只在函数内惰性导入**：没装不影响 `import wb_qrlogin`，  
     也不会被 zipapp 的 import 闭包收进单文件（体积不变）。
-- **`wb_server` 二维码授权流程**：缺授权才起浏览器 →
+- **`wb_server` 二维码授权流程**：缺授权才起浏览器 →  
   取二维码链接 → 推到企业微信/钉钉 → 等扫码 → 拿到令牌**立刻关掉**浏览器。
-  - 推送内容统一走**文字 + 图片链接**：企业微信和钉钉都支持，不需要图床、
+  - 推送内容统一走**文字 + 图片链接**：企业微信和钉钉都支持，不需要图床、  
     不用在服务器上开端口暴露 PNG，也不用为"钉钉不能发图片"做降级。
-  - 新增 `--no-qr` 与配置项 `auth_qr`（默认 `true`）：退回推授权页链接，
+  - 新增 `--no-qr` 与配置项 `auth_qr`（默认 `true`）：退回推授权页链接，  
     仅排障用。
   - `--check` 会额外报告「二维码授权：可用 / 不可用（原因）」。
   - 没装 playwright 时不会崩：打一行安装指引，然后退回旧行为。
 
 ### 说明
 
-- **日常签到零依赖、不启动浏览器**。只有 `detect_env` 判为
+- **日常签到零依赖、不启动浏览器**。只有 `detect_env` 判为  
   「未授权 / 令牌损坏 / 会话失效」时才进授权分支（`--auth-only` 除外）。
-- 浏览器在 `finally` 里关闭：成功、超时、异常三条路径都会收掉，
+- 浏览器在 `finally` 里关闭：成功、超时、异常三条路径都会收掉，  
   已用进程数探针验证退出后无 chromium 残留。
 - 桌面端行为不变（它在本机，一直没问题）。
 
 ## [3.1.1] - 2026-10-19
 
-**Windows 版不再要求"在本机浏览器完成登录"：点「立即授权」拿链接，手机扫码
+**Windows 版不再要求"在本机浏览器完成登录"：点「立即授权」拿链接，手机扫码  
 授权，本机自动取回令牌。**
 
 ### 变更
 
-- **桌面端授权默认不弹本机浏览器**（`login_oauth(open_browser=False)`）。
-  授权链接本来就不绑定发起设备——手机登录确认后，本机用同一个 `state`
-  轮询到 `code=0`，令牌自动落盘并刷新界面，手机上不需要任何回传。
-  对"账号就在手机上"和"企业策略拦浏览器 / 远程桌面没有默认浏览器"这两种
+- **桌面端授权默认不弹本机浏览器**（`login_oauth(open_browser=False)`）。  
+  授权链接本来就不绑定发起设备——手机登录确认后，本机用同一个 `state`  
+  轮询到 `code=0`，令牌自动落盘并刷新界面，手机上不需要任何回传。  
+  对"账号就在手机上"和"企业策略拦浏览器 / 远程桌面没有默认浏览器"这两种  
   情况都更省事。
-- 授权窗口改为「用手机完成授权」：链接可一键复制，「在本机打开」作为次要
+- 授权窗口改为「用手机完成授权」：链接可一键复制，「在本机打开」作为次要  
   入口保留；等待状态显示「等待手机完成授权… 已等 N 秒」。
-- 新增 `--auth --no-browser`：命令行只打印链接、不弹浏览器
+- 新增 `--auth --no-browser`：命令行只打印链接、不弹浏览器  
   （`--auth` 本身行为不变）。
 
 ### 修正
 
-- 授权窗口的说明文字在高 DPI 下会超出窗口宽度被裁切（`wraplength` 是固定
+- 授权窗口的说明文字在高 DPI 下会超出窗口宽度被裁切（`wraplength` 是固定  
   像素值）。现在换行宽度跟着控件实际宽度走。
-- 状态行会被窗口底边裁掉：窗口尺寸在链接到达前就固定了，文案变长后长不高。
+- 状态行会被窗口底边裁掉：窗口尺寸在链接到达前就固定了，文案变长后长不高。  
   改为初始就按最终文案排版，高度一次成型。
 
 ## [3.1.0] - 2026-10-19
 
-**源码按版本分层（`common` / `desktop` / `server`）；服务端交付从"一包文件"
+**源码按版本分层（`common` / `desktop` / `server`）；服务端交付从"一包文件"  
 变成"一个文件"。**
 
 ### 变更
 
 - **`src/` 拆成三层**，不再平铺：
-  - `src/common/`：`wb_config`、`wb_oauth`、`wb_notify`、`workbuddy_checkin`
+  - `src/common/`：`wb_config`、`wb_oauth`、`wb_notify`、`workbuddy_checkin`  
     （两边共用，禁止 import Windows / tkinter）
   - `src/desktop/`：`checkin_gui`、`wb_task`、`win_quiet`（只有 exe 版用）
-  - `src/server/`：`wb_server`（只有服务端用）
-  入口脚本自己在文件顶部把 `common/` 挂进 `sys.path`，所以
-  `python src/desktop/checkin_gui.py`、`python src/common/workbuddy_checkin.py --run`
-  都能直接跑，不需要根目录的启动脚本。
-- **服务端产物改为单文件 `dist/server/wb_server.pyz`**（约 30 KB，zipapp）：
-  服务器上只要拷这一个文件，`python3 wb_server.pyz --init-config` /
-  `--check` / 直接运行都行。模块在 zip 内天然隔离，不存在"合并单文件撞名"
-  的问题。构建脚本 `build/make_server_bundle.py` 相应改名为
-  **`build/make_server.py`**，仍按 import 闭包收模块，闭包里出现
+  - `src/server/`：`wb_server`（只有服务端用）  
+    入口脚本自己在文件顶部把 `common/` 挂进 `sys.path`，所以  
+    `python src/desktop/checkin_gui.py`、`python src/common/workbuddy_checkin.py --run`  
+    都能直接跑，不需要根目录的启动脚本。
+- **服务端产物改为单文件 `dist/server/wb_server.pyz`**（约 30 KB，zipapp）：  
+  服务器上只要拷这一个文件，`python3 wb_server.pyz --init-config` /  
+  `--check` / 直接运行都行。模块在 zip 内天然隔离，不存在"合并单文件撞名"  
+  的问题。构建脚本 `build/make_server_bundle.py` 相应改名为  
+  **`build/make_server.py`**，仍按 import 闭包收模块，闭包里出现  
   `checkin_gui` / `wb_task` / `win_quiet` 直接构建失败。
-- `wb_config` 新增 `_script_dir()`：单文件里 `__file__` 指向 zip 内部
-  （`.../wb_server.pyz/wb_config.py`，parent 是文件不是目录），此时退到
-  `sys.argv[0]` 的目录。配置、日志、令牌仍落在 pyz 旁边，
+- `wb_config` 新增 `_script_dir()`：单文件里 `__file__` 指向 zip 内部  
+  （`.../wb_server.pyz/wb_config.py`，parent 是文件不是目录），此时退到  
+  `sys.argv[0]` 的目录。配置、日志、令牌仍落在 pyz 旁边，  
   `--version` 显示「脚本运行」。
-- `is_repo_layout()` 改为**绝对判据**（`src/common/` 下且仓库根有
-  `build/build_exe.py`）。之前"往上找 `run.py` / `build/`"的写法会让
+- `is_repo_layout()` 改为**绝对判据**（`src/common/` 下且仓库根有  
+  `build/build_exe.py`）。之前"往上找 `run.py` / `build/`"的写法会让  
   `dist/server/` 往上两级命中仓库根，把服务端误判成开发仓库。
 
 ### 删除
 
-- **根目录 `run.py`**：源码运行改用
-  `python src/desktop/checkin_gui.py`（界面）/
-  `python src/common/workbuddy_checkin.py --run`（无界面）。
+- **根目录 `run.py`**：源码运行改用  
+  `python src/desktop/checkin_gui.py`（界面）/  
+  `python src/common/workbuddy_checkin.py --run`（无界面）。  
   计划任务在源码态（仅开发自测）相应指向后者。
-- 遗留配置与运行残留：根目录 `config.json`（只有 `push_channels`、无 key）、
-  `dist/config.json`（与缓存目录那份完全等价，exe 早已不读它）、
-  根目录 `checkin.log` / `selftest.json` / `__pycache__`。
+- 遗留配置与运行残留：根目录 `config.json`（只有 `push_channels`、无 key）、  
+  `dist/config.json`（与缓存目录那份完全等价，exe 早已不读它）、  
+  根目录 `checkin.log` / `selftest.json` / `__pycache__`。  
   删除前已备份到 `.build/legacy/`。
 
 ### 修正
 
-- 回归从 77 项扩到 **81 项**：新增"服务端产物是单文件 .pyz""pyz 里没有
+- 回归从 77 项扩到 **81 项**：新增"服务端产物是单文件 .pyz""pyz 里没有  
   GUI/Windows 模块""pyz 有 `__main__` 入口""单文件在空目录能跑"等断言。
 
 ## [3.0.0] - 2026-10-19
 
-**Windows 版变成真正的"拷到哪都能跑"的单文件程序；服务端版从"授权工具"
+**Windows 版变成真正的"拷到哪都能跑"的单文件程序；服务端版从"授权工具"  
 变成"日常入口"，一条命令管完授权与签到。**
 
 ### 变更（对用户可见）
 
 - **数据目录从 exe 旁边挪到用户缓存目录** `%LOCALAPPDATA%\WorkBuddyCheckin`
   - exe 放桌面、U 盘、只读目录都能正常读写配置
-  - 把 exe 发给别人不会连 `config.json`（机器人 key）和 `auth_oauth.json`
+  - 把 exe 发给别人不会连 `config.json`（机器人 key）和 `auth_oauth.json`  
     （明文令牌）一起带走
-  - 首次运行会把旧版留在 exe 旁边的配置与令牌**复制**过来（不删源文件，
+  - 首次运行会把旧版留在 exe 旁边的配置与令牌**复制**过来（不删源文件，  
     不覆盖已有配置）
   - 界面日志首行显示"程序位置"与"数据目录（用户缓存目录）"
-- **计划任务指向 exe 自身**（`WorkBuddyCheckin.exe --run`），并在启动时自愈：
-  exe 换目录、从旧版升级后任务指向失效，打开一次程序即自动改指当前路径。
+- **计划任务指向 exe 自身**（`WorkBuddyCheckin.exe --run`），并在启动时自愈：  
+  exe 换目录、从旧版升级后任务指向失效，打开一次程序即自动改指当前路径。  
   源码运行不参与自愈，避免开发动作抢走已部署的任务。
-- **服务端脚本 `wb_auth_server.py` → `wb_server.py`**，默认行为改为完整日常流程：
-  检查授权 → 需要时推授权链接并等 180 秒 → 失败按 60/120 秒指数退避重试，
+- **服务端脚本 `wb_auth_server.py` → `wb_server.py`**，默认行为改为完整日常流程：  
+  检查授权 → 需要时推授权链接并等 180 秒 → 失败按 60/120 秒指数退避重试，  
   最多 3 轮 → 授权成功后立刻签到 → 推送结果。3 轮全失败推失败通知、退出码 `2`。
-- **配置跟着脚本走**：服务端默认读脚本同目录的 `config.json`，日志与令牌
+- **配置跟着脚本走**：服务端默认读脚本同目录的 `config.json`，日志与令牌  
   也写在同一层，整个目录拷走即可换机器。
-- **产物只出英文名** `dist/WorkBuddyCheckin.exe`，不再生成中文名副本；
+- **产物只出英文名** `dist/WorkBuddyCheckin.exe`，不再生成中文名副本；  
   dist 里旧的中文名 exe 会在打包时清掉。
-- 新增版本管理：`wb_config.VERSION` 为唯一来源，`--version` 输出
+- 新增版本管理：`wb_config.VERSION` 为唯一来源，`--version` 输出  
   版本 / 运行方式 / 数据目录，打包时写入 exe 文件属性。
 
 ### 新增
 
-- 配置项 `auth_wait_seconds`（180）、`auth_attempts`（3）、
+- 配置项 `auth_wait_seconds`（180）、`auth_attempts`（3）、  
   `auth_backoff_seconds`（60），可用 `--wait` / `--attempts` / `--backoff` 覆盖
 - `wb_server.py --auth-only` / `--checkin-only` / `--version`
 - `--check` 增加授权状态一行（未授权时说明下次运行会自动发起授权）
 - `docs/server.md` 按"cron 日常入口"重写：退避时间线、cron 示例、干净环境验证
-- 回归从 52 项扩到 **77 项**：新增版本与数据目录、迁移、服务端参数、
+- 回归从 52 项扩到 **77 项**：新增版本与数据目录、迁移、服务端参数、  
   服务端打包闭包与平铺目录断言
 
 ### 新增
 
-- **服务端打包脚本 `build/make_server_bundle.py`**：服务端部署不再需要
-  "把整个 `src/` 拷过去"。脚本从 `wb_server.py` 出发按 import 闭包（AST
-  静态解析模块级导入）自动收集，产出 `dist/server/`：
-  `wb_server.py`、`workbuddy_checkin.py`、`wb_oauth.py`、`wb_notify.py`、
-  `wb_config.py` + `config.example.json` + `README.txt` + `_bundle.json`。
-  `checkin_gui.py`（tkinter 界面）、`wb_task.py`（Windows 计划任务）、
-  `win_quiet.py`（弹窗抑制）不会被带上；万一以后被 import 进来，脚本直接报错。
-  只清理自己上次放进去的文件，不碰 `config.json` / `auth_oauth.json` /
+- **服务端打包脚本 `build/make_server_bundle.py`**：服务端部署不再需要  
+  "把整个 `src/` 拷过去"。脚本从 `wb_server.py` 出发按 import 闭包（AST  
+  静态解析模块级导入）自动收集，产出 `dist/server/`：  
+  `wb_server.py`、`workbuddy_checkin.py`、`wb_oauth.py`、`wb_notify.py`、  
+  `wb_config.py` + `config.example.json` + `README.txt` + `_bundle.json`。  
+  `checkin_gui.py`（tkinter 界面）、`wb_task.py`（Windows 计划任务）、  
+  `win_quiet.py`（弹窗抑制）不会被带上；万一以后被 import 进来，脚本直接报错。  
+  只清理自己上次放进去的文件，不碰 `config.json` / `auth_oauth.json` /  
   `checkin.log`，打完自动跑一次 `--version` 冒烟。
 
 ### 删除
 
-- 服务端一次性领取端口（`--handoff` / `--port` / `--bind` /
-  `--handoff-timeout`）与客户端 `--pull-token`
+- 服务端一次性领取端口（`--handoff` / `--port` / `--bind` /  
+  `--handoff-timeout`）与客户端 `--pull-token`  
   —— 两个版本各自授权、各存一份，不再需要跨机器交接令牌
 - 服务端 `--save-token` / `--timeout`（由 `auth_wait_seconds` 与 `--wait` 取代）
 - 中文名 exe 产物与相关文案
 
 ### 修正
 
-- 服务端单独调用内部函数时，令牌可能写到当前工作目录而不是配置目录
+- 服务端单独调用内部函数时，令牌可能写到当前工作目录而不是配置目录  
   （现在每个入口都先绑定数据目录）
-- **服务端平铺目录的数据目录不再是"父目录"**：`default_data_dir()` 之前假定
-  "源码运行 = 仓库"，把 `src/` 的上一级当数据目录；服务端把 5 个脚本平铺在
-  `/opt/wbcheckin` 时，配置会被写到 `/opt/`。现在用 `is_repo_layout()` 判据
-  （`run.py` / `.git` / `build/`）区分，平铺目录的数据目录就是脚本目录，
+- **服务端平铺目录的数据目录不再是"父目录"**：`default_data_dir()` 之前假定  
+  "源码运行 = 仓库"，把 `src/` 的上一级当数据目录；服务端把 5 个脚本平铺在  
+  `/opt/wbcheckin` 时，配置会被写到 `/opt/`。现在用 `is_repo_layout()` 判据  
+  （`run.py` / `.git` / `build/`）区分，平铺目录的数据目录就是脚本目录，  
   `--version` 显示「脚本运行」以示区别
 - 界面"每日定时"的路径校验改看"命令 + 参数"，之前只比程序路径
 
@@ -253,47 +274,47 @@ bundled: ... Target page, context or browser has been closed
 
 ### 新增
 
-- **授权到期提醒**：每次签到结束后检查令牌剩余天数，`≤ expiry_warn_days`
-  （默认 2 天）就向已配置渠道推一条提醒；已过期时文案直接说"授权已过期"。
+- **授权到期提醒**：每次签到结束后检查令牌剩余天数，`≤ expiry_warn_days`  
+  （默认 2 天）就向已配置渠道推一条提醒；已过期时文案直接说"授权已过期"。  
   定时任务（`--run`）同样生效，不额外增加任何调度。
 - 配置项 `expiry_warn_days`（默认 `2`，设 `0` 关闭；界面不暴露）
 - 界面横幅：令牌快到期时变黄并给「重新授权」按钮，「账号授权」行同步标注
 - 服务端脚本新增两个**不联网**的运维入口：
   - `--init-config [PATH]`：生成配置模板（`--force` 才覆盖）
-  - `--check`：体检渠道与 key（`可用` / `勾了没填` / `填了没勾` / `未启用`），
+  - `--check`：体检渠道与 key（`可用` / `勾了没填` / `填了没勾` / `未启用`），  
     无可用渠道时退出码 `2`
 - 服务端 `--help` 补上典型流程；输出改为 ①②③④ 分阶段；Ctrl+C 优雅退出（`130`）
-- `docs/server.md`：服务端授权完整指南（部署文件清单、两种交接方式、
+- `docs/server.md`：服务端授权完整指南（部署文件清单、两种交接方式、  
   Windows 端命令、cron、退出码、安全注意、排错表）
 
 ### 变更
 
-- **未授权门禁**：打开界面时如果检测到没有授权（无令牌 / 损坏 / 会话失效 /
-  已过期），除了「立即授权」以外**所有按钮禁用**（签到、只查状态、设置定时、
+- **未授权门禁**：打开界面时如果检测到没有授权（无令牌 / 损坏 / 会话失效 /  
+  已过期），除了「立即授权」以外**所有按钮禁用**（签到、只查状态、设置定时、  
   设置推送、发送测试），授权成功后自动恢复。避免"点了才报错"和"以为配好了"。
-- 按钮可用性收敛到唯一出口 `App._sync_controls()`（`已授权 且 不忙`），
+- 按钮可用性收敛到唯一出口 `App._sync_controls()`（`已授权 且 不忙`），  
   不再由各任务收尾时自己 `configure(state=...)`
 - 命令行帮助里 `--import-token` / `--pull-token` 明确标注为「服务端流程」
 
 ### 删除
 
-- **界面上的远程授权入口**：「推到手机授权」「导入授权」两个按钮及对应对话框
+- **界面上的远程授权入口**：「推到手机授权」「导入授权」两个按钮及对应对话框  
   （远程授权只属于服务端流程，界面只保留本机浏览器授权）
-- `--auth-push` 参数、`AuthDialog(push=...)`、`ImportDialog`、
+- `--auth-push` 参数、`AuthDialog(push=...)`、`ImportDialog`、  
   `core.login_oauth(push=...)` 及其推送逻辑
 - `.build/` 下 v1 时期遗留的 40 个探针脚本与临时输出（只保留 `shot.py`）
-- 根目录测试产物 `selftest.json` / `no_popup_check.json` / `oauth_mode_check.json`；
+- 根目录测试产物 `selftest.json` / `no_popup_check.json` / `oauth_mode_check.json`；  
   回归脚本输出统一改到 `.build/`
 - `dist/ui_import.png`（导入对话框已删除）
 
 ### 文档
 
 - README 按新行为更新：门禁说明、到期提醒、远程授权指向 `docs/server.md`
-- `docs/usage.md` 授权章节重写（只讲本机授权 + 服务端流程指路），
+- `docs/usage.md` 授权章节重写（只讲本机授权 + 服务端流程指路），  
   新增「到期提醒」小节与 `expiry_warn_days` 配置项
-- `docs/architecture.md` 新增「界面只保留本机浏览器授权」「未授权就把界面锁住」
+- `docs/architecture.md` 新增「界面只保留本机浏览器授权」「未授权就把界面锁住」  
   「到期提醒」三节
-- `docs/troubleshooting.md`：未授权 / 授权失效两节按新行为重写，
+- `docs/troubleshooting.md`：未授权 / 授权失效两节按新行为重写，  
   服务端章节改为先跑 `--check`
 - `docs/build.md` 检查清单补「未授权时按钮全灰」「两套配置都要断推送」
 
@@ -318,9 +339,9 @@ bundled: ... Target page, context or browser has been closed
   - `tools/`：回归检查，不参与发布
   - 仓库根目录只留 `run.py` 与文档
 - **两个运行入口**
-  - `run.py`：本地源码运行，唯一入口。负责挂 `src/` 到 `sys.path`，
+  - `run.py`：本地源码运行，唯一入口。负责挂 `src/` 到 `sys.path`，  
     并在缺 tkinter 时给出明确提示
-  - `build/entry.py`：独立运行入口，只给 PyInstaller 用。冻结态不再做
+  - `build/entry.py`：独立运行入口，只给 PyInstaller 用。冻结态不再做  
     路径引导，避免把 `_MEIPASS` 里的包结构搞乱
 - **数据目录按运行方式分流**
   - 本地运行：仓库根目录
@@ -333,12 +354,13 @@ bundled: ... Target page, context or browser has been closed
 
 - `build/build_exe.py` 显式传 `--paths src`，入口改为 `build/entry.py`
 - 打包加 `--clean`，避免上一次的中间产物导致 `PermissionError`
-- 自检不再只看 `selftest.json` 是否存在，还要求 `frozen == true`；
+- 自检不再只看 `selftest.json` 是否存在，还要求 `frozen == true`；  
   顺带打印授权状态与推送渠道
 - 打包成功后自动复制出 `dist/WorkBuddy签到.exe`，不再手工改名
 - `.gitignore` 不再忽略 `build/`（它是打包脚本目录）；中间产物仍在 `.build/`
 
 ### 文档
+
 
 - README 按新结构重写，开头先讲清「本地运行 vs 独立运行」
 - `docs/` 重组为四份：`usage.md`（使用）、`build.md`（构建）、
